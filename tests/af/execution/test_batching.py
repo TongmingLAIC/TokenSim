@@ -30,6 +30,10 @@ def batch_runtime(
     f_tp=1,
     f_ep=1,
     submit_us=0,
+    max_inflight=0,
+    transport_effects=None,
+    layers=1,
+    inflight_scope="iteration",
 ):
     cluster = _cluster(a_tp=1, a_dp=owners, f_tp=f_tp, f_dp=1, f_ep=f_ep)
     cluster = replace(
@@ -40,6 +44,9 @@ def batch_runtime(
             ffn_batching=enabled,
             ffn_batch_wait_us=wait_us,
             ffn_batch_max_tokens=max_tokens,
+            max_inflight_blocks=max_inflight,
+            max_inflight_scope=inflight_scope,
+            transport_effects=transport_effects or cluster.af.transport_effects,
             communication_timing=replace(
                 cluster.af.communication_timing,
                 enabled=bool(submit_us),
@@ -49,7 +56,7 @@ def batch_runtime(
     )
     env = simpy.Environment()
     compute = provider or FixedComputeProvider(1e-6, 20e-6, router=0, expert=20e-6)
-    moe = _moe()
+    moe = replace(_moe(), num_moe_layers=layers)
     executor = AFExecutor(
         env,
         cluster,
@@ -58,9 +65,9 @@ def batch_runtime(
         FixedTransferProvider(0, 0, timing_scope="transport_service"),
         "TestModel",
         "bf16",
-        1,
+        layers,
         16,
-        runtime_plan=execution_plan(cluster, moe=moe),
+        runtime_plan=execution_plan(cluster, layers=layers, moe=moe),
         moe_config=moe,
         resources=af_test_resources(env, cluster),
     )

@@ -194,8 +194,10 @@ class OperatorTableLatencyBackend(StepComposition, OperatorQueries, LatencyBacke
         self.native_mtp = None
         if model.components and self.mtp_query_width > 1:
             from TokenSim.latency.speculative import SpeculativeEstimator
+            from TokenSim.latency.dspark import DSparkEstimator
 
-            self.native_mtp = SpeculativeEstimator(self, max_num_seqs=max_num_seqs)
+            estimator = DSparkEstimator if model.dspark else SpeculativeEstimator
+            self.native_mtp = estimator(self, max_num_seqs=max_num_seqs)
         self.include_pp_transfer = self.include_step_overhead = True
         self.include_embedding_scale = self.rank_info.pp_rank == 0
         from .layers import layer_backends

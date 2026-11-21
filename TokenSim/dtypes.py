@@ -55,6 +55,7 @@ _ALIAS_TO_CANONICAL: Mapping[str, str] = MappingProxyType(
     {alias: spec.canonical_name for spec in _SPECS for alias in spec.aliases}
 )
 _PACKED_WEIGHTS = {
+    "fp8_block": DTypeSpec("fp8_block", 1, ("fp8_block",)),
     "mxfp4": DTypeSpec("mxfp4", 0.5, ("mxfp4",)),
     "mxfp4_wo": DTypeSpec("mxfp4_wo", 0.5, ("mxfp4_wo", "w4a16_mxfp4")),
 }

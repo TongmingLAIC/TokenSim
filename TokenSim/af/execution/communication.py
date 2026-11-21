@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import simpy
-
+from TokenSim.af.execution.readiness import TransferReadiness
 from TokenSim.af.caching.estimates import prepare_query
 from TokenSim.af.planning.batching import AFBlock
 from TokenSim.af.planning.nodes import ExecutionNode
@@ -14,33 +11,6 @@ from TokenSim.af.trace.metrics import AFTraceEvent
 from TokenSim.config.af.links import AFLinkConfig
 from TokenSim.config.af.common import _COLLECTIVE_OPERATIONS
 from TokenSim.errors import ConfigurationError, SimulationStateError
-
-
-@dataclass(frozen=True)
-class TransferReadiness:
-    """Events completing when each stream/input and the receive call are ready.
-
-    Callers create these events for the current invocation. A host API return
-    alone does not make a CUDA stream ready. Omitted events mean readiness is
-    already covered by the DAG; this assumption is exported in the trace.
-    """
-
-    sender_stream: simpy.Event | None = None
-    receiver_stream: simpy.Event | None = None
-    receiver_posted: simpy.Event | None = None
-
-    def events(self, env):
-        result = []
-        for event in (self.sender_stream, self.receiver_stream, self.receiver_posted):
-            if event is None:
-                continue
-            if not isinstance(event, simpy.Event) or event.env is not env:
-                raise SimulationStateError(
-                    "transfer readiness must use events from the current simulation"
-                )
-            if event not in result:
-                result.append(event)
-        return tuple(result)
 
 
 class ExecutorCommunicationMixin:
@@ -339,8 +309,21 @@ class ExecutorCommunicationMixin:
                     )
                 )
         else:
-            ready_at, start_at, end_at, estimate = yield from self._run_flat_transport(
-                block, layer_id, wire_node_id, keyed_resources, resource_ids, estimate
+            ready_at, start_at, end_at, estimate = (
+                yield from self.transport_effects.run(
+                    block,
+                    layer_id,
+                    step,
+                    estimate,
+                    lambda: self._run_flat_transport(
+                        block,
+                        layer_id,
+                        wire_node_id,
+                        keyed_resources,
+                        resource_ids,
+                        estimate,
+                    ),
+                )
             )
         if (
             estimate.payload_bytes is not None

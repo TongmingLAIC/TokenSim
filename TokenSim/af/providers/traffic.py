@@ -94,9 +94,21 @@ class TransferPlanMixin:
         """Cache wire geometry; invocation provenance and readiness stay outside."""
         self.validate_query(query)
         endpoints = tuple(query.physical_endpoints)
+        loopback = (
+            query.operation
+            not in {
+                "tp_collective",
+                "all_reduce",
+                "all_gather",
+                "reduce_scatter",
+                "all_to_all",
+            }
+            and len(endpoints) == 2
+            and endpoints[0] == endpoints[1]
+        )
         if (
             not endpoints
-            or len(set(endpoints)) != len(endpoints)
+            or (len(set(endpoints)) != len(endpoints) and not loopback)
             or any(item not in self._worker_ids for item in endpoints)
         ):
             raise ConfigurationError(

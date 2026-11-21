@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from TokenSim.af.execution.jitter import perturb_service
+
 import simpy
 from dataclasses import replace
 
@@ -103,7 +107,25 @@ class ExecutorTransportMixin:
                     )
                 )
             )
-            estimate = self.transfer_provider.phase_estimate(phase)
+            phase_query = None
+            if self.cluster_config.af.jitter_model.tp_rank_cv:
+                phase_query = SimpleNamespace(
+                    direction="collective",
+                    operation=step.operation,
+                    physical_endpoints=tuple(
+                        self.resources.worker(rank).physical_worker_ref.identity
+                        for rank in phase.participants
+                    ),
+                )
+            estimate = perturb_service(
+                self.transfer_provider.phase_estimate(phase),
+                self.cluster_config.af.jitter_model,
+                block,
+                layer_id,
+                (step.operation, phase.phase_id),
+                network=True,
+                query=phase_query,
+            )
             identity = (
                 block.iteration_id,
                 block.block_id,

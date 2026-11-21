@@ -290,12 +290,17 @@ def packed_weight_memory(
             add(prefix + f".hc_{site}.fn", "mhc", (mix_hc, spec.hc_mult * h), "mhc")
             add(prefix + f".hc_{site}.base", "mhc", (mix_hc,), "mhc")
             add(prefix + f".hc_{site}.scale", "mhc", (3,), "mhc")
-        if layer.is_mtp:
+        if layer.is_mtp and model.dspark is None:
             add(prefix + ".e_proj", "mtp_input_projection", (h, h), "attention_gemm")
             add(prefix + ".h_proj", "mtp_input_projection", (h, h), "attention_gemm")
             for name in ("enorm", "hnorm", "shared_head_norm"):
                 add(prefix + "." + name, "norm", (h,), "norm")
             hc_head(prefix + ".hc_head")
+
+    if model.dspark is not None and include_mtp:
+        from TokenSim.config.dspark import add_dspark_weights
+
+        add_dspark_weights(model, add, hc_head)
 
     totals = {
         key: sum(value[key] for value in components.values())

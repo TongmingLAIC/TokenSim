@@ -255,6 +255,7 @@ class TraceSession:
                 node = f"forward:{worker_id}:{info['iteration']}:rank:{physical_worker}:{index}"
                 details = dict(
                     segment.details,
+                    device_id=worker.device.device_id,
                     request_ids=requests,
                     run_phase=info["run_phase"],
                     placement_assumption=(

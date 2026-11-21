@@ -210,6 +210,15 @@ class ComputeNodePlannerMixin:
         local_width = self.hidden_size // max(1, len(bindings))
         full_bytes = token_count * self.hidden_size * activation_bytes
         local_bytes = token_count * local_width * activation_bytes
+        if (
+            self.runtime_plan.compressed_kv_layout is not None
+            and after_stage == "residual"
+        ):
+            # The residual after mHC post contains hc_mult channels per hidden
+            # coordinate. FFN transfers still carry one ordinary hidden vector.
+            hc = self.runtime_plan.hyper_residual_multiplier
+            full_bytes *= hc
+            local_bytes *= hc
         transitions = {
             "all_gather": ("sharded", "replicated"),
             "reduce_scatter": ("partial", "sharded"),

@@ -45,7 +45,17 @@ class RuntimeValidationMixin:
                     "component ownership differs from physical ledger"
                 )
             allowed = (
-                {"attention", "embedding_lm_head", "router"}
+                {
+                    "attention",
+                    "embedding_lm_head",
+                    "router",
+                    "indexer",
+                    "compressor",
+                    "mhc",
+                    "norm",
+                    "embedding",
+                    "lm_head",
+                }
                 if binding.capability == "af_attention"
                 else {"dense_ffn", "routed_expert", "shared_expert", "router"}
             )
@@ -245,6 +255,12 @@ class RuntimeValidationMixin:
                         self.block_size,
                         self.kv_dtype_size_bytes,
                     )
+                    if self.compressed_kv_layout is not None:
+                        from TokenSim.af.runtime.compressed import compressed_partitions
+
+                        expected_partitions = compressed_partitions(
+                            self.compressed_kv_layout, domain.tensor_parallel_size
+                        )
                     if binding.kv_partition != expected_partitions[binding.tp_rank]:
                         raise ConfigurationError(
                             f"AF runtime rank {binding.rank_key!r} KV partition mismatch"

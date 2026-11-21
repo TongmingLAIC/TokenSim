@@ -315,6 +315,24 @@ def _compile_physical_states(
             )
         )
         buffers += (("communication_workspace", workspace),)
+        if model.components is not None:
+            from TokenSim.af.runtime.compressed import runtime_buffers
+
+            a_tp = cluster_config.af_domains[0].parallel.tensor_parallel_size
+            a_domain = cluster_config.af_domains[0]
+            a_tokens = (
+                cluster_config.af.af_block_size * cluster_config.af.max_inflight_blocks
+            )
+            f_tokens = max(
+                workspace_tokens, a_tokens * a_domain.parallel.data_parallel_size
+            )
+            buffers += runtime_buffers(
+                model,
+                roles,
+                tokens=a_tokens,
+                f_tokens=f_tokens,
+                tp=a_tp,
+            )
         if (
             cluster_config.af_link.colocated_dense_reuse
             and cluster_config.af.execution_protocol == "partial_return"

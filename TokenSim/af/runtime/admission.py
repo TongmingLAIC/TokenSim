@@ -12,6 +12,10 @@ def rank_layer_kv_bytes(plan, binding, context):
     integer(context, "KV context")
     if binding.kv_partition is None:
         return {}
+    if plan.compressed_kv_layout is not None:
+        from TokenSim.af.runtime.compressed import layer_residence
+
+        return layer_residence(plan.compressed_kv_layout, context)
     domain = plan.domain_runtime(binding.domain)
     layers = tuple(
         stage_layer_range(
@@ -87,7 +91,10 @@ class ResidentKV:
         replica = self.plan.replica_for_instance(domain, instance)
         for rank, blocks in replica.local_gpu_blocks:
             partition = self.plan.binding(*rank).kv_partition
-            budget = blocks * partition.bytes_per_block if partition else 0
+            usable_blocks = blocks - int(self.plan.compressed_kv_layout is not None)
+            budget = (
+                max(0, usable_blocks) * partition.bytes_per_block if partition else 0
+            )
             required = self.reserved_by_rank.get(rank, 0) + rank_sizes[rank]
             if required > budget:
                 raise ConfigurationError(
@@ -102,6 +109,8 @@ class ResidentKV:
                 + self.reserved[physical]
                 + size
             )
+            if self.plan.compressed_kv_layout is not None:
+                required += self.plan.compressed_kv_layout.physical_slot_bytes
             if required > state.capacity_bytes:
                 raise ConfigurationError(
                     f"resident KV does not fit on {physical}: required={required}, available={state.capacity_bytes}"

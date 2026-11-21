@@ -44,6 +44,45 @@ class TopologyTransferProviderTest(unittest.TestCase):
             0.0,
         )
 
+    def test_colocated_logical_handoff_has_no_physical_wire_service(self):
+        for operation in ("af_a_to_f", "af_f_to_a"):
+            query = _transfer_query(
+                operation, payload_bytes=8192, endpoints=("a-pool:0", "a-pool:0")
+            )
+            plan = self.provider.communication_plan(query)
+            self.assertEqual(plan.output_bytes_per_rank, 8192)
+            self.assertEqual(plan.wire_bytes, 0)
+            self.assertEqual(plan.phases, ())
+            estimate = self.provider.estimate(query)
+            self.assertEqual(estimate.service_duration, 0)
+            self.assertEqual(estimate.details["resource_wire_bytes"], ())
+
+    def test_collective_duplicate_physical_participants_remain_invalid(self):
+        for operation in ("tp_collective", "all_to_all"):
+            query = _transfer_query(
+                operation, payload_bytes=8192, endpoints=("a-pool:0", "a-pool:0")
+            )
+            with self.assertRaises(ConfigurationError):
+                self.provider.communication_plan(query)
+            with self.assertRaises(ConfigurationError):
+                self.provider.estimate(query)
+
+    def test_flat_loopback_does_not_pay_network_latency_or_wire_service(self):
+        values = _cluster_dict(attention_workers=2, ffn_workers=2)
+        values["af"]["transfer_topology_mode"] = "flat_link"
+        provider = TopologyAFTransferProvider(
+            self.hardware, ClusterConfig(**values), self.workers, None
+        )
+        query = _transfer_query(payload_bytes=8192, endpoints=("a-pool:0", "a-pool:0"))
+        local = provider.estimate(query)
+        self.assertEqual(local.service_duration, 0)
+        self.assertEqual(local.payload_bytes, 8192)
+        self.assertEqual(local.details["wire_bytes"], 0)
+        self.assertEqual(local.details["fixed_latency_us"], 0)
+        self.assertGreater(
+            provider.estimate(_transfer_query(payload_bytes=8192)).service_duration, 0
+        )
+
     def test_tp_collective_uses_the_collective_model_or_a_ring_fallback(self):
         query = _transfer_query(
             "tp_collective", payload_bytes=8192, endpoints=("a-pool:0", "a-pool:1")

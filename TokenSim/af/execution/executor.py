@@ -15,6 +15,9 @@ from TokenSim.af.communication.resources import AFResourceRegistry
 from TokenSim.af.execution.communication import ExecutorCommunicationMixin
 from TokenSim.af.execution.batching import FFNBatcher
 from TokenSim.af.execution.rendezvous import NativeRendezvous
+from TokenSim.af.execution.barrier import PeerLayerBarrier
+from TokenSim.af.execution.transport_effects import AFTransportEffects
+from TokenSim.af.execution.jitter import perturb_service
 from TokenSim.af.execution.compute import ExecutorComputeMixin
 from TokenSim.af.execution.control import NativeControlMixin
 from TokenSim.af.execution.iteration import ExecutorIterationMixin
@@ -247,7 +250,10 @@ class AFExecutor(
         self._step_preparation = {}
         self._native_controls = {}
         self.native_batches = NativeRendezvous(self)
+        self.layer_barrier = PeerLayerBarrier(self)
+        self.transport_effects = AFTransportEffects(self)
         self.ffn_batcher = FFNBatcher(self)
+        self.owner_windows = {}
 
     def _effective_dtypes(self, link_name: str) -> dict[str, str]:
         cached = self._effective_dtype_bindings.get(link_name)
@@ -338,8 +344,7 @@ class AFExecutor(
                 "AF runtime is missing required dependencies: " + ", ".join(missing)
             )
 
-    @staticmethod
-    def _estimate(provider, query, block, layer_id, stage) -> AFServiceEstimate:
+    def _estimate(self, provider, query, block, layer_id, stage) -> AFServiceEstimate:
         try:
             estimate = provider.estimate(query)
         except Exception as exc:
@@ -390,7 +395,15 @@ class AFExecutor(
                 f"for iteration={block.iteration_id}, block={block.block_id}, "
                 f"layer={layer_id}, stage={stage}"
             )
-        return estimate
+        return perturb_service(
+            estimate,
+            self.cluster_config.af.jitter_model,
+            block,
+            layer_id,
+            stage,
+            network=provider is self.transfer_provider,
+            query=query,
+        )
 
     def _set_active_stage(
         self,

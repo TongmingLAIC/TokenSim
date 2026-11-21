@@ -200,6 +200,7 @@ The following settings control the principal AFD modeling choices.
 | `ffn_batching` | Combine compatible ready F work under `partial_return`; defaults to `true` |
 | `ffn_batch_wait_us` | F collection window; defaults to the 5-microsecond assumption |
 | `ffn_batch_max_tokens` | F batch token limit; zero selects `af_block_size * A_DP` |
+| `max_inflight_blocks` | Maximum simultaneously admitted blocks per attention-owner iteration; zero admits all blocks, and one serializes them without changing block geometry |
 | `transfer_topology_mode` | Default physical node budgets or explicit flat links |
 | `communication_domains` | Node inventory, placement, bandwidth and latency in physical mode |
 | `links` | A/F endpoints, resource groups and optional directional wire dtypes |

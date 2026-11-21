@@ -164,7 +164,12 @@ def build_domain_placement(cluster_config, worker_configs, hardware, config):
         occupied.add(slot)
         if config.placement_strategy == "dedicated":
             dedicated_nodes[slot // config.node_size] = roles[worker_id]
-    legacy = synthesize_topology(cluster_config, worker_configs, hardware)
+    topology_id = getattr(cluster_config, "topology", None)
+    legacy = (
+        hardware.topology(topology_id)
+        if topology_id
+        else synthesize_topology(cluster_config, worker_configs, hardware)
+    )
     topology = TopologySpec.two_level(
         "domain_" + legacy.topology_id,
         node_size=config.node_size,

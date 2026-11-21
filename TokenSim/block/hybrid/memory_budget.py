@@ -226,6 +226,11 @@ def hybrid_memory_budget(
         )
         * (2 if mtp else 1),
     }
+    from .dspark_memory import persistent_allocations, capture_rows as dspark_captures
+
+    persistent.update(
+        persistent_allocations(model, tokens, max_num_seqs, speculative_tokens)
+    )
     indexer_workspace = None
     if "csa" in kinds:
         gather_rows = model.max_position_embeddings * 40 // 4
@@ -329,6 +334,16 @@ def hybrid_memory_budget(
         if mtp and speculative_tokens > 1
         else 0
     )
+    if model.dspark is not None and mtp:
+        draft_prefill_graphs = len(
+            dspark_captures(
+                speculative_tokens,
+                max_num_seqs,
+                model.dspark.sample_from_anchor,
+                capture_seqs,
+            )
+        )
+        draft_decode_graphs = 0
     graph_count += draft_prefill_graphs + draft_decode_graphs
     graph_pool_peak = max((row["peak_bytes"] for row in graph_plans), default=0)
     graph_output = capture_rows * model.hidden_size * 2
@@ -391,7 +406,11 @@ def hybrid_memory_budget(
             "graph scratch reused across layer sites; largest target/draft live bound used once, plus separate fixed output and driver-floor proxy",
             "generic fused-MoE activation/EP envelopes remain unverified when selected; no native ring claimed for that path",
             "runtime/NCCL reserve retained in full; no overlap credit or reference-capacity fit",
-            "sampler FP32 processing copy is a conservative optional-path bound; cached probabilistic draft logits not assumed for synthetic sampling",
+            (
+                "DSpark probabilistic draft logits remain allocated during synthetic rejection; the source head dtype determines their storage"
+                if model.dspark
+                else "sampler FP32 processing copy is a conservative optional-path bound; cached probabilistic draft logits not assumed for synthetic sampling"
+            ),
         ],
         "comparison_policy": "report differences and sensitivity; never fit KV capacity or use negative profiler increments",
     }

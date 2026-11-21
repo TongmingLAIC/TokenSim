@@ -94,6 +94,15 @@ def compile_af_runtime_plan(
             f"AF runtime plan requires a ModelSpec, got {type(model).__name__}"
         )
     model_id = model.model_id
+    from TokenSim.af.runtime.compressed import compressed_layout
+
+    compressed_kv = compressed_layout(
+        model, block_size, cluster_config.af.af_block_size
+    )
+    if compressed_kv is not None and not cluster_config.af.max_inflight_blocks:
+        raise ConfigurationError(
+            "compressed AF requires finite max_inflight_blocks for activation admission"
+        )
     moe_config = model.moe
     if cluster_config.af.execution_protocol == "vllm_afd":
         if (
@@ -341,6 +350,8 @@ def compile_af_runtime_plan(
                             32768 * _GB // binding.kv_partition.bytes_per_block,
                         )
                     )
+                    if compressed_kv is not None:
+                        cpu_blocks = 0
                 local_gpu.append((binding.rank_key, gpu_blocks))
                 local_cpu.append((binding.rank_key, cpu_blocks))
             leader = next(
@@ -405,6 +416,8 @@ def compile_af_runtime_plan(
     collective_plans = _compile_collective_plans(cluster_config, binding_by_key)
 
     plan = AFRuntimePlan(
+        hyper_residual_multiplier=model.components.hc_mult if model.components else 1,
+        compressed_kv_layout=compressed_kv,
         mla=mla,
         schema_version="3.0",
         component_weight_dtypes=tuple(sorted(model.operator_dtypes.items())),

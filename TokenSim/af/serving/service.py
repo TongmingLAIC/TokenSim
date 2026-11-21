@@ -149,7 +149,8 @@ class AFService:
     ):
         if phase not in {"prefill", "decode"}:
             raise ConfigurationError("serving phase must be prefill or decode")
-        if phase == "prefill":
+        compressed = self.runtime.plan.compressed_kv_layout is not None
+        if phase == "prefill" and not compressed:
             self.prefill.validate()
         integer(query_tokens, "query tokens", minimum=1)
         boolean(emit_logits, "emit logits")
@@ -195,9 +196,15 @@ class AFService:
         if phase == "decode":
             request_batches(requests, self.runtime.cluster.af.af_block_size)
         start = self.env.now
+        if phase == "prefill" and compressed:
+            # AF's existing recomputation contract carries query offsets and
+            # logical prefill work through the complete split model DAG.
+            for request in requests:
+                request.is_prefill = False
+                request.needs_recompute = True
         if self.execution_driver is not None:
             iteration = yield from self.execution_driver.forward(self, requests, phase)
-        elif phase == "prefill":
+        elif phase == "prefill" and not compressed:
             iteration = yield from self.prefill.run(owner, requests)
         else:
             iteration = yield from self._execute_native(

@@ -6,6 +6,7 @@ import simpy
 
 from TokenSim.af.planning.batching import AFBlock, AFIteration
 from TokenSim.af.planning.dag import AFExecutionDAG
+from TokenSim.af.execution.window import run_admitted_block
 from TokenSim.af.planning.nodes import ExecutionNode
 from TokenSim.config.af.links import AFLinkConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
@@ -14,6 +15,7 @@ from TokenSim.errors import ConfigurationError, SimulationStateError
 class ExecutorIterationMixin:
     def run_iteration(self, iteration: AFIteration):
         self.native_batches.check()
+        self.layer_barrier.check()
         if any(
             block.token_count > self.cluster_config.af.af_block_size
             for block in iteration.blocks
@@ -44,9 +46,27 @@ class ExecutorIterationMixin:
         failure_event = self.env.event()
         failures: list[BaseException] = []
         done_events = [self.env.event() for _ in iteration.blocks]
+        limit = self.cluster_config.af.max_inflight_blocks
+        slots = None
+        if limit:
+            if (
+                self.cluster_config.af.max_inflight_scope == "owner"
+                and iteration.blocks
+            ):
+                owner = iteration.blocks[0].placement
+                key = (owner.a_domain, owner.a_instance)
+                slots = self.owner_windows.get(key)
+                if slots is None:
+                    slots = self.owner_windows[key] = simpy.Resource(
+                        self.env, capacity=limit
+                    )
+            else:
+                slots = simpy.Resource(self.env, capacity=limit)
         processes = [
             self.env.process(
-                self._run_block_guarded(block, failure_event, failures, done_event)
+                self._run_block_guarded(
+                    block, failure_event, failures, done_event, slots
+                )
             )
             for block, done_event in zip(iteration.blocks, done_events)
         ]
@@ -79,7 +99,11 @@ class ExecutorIterationMixin:
                 signals = [completion, failure_event]
                 if self.native_batches.enabled:
                     signals.append(self.native_batches.failure)
+                if self.layer_barrier.enabled:
+                    signals.append(self.layer_barrier.failure)
                 yield self.env.any_of(signals)
+                if self.layer_barrier.enabled and self.layer_barrier.failure.triggered:
+                    failures.append(self.layer_barrier.failure.value)
                 if (
                     self.native_batches.enabled
                     and self.native_batches.failure.triggered
@@ -99,6 +123,7 @@ class ExecutorIterationMixin:
                         f"AF iteration {iteration.iteration_id} failed: {exc}"
                     ) from exc
         except simpy.Interrupt:
+            self.layer_barrier.abort("peer iteration failed or cancelled")
             self.native_batches.abort(f"iteration {iteration.iteration_id} cancelled")
             for process in processes:
                 if process.is_alive:
@@ -109,6 +134,7 @@ class ExecutorIterationMixin:
                 yield self.env.all_of(done_events)
             raise
         except BaseException as error:
+            self.layer_barrier.abort("peer iteration failed or cancelled")
             self.native_batches.abort(error)
             raise
         finally:
@@ -132,6 +158,8 @@ class ExecutorIterationMixin:
                 yield self.env.all_of([process for process, _ in preparations.values()])
             self.active_iterations.pop(iteration.iteration_id, None)
             self.native_batches.complete(iteration)
+            self.layer_barrier.complete(iteration)
+            self.transport_effects.cancel_iteration(iteration)
             for key in tuple(self.active_stages):
                 if key[0] == iteration.iteration_id:
                     self.active_stages.pop(key, None)
@@ -147,6 +175,7 @@ class ExecutorIterationMixin:
                     self.trace.validate_invariants(iteration.iteration_id)
                 self.trace.complete_iteration(iteration.iteration_id)
             except BaseException as error:
+                self.layer_barrier.abort(error)
                 self.native_batches.abort(error)
                 raise
         return iteration
@@ -170,6 +199,7 @@ class ExecutorIterationMixin:
         failure_event: simpy.Event,
         failures: list[BaseException],
         done_event: simpy.Event,
+        slots=None,
     ):
         try:
             control = self._native_controls.get(block.iteration_id)
@@ -177,7 +207,7 @@ class ExecutorIterationMixin:
                 yield self.env.any_of((control["a_ready"], failure_event))
                 if failure_event.triggered:
                     return
-            yield from self._run_block(block)
+            yield from run_admitted_block(self, block, slots)
         except simpy.Interrupt:
             return
         except BaseException as exc:
@@ -196,7 +226,9 @@ class ExecutorIterationMixin:
             if handoff is not None:
                 yield from self._run_dag(block, layer_id, link, handoff)
             dag = self.plan_builder.build_layer(block, layer_id, link)
+            self.transport_effects.register_layer(block, layer_id, dag)
             yield from self._run_dag(block, layer_id, link, dag)
+            self.transport_effects.release_layer(block, layer_id)
         iteration = self.active_iterations[block.iteration_id]
         iteration.block_completed_at[block.block_id] = self.env.now
 

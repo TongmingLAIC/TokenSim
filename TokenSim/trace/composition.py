@@ -5,6 +5,7 @@ import math
 
 from TokenSim.config.cache_config import stage_layer_range
 from TokenSim.errors import SimulationStateError
+from TokenSim.trace.work_shapes import attention_components, moe_key
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,7 @@ def expand_composition(backend, values, communications):
                 dict(
                     details or {},
                     dtype=model.activation_dtype,
+                    table=table,
                     tokens=values["T"],
                     shape=key or {},
                     granularity="module" if "module" in operation else "operator",
@@ -221,6 +223,9 @@ def expand_composition(backend, values, communications):
                         (req.query_tokens, req.num_computed_tokens + req.query_tokens)
                         for req in values["requests_list"]
                     ),
+                    "work_components": attention_components(
+                        backend, values["requests_list"]
+                    ),
                 },
             )
         for projection, us in outputs:
@@ -248,6 +253,7 @@ def expand_composition(backend, values, communications):
                 - values["draft"].get("moe", 0) / backend.moe_layers_local,
                 layer,
                 table=backend.native_moe.table if backend.native_moe else "moe",
+                key=moe_key(backend, values["T"]) if not backend.native_moe else None,
                 details={"includes_dispatch_combine": bool(backend.native_moe)},
             )
             collective(

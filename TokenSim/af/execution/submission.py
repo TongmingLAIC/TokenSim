@@ -23,6 +23,7 @@ class ExecutorSubmissionMixin:
             raise ConfigurationError("AF submission requires a compiled runtime plan")
         validate_decode_requests(requests)
         self.native_batches.check()
+        self.layer_barrier.check()
         request_batches(requests, self.cluster_config.af.af_block_size)
         if self.operation_profile is not None:
             self.operation_profile.validate_workload(requests, "decode")
@@ -121,6 +122,7 @@ class ExecutorSubmissionMixin:
             ),
         )
         self.native_batches.register(iteration)
+        self.layer_barrier.register(iteration)
         return iteration
 
     def _runtime_layer_types(self) -> dict[int, str]:

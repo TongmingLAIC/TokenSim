@@ -129,6 +129,17 @@ class OperatorTableAFComputeProvider(
         return resolver
 
     def estimate_signature(self, query):
+        if self.model.components is not None:
+            layers = self.model.layer_specs(include_mtp=False)
+            layer = (
+                layers[query.layer_id] if 0 <= query.layer_id < len(layers) else None
+            )
+            return (
+                "compressed",
+                layer.attention_kind if layer else None,
+                layer.compress_ratio if layer else None,
+                layer.moe_routing if layer else None,
+            )
         if (
             self.model.attention_windows or self.model.attention_geometries
         ) and query.stage in {"a", "attention"}:

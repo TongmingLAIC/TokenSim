@@ -231,13 +231,16 @@ class ModelAFExecutor(AFExecutor):
         if dag is not None:
             previous = yield from self._run_model_dag(block, -1, link, dag, previous)
         for layer in range(self.total_layers):
+            previous = yield from self.layer_barrier.wait(block, layer, previous)
             handoff = self._pipeline_handoff(block, layer)
             if handoff is not None:
                 previous = yield from self._run_model_dag(
                     block, layer, link, handoff, previous
                 )
             dag = self.plan_builder.build_layer(block, layer, link)
+            self.transport_effects.register_layer(block, layer, dag)
             previous = yield from self._run_model_dag(block, layer, link, dag, previous)
+            self.transport_effects.release_layer(block, layer)
         for operation in ("final_norm", "lm_head"):
             nodes = self._boundary_nodes(block, operation)
             if nodes:

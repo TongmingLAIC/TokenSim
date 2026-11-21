@@ -16,6 +16,7 @@ from TokenSim.moe.config import MoEModelConfig
 from TokenSim.mla import MLADimensions
 from TokenSim.config.attention_model import AttentionModelMixin
 from TokenSim.config.validation import integer, boolean
+from TokenSim.config.dspark import DSparkConfig
 
 GATED_ACTIVATIONS = {"swiglu", "geglu", "reglu"}
 ACTIVATIONS = GATED_ACTIVATIONS | {"gelu", "relu", "silu"}
@@ -65,6 +66,7 @@ class ModelSpec(AttentionModelMixin):
     k_eq_v: bool = False
     attention_geometries: tuple = ()
     block_layout: TransformerBlockLayout = field(default_factory=TransformerBlockLayout)
+    dspark: DSparkConfig | None = None
 
     def __post_init__(self) -> None:
         if self.attention_type not in {"mha", "gqa", "mqa", "mla"}:
@@ -165,6 +167,7 @@ class ModelSpec(AttentionModelMixin):
             integer(self.kv_cache_dim, "kv_cache_dim", minimum=1)
         if not self.display_name:
             object.__setattr__(self, "display_name", self.model_id)
+        object.__setattr__(self, "dspark", DSparkConfig.from_value(self.dspark, self))
 
     # -- derived dimensions ----------------------------------------------
 
@@ -423,6 +426,7 @@ class ModelSpec(AttentionModelMixin):
             k_eq_v=raw.get("k_eq_v", False),
             attention_geometries=raw.get("attention_geometries", ()),
             block_layout=raw.get("block_layout", {}),
+            dspark=raw.get("dspark"),
             attention_type=attention_type,
             **{name: raw.get(name, 0) for name in MLADimensions.__dataclass_fields__},
         )
@@ -482,6 +486,7 @@ class ModelSpec(AttentionModelMixin):
             "components": self.components.to_dict() if self.components else None,
             "operator_modules": dict(self.operator_modules),
             "layers": [vars(layer) for layer in self.layer_specs()],
+            **({"dspark": self.dspark.to_dict()} if self.dspark else {}),
         }
 
 

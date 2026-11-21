@@ -8,6 +8,9 @@ from typing import Any
 from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.dataclasses import Field, dataclass
 
+from TokenSim.config.af.jitter import AFJitterConfig
+from TokenSim.config.af.transport_effects import AFTransportEffectsConfig
+
 from TokenSim.config.af.common import (
     AF_LATENCY_FALLBACKS,
     AF_LATENCY_PROVIDERS,
@@ -72,11 +75,18 @@ class AFConfig:
     ffn_batching: bool = True
     ffn_batch_wait_us: float = 5.0
     ffn_batch_max_tokens: int = 0
+    max_inflight_blocks: int = 0
+    peer_layer_barrier: bool = False
+    jitter_model: AFJitterConfig = Field(default_factory=AFJitterConfig)
+    transport_effects: AFTransportEffectsConfig = Field(
+        default_factory=AFTransportEffectsConfig
+    )
     operation_service_profile: dict[str, Any] | None = None
     transport_service_profile: dict[str, Any] | None = None
     engine_overhead_profile: dict[str, Any] | None = None
     calibration_environment: dict[str, str] = Field(default_factory=dict)
     routing_replay: dict[str, Any] | None = None
+    max_inflight_scope: str = "iteration"
 
     @model_validator(mode="before")
     @classmethod
@@ -112,6 +122,7 @@ class AFConfig:
         "dag_template_cache",
         "coalesce_ready_transfers",
         "ffn_batching",
+        "peer_layer_barrier",
         mode="before",
     )
     @classmethod
@@ -124,6 +135,7 @@ class AFConfig:
         "af_block_size",
         "dag_template_cache_max_tokens",
         "ffn_batch_max_tokens",
+        "max_inflight_blocks",
         mode="before",
     )
     @classmethod
@@ -158,6 +170,9 @@ class AFConfig:
 
         integer(self.dag_template_cache_max_tokens, "AF DAG cache token limit")
         integer(self.ffn_batch_max_tokens, "AF F batch token limit")
+        integer(self.max_inflight_blocks, "AF in-flight block limit")
+        if self.max_inflight_scope not in {"iteration", "owner"}:
+            raise ConfigurationError("AF in-flight scope must be iteration or owner")
         self._explicit_dtype_fields = frozenset(dtype_presence_input)
         if self.transfer_topology_mode not in {"physical", "flat_link"}:
             raise ConfigurationError(

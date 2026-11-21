@@ -284,6 +284,7 @@ class ExecutorComputeMixin:
                     target_dtype=local_work.target_dtype,
                 )
             )
+        self.transport_effects.complete_compute(block, layer_id, step.node_id)
         self.active_stages.pop((block.iteration_id, block.block_id, step.node_id), None)
         if step.stage == "weighted_combine":
             self.native_batches.finish_stage(block, layer_id)

@@ -50,8 +50,20 @@ class AFRuntimePlan(RuntimeGeometryMixin, RuntimeValidationMixin):
     link_effective_dtypes: tuple[tuple[str, AFEffectiveDTypes], ...] = ()
     mla: MLADimensions | None = None
     component_weight_dtypes: tuple[tuple[str, str], ...] = ()
+    compressed_kv_layout: Any = None
+    hyper_residual_multiplier: int = 1
 
     def weight_dtype_for(self, stage, operation):
+        if self.compressed_kv_layout is not None:
+            operator = {
+                "routed_expert": "routed_expert",
+                "expert": "routed_expert",
+            }.get(stage, stage)
+            if operation in {"lm_head", "embedding_lookup"}:
+                operator = "lm_head" if operation == "lm_head" else "embedding"
+            return dict(self.component_weight_dtypes).get(
+                operator, self.effective_dtypes.weight_dtype
+            )
         key = {
             "a": "attention",
             "expert": "routed_experts",
@@ -355,6 +367,11 @@ class AFRuntimePlan(RuntimeGeometryMixin, RuntimeValidationMixin):
             "block_size": self.block_size,
             "dtype": self.dtype,
             "effective_dtypes": self.effective_dtypes.as_dict(),
+            **(
+                {"compressed_kv_layout": self.compressed_kv_layout.to_dict()}
+                if self.compressed_kv_layout
+                else {}
+            ),
             **(
                 {"component_weight_dtypes": dict(self.component_weight_dtypes)}
                 if self.component_weight_dtypes

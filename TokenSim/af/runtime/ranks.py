@@ -23,6 +23,14 @@ def compile_rank_components(
     router_location,
 ):
     preliminary, kv_by_rank, component_by_id = [], {}, {}
+    from TokenSim.af.runtime.compressed import (
+        compressed_layout,
+        compressed_partitions,
+        components_for_rank,
+    )
+
+    packed_reports = {}
+    layout = compressed_layout(model, block_size, max(1, block_size))
     for domain in domains:
         tp, pp = (
             domain.parallel.tensor_parallel_size,
@@ -57,6 +65,8 @@ def compile_rank_components(
             if domain.capability == "af_attention"
             else {}
         )
+        if layout is not None and domain.capability == "af_attention":
+            partitions = {0: compressed_partitions(layout, tp)}
         view = domain.expert_parallel
         experts_by_rank = _experts_by_ep(
             model.moe.num_experts if model.moe.enabled else 0,
@@ -141,6 +151,15 @@ def compile_rank_components(
                     mla=mla,
                     embedding_role=role,
                 )
+                if layout is not None:
+                    components = components_for_rank(
+                        model,
+                        domain,
+                        mapping,
+                        expert_ids,
+                        packed_reports,
+                        router_location,
+                    )
                 for component in components:
                     previous = component_by_id.get(component.component_id)
                     if previous is not None and previous != component:

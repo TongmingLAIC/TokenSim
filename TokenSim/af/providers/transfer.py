@@ -310,7 +310,13 @@ class TransferEstimateMixin:
             )
         link = self.link_class(query.network)
         payload = query.payload_bytes
-        service_us = link.analytical_transfer_us(payload)
+        endpoints = query.physical_endpoints
+        loopback = (
+            len(endpoints) == 2
+            and endpoints[0] == endpoints[1]
+            and endpoints[0] in self._worker_ids
+        )
+        service_us = 0.0 if loopback else link.analytical_transfer_us(payload)
         source_id = f"link:{link.link_id}:{link.source_id}"
         dataset_version = f"links:{link.link_id}"
         return AFServiceEstimate(
@@ -326,7 +332,8 @@ class TransferEstimateMixin:
                 "transport_backend": query.transport_backend,
                 "backend_calibrated": False,
                 "link": (link.link_id if link is not None else None),
-                "fixed_latency_us": link.latency_us if link is not None else None,
+                "fixed_latency_us": 0.0 if loopback else link.latency_us,
+                "wire_bytes": 0 if loopback else payload,
                 "bandwidth_bytes_per_s": (
                     link.bandwidth_per_direction_bytes_per_s
                     if link is not None

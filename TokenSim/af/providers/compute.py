@@ -73,6 +73,8 @@ class OperatorComponent:
     source_id: str
     dataset_version: str = ""
     covered_operations: tuple[str, ...] = ()
+    work: Mapping[str, float] | None = None
+    analytical_bounds: Mapping[str, float] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +86,16 @@ class OperatorComponent:
             "source_id": self.source_id,
             "dataset_version": self.dataset_version,
             "covered_operations": self.covered_operations,
+            **(
+                {"work_flops_by_dtype": dict(self.work)}
+                if self.work is not None
+                else {}
+            ),
+            **(
+                {"analytical_bounds": dict(self.analytical_bounds)}
+                if self.analytical_bounds is not None
+                else {}
+            ),
         }
 
 
@@ -147,7 +159,12 @@ class ComputeEstimateMixin:
         resolver = self.resolver_for(query.device_type)
         dtype = normalize_dtype(query.dtype)
         weight_dtype = normalize_dtype(query.weight_dtype or dtype)
-        if query.stage in {"encode", "decode"}:
+        from TokenSim.af.providers.compressed import compressed_components
+
+        native = compressed_components(self, resolver, query, tokens, tp_size, dtype)
+        if native is not None:
+            components = native
+        elif query.stage in {"encode", "decode"}:
             source = normalize_dtype(query.source_dtype)
             target = normalize_dtype(query.target_dtype)
             elements = query.local_shape.get("elements")

@@ -165,10 +165,16 @@ class ComputeComponentsMixin:
                 "ep_size": ep_size,
                 "num_tokens": equivalent_tokens,
             }
-            estimate = resolver.query_moe(base_key, self.moe_distributions)
+            # Compressed AF receives an exact, possibly merged local histogram.
+            # Balanced whole-layer samples cannot identify that dynamic work.
+            estimate = (
+                None
+                if model.components is not None
+                else resolver.query_moe(base_key, self.moe_distributions)
+            )
             table = "moe"
             exact_key = {}
-            if estimate.match_type == "analytical":
+            if estimate is None or estimate.match_type == "analytical":
                 # The runtime already knows the local histogram. Preserve its
                 # assignment and active-expert counts through analytical fallback.
                 table = "routed_experts"

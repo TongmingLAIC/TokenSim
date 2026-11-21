@@ -79,6 +79,7 @@ class AFConfigModelTest(unittest.TestCase):
             ("ffn_batching", (1, "true")),
             ("ffn_batch_wait_us", (-1, True, float("nan"), float("inf"))),
             ("ffn_batch_max_tokens", (-1, True, 1.5, "8")),
+            ("max_inflight_blocks", (-1, True, 1.5, "8")),
         ):
             for value in values:
                 with (

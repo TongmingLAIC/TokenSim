@@ -36,7 +36,8 @@ class AFModelRuntime:
     plan: AFRuntimePlan
 
 
-def build_model_runtime(doc, *, hardware, model, block_size=16):
+def build_model_runtime(doc, *, hardware, model, block_size=None):
+    block_size = block_size or (256 if model.components is not None else 16)
     cluster = ClusterConfig(**doc)
     workers = cluster.workers()
     placement = build_topology_placement(cluster, workers, hardware)
@@ -109,13 +110,22 @@ def simulate_decode(
         for index, worker in enumerate(config.workers)
         if worker.physical_worker_ref.identity == leader.physical_identity
     )
-    replica = config.plan.replica_for_instance(leader.domain, leader.instance)
-    required_blocks = batch * (-(-peak_context // config.plan.block_size))
-    if required_blocks > replica.logical_gpu_blocks:
+    from TokenSim.af.runtime.admission import ResidentKV
+
+    memory = ResidentKV(config.plan)
+    try:
+        for request_id in range(batch):
+            memory.admit(
+                request_id,
+                owner.domain,
+                owner.instance,
+                maximum_context=peak_context,
+                current_context=context,
+            )
+    except ConfigurationError as error:
         raise ConfigurationError(
-            f"fixed-batch decode KV does not fit: required_blocks={required_blocks}, "
-            f"available_blocks={replica.logical_gpu_blocks}"
-        )
+            f"fixed-batch decode KV does not fit: {error}"
+        ) from error
     env = simpy.Environment()
     compute, transfer = build_operator_table_af_providers(
         hardware=config.hardware,

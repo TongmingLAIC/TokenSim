@@ -119,7 +119,7 @@ class AFEngineMixin:
         latency_fallback = config.latency_fallback
         latency_backend_type = config.latency_backend_type
         random_seed = config.random_seed
-        af_dtype = af_dtype or self.model_spec.dtype
+        af_dtype = af_dtype or self.model_spec.activation_dtype
         if cluster_config.af.enabled and not any(
             "prefill" in worker.capabilities for worker in worker_configs
         ):
@@ -186,6 +186,21 @@ class AFEngineMixin:
                     cache_config_override = AFCacheConfig.from_plan(
                         self.af_runtime_plan, replica
                     )
+                    if self.af_runtime_plan.compressed_kv_layout is not None:
+                        from TokenSim.block.hybrid.af_replica import (
+                            CompressedReplicaKV,
+                            cache_configuration,
+                        )
+
+                        block_manager = CompressedReplicaKV(
+                            self.af_runtime_plan, replica
+                        )
+                        self.af_replica_block_managers[replica.replica_key] = (
+                            block_manager
+                        )
+                        cache_config_override = cache_configuration(
+                            self.af_runtime_plan, replica
+                        )
                     worker_parallel_config = self.af_runtime_plan.domain_runtime(
                         replica.domain
                     ).parallel_config()
