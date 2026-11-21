@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "provenance": "Locally collected PyTorch Profiler slice from Qwen3-8B on PKUa100; one common timestamp translation; ancillary device counters removed.",
+    "provenance": "Locally collected PyTorch Profiler slice from Qwen3-8B; one common timestamp translation; ancillary device counters removed.",
     "vllm_revision": "9cf0c96c91c690ad2e3dfc8ddd81f20014565327",
     "torch": "2.13.0+cu132",
     "raw_sha256": "099fa8899d5eef6bdd1e4f90211a5f815302abcff6f7cc549f1accac27435ab1"

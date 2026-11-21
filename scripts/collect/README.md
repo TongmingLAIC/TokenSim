@@ -27,9 +27,9 @@ CUDA_VISIBLE_DEVICES=0 \
 ```
 
 Use the authorized inference environment's Python executable for collection.
-For the agreed `PKUa100` campaign, the source installation is `/home/youwei/bzh/project/TokenCake/RFC/vllm-rfc` and the independent working copy is `/home/youwei/bzh/project/TokenSim/vllm-rfc`.
+Run collection from an independent copy of the vLLM checkout.
 Keep the source installation unchanged, including editable-install mappings and generated caches.
-Store remote data under `/home/youwei/bzh/project/TokenSim/profiler`.
+Pass an output directory on the collection host with `--output`.
 The [tracing specification](../../docs/operator-latency-model.md#collection-environment) describes the collection environment and source verification.
 
 The collector warms up the same fixed workload before starting capture.

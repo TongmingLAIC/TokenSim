@@ -1293,11 +1293,9 @@ Warmup and measured records remain distinguishable; cutoff handling retains comp
 
 ### Collection environment
 
-The agreed GPU host is SSH target `PKUa100`.
-The source vLLM checkout at `/home/youwei/bzh/project/TokenCake/RFC/vllm-rfc` must remain unchanged.
-Collection uses the independent copy at `/home/youwei/bzh/project/TokenSim/vllm-rfc`.
-Remote raw captures and experiment output live under `/home/youwei/bzh/project/TokenSim/profiler`.
-Local artifacts live under ignored `outputs/operator_trace/` directories.
+Run collection on a GPU host with an independent copy of the vLLM checkout.
+Keep the source checkout unchanged.
+Write raw captures and experiment output under an ignored directory such as `outputs/operator_trace/`.
 Weights, copied environments and raw traces are excluded from commits.
 
 Record source revision and status before copying the checkout, and verify source state after collection.
@@ -1503,5 +1501,4 @@ Initial raw evidence, ablations, routing observations and collective probes rema
 Updated captures, mode parity, source configurations and verification summaries remain under `outputs/operator_trace/improvement/`.
 That directory's `figures/audit_differences.py` reproduces the quantitative audit in `figures/timing-difference-audit.json`.
 The paired PNG/SVG samples and geometry sidecars are under `figures/charon/`.
-Remote copies are under `/home/youwei/bzh/project/TokenSim/profiler/improvement-verification/`.
 Logs and raw artifacts remain ignored by Git; committed documentation retains the measurements and their source revisions.
