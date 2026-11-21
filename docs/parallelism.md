@@ -95,8 +95,10 @@ The KV head count must be divisible by TP, or TP must be a multiple of the KV he
 
 PP splits layers, model memory, and KV memory across stages.
 Remainder layers are assigned to the earliest stages.
-The latency backend estimates only the layers assigned to each stage and adds one activation transfer between adjacent stages per step.
-The last stage also includes the output projection that produces vocabulary logits, called the LM head.
+An ordinary serving replica executes each step through its stages in order and charges an activation transfer between adjacent stages.
+The last stage adds the output projection that produces vocabulary logits, called the LM head.
+The ordinary stage model uses one representative rank per stage and serializes all stages of each batch without overlapping different batches.
+It supports hybrid workers with uniform KV caches, `NoopConnector`, and independent DP steps.
 
 ### Data Parallelism
 
@@ -111,7 +113,8 @@ The simulator validates `data_parallel_size_local` and `data_parallel_rank` and 
 It represents every rank in `world_size` within one simulation process.
 
 Only the TP=0, PP=0 worker in each DP group is directly schedulable.
-Other ranks represent the corresponding model shards and participate through per-rank memory and communication modeling.
+Other ranks represent model shards and participate through per-rank memory and communication modeling.
+The replica admits requests within the KV capacity of its smallest rank pool.
 
 By default the DP replicas step independently.
 `--dp_lockstep` advances replicas in synchronized steps and supplies dummy batches for idle replicas.

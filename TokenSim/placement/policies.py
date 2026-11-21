@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -8,6 +9,10 @@ from TokenSim.utils import BoundedCache
 
 
 WorkerT = TypeVar("WorkerT")
+
+
+def replica_key(worker) -> tuple[str | None, int]:
+    return getattr(worker, "execution_domain", None), getattr(worker, "dp_rank", 0)
 
 
 class PlacementPolicy(Protocol[WorkerT]):
@@ -21,6 +26,7 @@ class WorkerPool(Generic[WorkerT]):
         self.workers = workers
         self.start_idx = workers[0].id
         self.placement_decision_count = 0
+        self.placements = Counter()
 
     def schedule(self) -> WorkerT:
         raise NotImplementedError
@@ -35,8 +41,25 @@ class WorkerPool(Generic[WorkerT]):
         return self._select()
 
     def _select(self) -> WorkerT:
+        worker = self.schedule()
+        self.record_placement(worker)
+        return worker
+
+    def record_placement(self, worker):
         self.placement_decision_count += 1
-        return self.schedule()
+        self.placements[replica_key(worker)] += 1
+
+    def reset_stats(self):
+        self.placement_decision_count = 0
+        self.placements.clear()
+
+    def placements_in_domain(self, domain):
+        return {
+            rank: self.placements[domain, rank]
+            for worker in self.workers
+            for worker_domain, rank in [replica_key(worker)]
+            if worker_domain == domain
+        }
 
     def get(self, id: int) -> WorkerT:
         return self.workers[id - self.start_idx]
@@ -54,72 +77,57 @@ class DataParallelWorkerPool(WorkerPool[WorkerT]):
         sticky_sessions: bool = False,
     ):
         super().__init__(workers)
-        grouped: dict[int, list[WorkerT]] = {}
+        grouped: dict[tuple[str | None, int], list[WorkerT]] = {}
         for worker in workers:
-            grouped.setdefault(getattr(worker, "dp_rank", 0), []).append(worker)
-        self.group_pools = {
-            dp_rank: pool_cls(group_workers)
-            for dp_rank, group_workers in sorted(grouped.items())
-        }
-        self.dp_ranks = sorted(self.group_pools)
+            grouped.setdefault(replica_key(worker), []).append(worker)
+        self.group_pools = {key: pool_cls(values) for key, values in grouped.items()}
+        self.replica_keys = sorted(
+            self.group_pools, key=lambda key: (key[0] or "", key[1])
+        )
         self.cur_dp_idx = 0
-        self.dp_placement_counts = {rank: 0 for rank in self.dp_ranks}
         self.sticky_sessions = sticky_sessions
         self.affinity_to_rank = BoundedCache(65536)
 
+    @property
+    def dp_placement_counts(self):
+        return self.placements_in_domain(None)
+
     def schedule(self) -> WorkerT:
-        return self._select()
+        return self._next_group_pool().schedule()
 
     def select_prefill_worker(self, request=None) -> WorkerT:
-        worker = self._select_for_request(request, assign_new=True)
-        self.placement_decision_count += 1
-        return worker
+        return self._select_for_request(request, assign_new=True)
 
     def select_decode_worker(self, request=None) -> WorkerT:
-        worker = self._select_for_request(request, assign_new=False)
-        self.placement_decision_count += 1
-        return worker
+        return self._select_for_request(request, assign_new=False)
 
     def select_transfer_target(self, requests=None) -> WorkerT:
-        request = requests[0] if requests else None
-        worker = self._select_for_request(request, assign_new=False)
-        self.placement_decision_count += 1
-        return worker
+        return self.select_decode_worker(requests[0] if requests else None)
 
-    def _select(self) -> WorkerT:
-        worker = self._next_group_pool().schedule()
-        self._record(worker)
-        return worker
-
-    def _select_for_request(self, request=None, assign_new: bool = False) -> WorkerT:
-        dp_rank = getattr(request, "dp_rank", None)
+    def _select_for_request(self, request, *, assign_new: bool) -> WorkerT:
+        rank = getattr(request, "dp_rank", None)
+        domain = getattr(request, "dp_domain", None)
         affinity_key = (
             getattr(request, "chat_id", None) if self.sticky_sessions else None
         )
-        if dp_rank not in self.group_pools and affinity_key:
-            dp_rank = self.affinity_to_rank.get(str(affinity_key))
-        if dp_rank in self.group_pools:
-            worker = self.group_pools[dp_rank].schedule()
-        else:
-            worker = self._next_group_pool().schedule()
-        self._record(worker)
-        if request is not None and (
-            assign_new or getattr(request, "dp_rank", None) is None
-        ):
-            assigned_rank = getattr(worker, "dp_rank", 0)
-            setattr(request, "dp_rank", assigned_rank)
-            if affinity_key:
-                self.affinity_to_rank.setdefault(str(affinity_key), assigned_rank)
+        affinity_key = str(affinity_key) if affinity_key else None
+        preferred = (domain, rank)
+        if preferred not in self.group_pools and affinity_key is not None:
+            preferred = self.affinity_to_rank.get(affinity_key)
+        pool = self.group_pools.get(preferred)
+        worker = (pool if pool is not None else self._next_group_pool()).schedule()
+        self.record_placement(worker)
+        selected = replica_key(worker)
+        if request is not None and assign_new:
+            request.dp_domain, request.dp_rank = selected
+        if affinity_key is not None:
+            self.affinity_to_rank[affinity_key] = selected
         return worker
 
     def _next_group_pool(self) -> WorkerPool[WorkerT]:
-        dp_rank = self.dp_ranks[self.cur_dp_idx]
-        self.cur_dp_idx = (self.cur_dp_idx + 1) % len(self.dp_ranks)
-        return self.group_pools[dp_rank]
-
-    def _record(self, worker: WorkerT) -> None:
-        dp_rank = getattr(worker, "dp_rank", 0)
-        self.dp_placement_counts[dp_rank] = self.dp_placement_counts.get(dp_rank, 0) + 1
+        key = self.replica_keys[self.cur_dp_idx]
+        self.cur_dp_idx = (self.cur_dp_idx + 1) % len(self.replica_keys)
+        return self.group_pools[key]
 
 
 class RoundRobinWorkerPool(WorkerPool[WorkerT]):
@@ -155,8 +163,12 @@ class WorkerLoad:
 class BalancedLoadWorkerPool(WorkerPool[WorkerT]):
     def worker_load(self, worker: WorkerT) -> WorkerLoad:
         scheduler = worker.scheduler
-        active_requests = len(getattr(scheduler, "running", [])) + len(
-            getattr(scheduler, "waiting", [])
+        active_requests = (
+            len(scheduler.running)
+            + len(scheduler.waiting)
+            + len(getattr(scheduler, "loading", ()))
+            + len(getattr(scheduler, "loaded_waiting", ()))
+            + getattr(worker, "pending_admissions", 0)
         )
         return WorkerLoad(
             active_requests=active_requests,

@@ -30,7 +30,8 @@ from TokenSim.llm.llm_scheduler import (
 from TokenSim.parallel import ParallelCommunicator
 from TokenSim.moe import MoEModelConfig, ExpertPlacement
 from TokenSim.config.model_config import ModelSpec
-from .af_worker import bind_af_worker, run_worker_compute
+from .af_worker import bind_af_worker
+from .worker_step import accept_requests, execute_worker_step, update_worker_status
 from .messages import (
     Task,
     WorkerStatus,
@@ -75,8 +76,6 @@ class LLMWorker(Worker):
         super().__init__(env, id)
         self.hardware_context = hardware
         self.engine = engine
-        if config.prefill_schedule_interval < 1:
-            raise ConfigurationError("prefill_schedule_interval must be positive")
         self.prefill_schedule_interval = config.prefill_schedule_interval
 
         self.role = runtime_role or worker_config.role
@@ -278,7 +277,10 @@ class LLMWorker(Worker):
                 connector=self.connector,
             )
 
+        self.scheduler.max_model_len = self.model_spec.max_position_embeddings
+        self.forward_stages = (self,)
         self.status = WorkerStatus.WAITING
+        self.stalled_at = None
         self.action = self.env.process(self.run())
 
     def workload(self):
@@ -333,80 +335,17 @@ class LLMWorker(Worker):
             try:
                 match msg.task:
                     case Task.ADD:
-                        if msg.metadata is not None:
-                            self.pending_connector_metadata = _merge_connector_metadata(
-                                msg.metadata, self.pending_connector_metadata
-                            )
-                        self.scheduler.add_requests(msg.requests or [])
-                        self.status = WorkerStatus.RUNNING
-
+                        accept_requests(self, msg)
                     case Task.STEP:
+                        if self.status == WorkerStatus.WAITING:
+                            continue
                         if self.status != WorkerStatus.RUNNING:
-                            if (
-                                self.status == WorkerStatus.WAITING
-                                and not self.scheduler.running
-                                and not self.scheduler.waiting
-                            ):
-                                # A cancelled request may leave a previously
-                                # queued STEP behind; it cannot restart work.
-                                continue
                             raise SimulationStateError(
                                 f"worker {self.id} received STEP while {self.status}"
                             )
-                        running, load_latency = self.prepare_step()
-                        handoff = getattr(self.engine, "pd_handoff", None)
-                        if not running and handoff is not None and handoff.jobs:
-                            self.status = WorkerStatus.WAITING
-                            handoff.blocked_workers.add(self.id)
+                        progressed = yield from execute_worker_step(self)
+                        if not progressed:
                             continue
-                        if not running and self.connector.async_offload:
-                            # Transfers advance independently; a worker with
-                            # only loading/capacity-blocked requests must yield.
-                            self.status = WorkerStatus.WAITING
-                            continue
-                        if load_latency:
-                            trace = getattr(self.engine, "trace_session", None)
-                            if trace is not None:
-                                trace.record_connector_load(self, load_latency)
-                            yield self.env.timeout(load_latency)
-                        running = [req for req in running if not req.cancel_requested]
-                        if running:
-                            latency = yield from run_worker_compute(self, running)
-                            save_latency = self.complete_step(running, latency)
-                            if save_latency:
-                                yield self.env.timeout(save_latency)
-                            self.finalize_connector_step()
-                            running = self.scheduler.running
-
-                            if self.role == "prefill":
-                                # Hand over requests whose prompt is complete;
-                                # partially prefilled ones keep their chunks here.
-                                completed = [
-                                    req for req in running if not req.is_context_build
-                                ]
-                                if completed:
-                                    self.engine.dispatch_prefill_to_decode(
-                                        self, completed
-                                    )
-                                    self.scheduler.running = [
-                                        req
-                                        for req in self.scheduler.running
-                                        if req.is_context_build
-                                    ]
-                                    running = self.scheduler.running
-
-                        else:
-                            # Blocking loads have completed even when every
-                            # scheduled request was cancelled before compute.
-                            self.finalize_connector_step()
-
-                        if (
-                            not running
-                            and not self.scheduler.waiting
-                            and not getattr(self.scheduler, "loaded_waiting", [])
-                        ):
-                            self.status = WorkerStatus.WAITING
-
                     case Task.STOP:
                         self.status = WorkerStatus.STOPPED
                         break
@@ -416,12 +355,7 @@ class LLMWorker(Worker):
                                 req.acknowledge_cancel(self.env, self.id)
                             else:
                                 self.env.process(self._wait_for_cancel_release(req))
-                        if (
-                            not self.scheduler.running
-                            and not self.scheduler.waiting
-                            and not getattr(self.scheduler, "loaded_waiting", [])
-                        ):
-                            self.status = WorkerStatus.WAITING
+                        update_worker_status(self)
                 handoff = getattr(self.engine, "pd_handoff", None)
                 if handoff is not None:
                     handoff.notify()

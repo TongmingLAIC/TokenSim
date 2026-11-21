@@ -135,6 +135,19 @@ class ServingDomainsTest(unittest.TestCase):
                     batching="paged-attn", block_size=16, dp_lockstep=True
                 ),
             )
+        prefill_done = {}
+        save_duration = 0.001
+
+        def with_blocking_save(complete_step):
+            def complete(batch, duration):
+                result = complete_step(batch, duration)
+                prefill_done.update((request.id, env.now) for request in batch)
+                return max(result, save_duration)
+
+            return complete
+
+        for worker in engine.prefill_workers.workers:
+            worker.complete_step = with_blocking_save(worker.complete_step)
         requests = [Request(i, 16, 4, 16) for i in range(4)]
         env.process(LLMSource(env, engine, requests, 1, "burst"))
         env.run(until=1)
@@ -148,6 +161,12 @@ class ServingDomainsTest(unittest.TestCase):
         ]
         self.assertEqual({row["target_dp_rank"] for row in starts}, {0, 1, 2, 3})
         self.assertEqual({row["source_dp_rank"] for row in starts}, {0, 1})
+        self.assertTrue(
+            all(
+                row["time"] >= prefill_done[row["request_id"]] + save_duration
+                for row in starts
+            )
+        )
         self.assertEqual(set(engine.dp_coordinator.coordinators), {"P", "D"})
         self.assertTrue(
             all(c.stats.steps > 0 for c in engine.dp_coordinator.coordinators.values())

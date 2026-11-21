@@ -48,7 +48,7 @@ def LLMSource(
             ),
         )
 
-    for req in requests:
+    for index, req in enumerate(requests):
         if req.arrival_timestamp is not None and distribution != "burst":
             yield env.timeout(max(0.0, req.arrival_timestamp - env.now))
         req.arrive(env)
@@ -56,6 +56,8 @@ def LLMSource(
             engine.add_requests_burst([req])
         else:
             engine.add_requests([req])
+            if index == len(requests) - 1:
+                break
             if req.inter_arrival_time is not None:
                 yield env.timeout(req.inter_arrival_time)
             elif req.arrival_timestamp is None:

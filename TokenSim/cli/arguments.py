@@ -34,7 +34,7 @@ def build_parser():
         "--sim_time",
         type=float,
         default=None,
-        help="Stop at this simulated time (seconds) and export partial results.",
+        help="Stop before events at this simulated time in seconds, including background transfers.",
     )
     parser.add_argument(
         "--qps",
@@ -58,7 +58,7 @@ def build_parser():
         "--request_count",
         type=int,
         default=100,
-        help="Number of synthetic requests, or the maximum loaded from a dataset.",
+        help="Positive synthetic request count or dataset record limit. Dataset rows are not repeated.",
     )
     parser.add_argument(
         "--prefill_mean_len", type=int, help="Mean synthetic prompt length in tokens."
@@ -332,7 +332,7 @@ def build_parser():
         "--trace_target_qps",
         type=float,
         default=None,
-        help="Scale timestamped trace arrivals to this QPS using scale = original_trace_qps / trace_target_qps.",
+        help="Scale trace times so (arrivals - 1) / (last - earliest) matches this QPS.",
     )
     parser.add_argument(
         "--workload_type",

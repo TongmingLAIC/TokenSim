@@ -67,6 +67,7 @@ class Worker:
         self.env = env
         self.id = id
         self.msg_queue = simpy.PriorityStore(self.env)
+        self.pending_admissions = 0
 
     def send_task(
         self,
@@ -76,6 +77,7 @@ class Worker:
         metadata=None,
     ):
         if task == Task.ADD and worker.id >= 0:
+            worker.pending_admissions += len(requests or ())
             for request in requests or []:
                 request.owner_worker_ids.add(worker.id)
         worker.msg_queue.put(Message(task, self.id, requests, metadata))

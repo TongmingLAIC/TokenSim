@@ -20,39 +20,41 @@ class OpenRootsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             trace = tmp / "trace.jsonl"
-            trace.write_text(
-                json.dumps(
+            graph = dict(
+                id="open-root",
+                models=["fixture"],
+                block_size=16,
+                hash_id_scope="local",
+                requests=[
                     dict(
-                        id="open-root",
-                        models=["fixture"],
-                        block_size=16,
-                        hash_id_scope="local",
-                        requests=[
-                            dict(
-                                t=0.0,
-                                model="fixture",
-                                type="s",
-                                **{"in": 32, "out": 2},
-                                hash_ids=[1, 2],
-                                api_time=0.1,
-                            ),
-                            dict(
-                                t=0.5,
-                                model="fixture",
-                                type="s",
-                                **{"in": 64, "out": 2},
-                                hash_ids=[1, 2, 3, 4],
-                                api_time=0.1,
-                            ),
-                        ],
-                    )
-                )
-                + "\n"
+                        t=0.0,
+                        model="fixture",
+                        type="s",
+                        **{"in": 32, "out": 2},
+                        hash_ids=[1, 2],
+                        api_time=0.1,
+                    ),
+                    dict(
+                        t=0.5,
+                        model="fixture",
+                        type="s",
+                        **{"in": 64, "out": 2},
+                        hash_ids=[1, 2, 3, 4],
+                        api_time=0.1,
+                    ),
+                ],
             )
+            oversized = dict(
+                graph,
+                id="outside-window",
+                requests=[{**graph["requests"][0], "in": 1_000_000, "hash_ids": []}],
+            )
+            trace.write_text(json.dumps(graph) + "\n" + json.dumps(oversized) + "\n")
             arrivals = tmp / "arrivals.jsonl"
             arrivals.write_text(
                 "\n".join(
-                    json.dumps(dict(time_s=t, trace_index=0)) for t in [0.0, 0.05, 9.95]
+                    json.dumps(dict(time_s=t, trace_index=i))
+                    for t, i in [(0.0, 0), (0.05, 0), (9.95, 0), (10, 1)]
                 )
                 + "\n"
             )
@@ -110,7 +112,13 @@ class OpenRootsTest(unittest.TestCase):
             result = json.loads(next(output.glob("agentx_c*.json")).read_text())[
                 "agentx_metrics"
             ]
+            self.assertEqual(result["scheduled_roots"], 4)
             self.assertEqual(result["issued_roots"], 3)
+            self.assertEqual(result["issue_window_observed_s"], 10)
+            self.assertEqual(result["issue_window_completed_requests"], 5)
+            self.assertEqual(result["issue_window_output_tokens"], 10)
+            self.assertEqual(result["issue_window_completion_rps"], 0.5)
+            self.assertEqual(result["issue_window_output_token_tps"], 1.0)
             self.assertGreaterEqual(result["maximum_active_plays"], 2)
             self.assertEqual(result["completed_plays"], 3)
             self.assertEqual(result["censored_plays"], 0)

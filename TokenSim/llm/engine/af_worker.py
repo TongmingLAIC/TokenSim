@@ -80,10 +80,13 @@ def bind_af_worker(worker, worker_config, runtime_bindings, runtime_state):
 
 
 def _complete_compute(worker, running):
-    latency = worker.dynamic_batch(running)
-    if latency:
-        yield from worker.engine.run_complete_compute(worker.id, latency)
-    return latency
+    elapsed = 0.0
+    for stage in worker.forward_stages:
+        latency = stage.dynamic_batch(running)
+        if latency:
+            yield from worker.engine.run_complete_compute(stage.id, latency)
+            elapsed += latency
+    return elapsed
 
 
 def _af_compute(worker, requests):

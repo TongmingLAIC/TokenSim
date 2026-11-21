@@ -14,6 +14,12 @@ import simpy
 from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.llm.llm_request import Request
 from TokenSim.llm.forward import ForwardPass, RankShape
+from TokenSim.llm.engine.messages import Task, WorkerStatus
+from TokenSim.llm.engine.worker_step import (
+    accept_requests,
+    finish_worker_step,
+    update_worker_status,
+)
 
 
 class StepBoundary(simpy.Event):
@@ -93,27 +99,11 @@ class DPStepCoordinator:
             self.env.process(worker._wait_for_cancel_release(request))
 
     def consume_messages(self, worker):
-        # Local import avoids the engine/coordinator type-definition cycle.
-        from TokenSim.llm.llm_engine import (
-            Task,
-            WorkerStatus,
-            _merge_connector_metadata,
-        )
-
         while True:
             msg = yield worker.msg_queue.get()
             try:
                 if msg.task == Task.ADD:
-                    if msg.metadata is not None:
-                        worker.pending_connector_metadata = _merge_connector_metadata(
-                            msg.metadata, worker.pending_connector_metadata
-                        )
-                    worker.scheduler.add_requests(msg.requests or [])
-                    worker.status = (
-                        WorkerStatus.RUNNING
-                        if (worker.scheduler.running or worker.scheduler.waiting)
-                        else WorkerStatus.WAITING
-                    )
+                    accept_requests(worker, msg)
                     self.notify()
                 elif msg.task == Task.CANCEL:
                     for request in msg.requests or []:
@@ -126,7 +116,9 @@ class DPStepCoordinator:
                     worker.status = WorkerStatus.STOPPED
                     self.notify()
                     return
-                elif msg.task != Task.STEP:
+                elif msg.task == Task.STEP:
+                    self.notify()
+                else:
                     raise SimulationStateError("unknown task in DP input consumer")
             except Exception as error:
                 self.engine.record_worker_failure(worker.id, error)
@@ -134,8 +126,6 @@ class DPStepCoordinator:
                 return
 
     def run(self):
-        from TokenSim.llm.llm_engine import WorkerStatus
-
         while True:
             yield StepBoundary(self.env)
             if self.engine.failure is not None:
@@ -232,28 +222,17 @@ class DPStepCoordinator:
                     )
                     batch = batches[worker.id]
                     if batch:
-                        save_latency = worker.complete_step(batch, duration)
-                        save_latencies.append(save_latency)
-                        worker.finalize_connector_step()
-                        from TokenSim.llm.engine.serving_domains import (
-                            dispatch_finished_prefills,
-                        )
-
-                        dispatch_finished_prefills(worker)
-                    for request in self.pending_cancels.pop(worker.id, {}).values():
-                        self.cancel_at_boundary(worker, request)
-                    worker.status = (
-                        WorkerStatus.RUNNING
-                        if (worker.scheduler.running or worker.scheduler.waiting)
-                        else WorkerStatus.WAITING
-                    )
-                # Synchronous external stores (for example the Mooncake
-                # comparison backend) report a blocking save after compute.
-                # Keep the DP wave in lockstep by charging the slowest save
-                # once, while native asynchronous connectors return zero.
+                        save_latencies.append(worker.complete_step(batch, duration))
+                # Wait for the slowest blocking save before publishing or handing over KV.
                 save_duration = max(save_latencies, default=0.0)
                 if save_duration:
                     yield self.env.timeout(save_duration)
+                for worker, load_latency in zip(self.workers, load_latencies):
+                    if batches[worker.id] or load_latency:
+                        finish_worker_step(worker)
+                    for request in self.pending_cancels.pop(worker.id, {}).values():
+                        self.cancel_at_boundary(worker, request)
+                    update_worker_status(worker)
                 self.stats.steps += 1
                 self.stats.elapsed_step_seconds += duration
                 self.step_counter += 1

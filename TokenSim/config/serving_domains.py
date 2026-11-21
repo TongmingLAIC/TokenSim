@@ -29,8 +29,6 @@ def resolve_worker_config(config, overrides):
 
 
 def assign_domain_ranks(cluster, workers, global_parallel):
-    from TokenSim.config.cluster_config import validate_worker_count
-
     if cluster.af.enabled:
         raise ConfigurationError(
             "Complete-model group parallelism cannot be mixed with AF domains"
@@ -48,7 +46,11 @@ def assign_domain_ranks(cluster, workers, global_parallel):
             raise ConfigurationError(
                 "Every independent serving group needs dedicated prefill/decode role and parallel_config"
             )
-        validate_worker_count(group.num_workers, group.parallel_config)
+        if group.num_workers != group.parallel_config.world_size:
+            raise ConfigurationError(
+                f"Serving group {group.name} needs one worker per parallel rank: "
+                f"got {group.num_workers}, expected {group.parallel_config.world_size}"
+            )
         for rank, worker in enumerate(w for w in workers if w.name == group.name):
             worker.rank_info = ParallelRankInfo.from_global_rank(
                 rank, group.parallel_config

@@ -21,6 +21,7 @@ from TokenSim.errors import ConfigurationError
 from TokenSim.llm.llm_request import Request
 from TokenSim.trace.events import TraceEvent
 from .worker import LLMWorker
+from .replicas import bind_ordinary_replicas
 from .af_worker import AFComputeWorker
 
 
@@ -252,6 +253,7 @@ class AFEngineMixin:
                     runtime_state=runtime_state,
                 )
             self.workers.append(worker)
+        bind_ordinary_replicas(self.request_workers)
         for worker in self.request_workers:
             worker.connector.bind_runtime(worker)
             worker.parallel_communicator.workers = self.workers

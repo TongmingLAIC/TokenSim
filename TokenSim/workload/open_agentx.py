@@ -64,6 +64,25 @@ class OpenRootReplay(AgentXReplay):
         self.initial_trace_ids = []
         self.system_idle_cap = None
 
+    def capacity_graphs(self, *, sim_time=None):
+        start = self.env.now
+        end = start + self.profile_duration
+        if sim_time is not None:
+            end = min(end, sim_time)
+        indices = dict.fromkeys(
+            row["trace_index"]
+            for row in self.root_arrivals
+            if start + row["time_s"] < end
+        )
+        return (self.graphs[index] for index in indices)
+
+    def _next_root_at(self):
+        if self._arrival_index == len(self.root_arrivals):
+            return math.inf
+        return (
+            self.profile_started_at + self.root_arrivals[self._arrival_index]["time_s"]
+        )
+
     def _recycle(self):
         terminal = [play for play in self.trees if play.finished()]
         self.successful_plays += sum(not play.bad_outcome for play in terminal)
@@ -74,8 +93,8 @@ class OpenRootReplay(AgentXReplay):
         while (
             self.accepting
             and self.phase == "profiling"
-            and self._arrival_index < len(self.root_arrivals)
-            and self.root_arrivals[self._arrival_index]["time_s"] <= self.env.now + 1e-9
+            and self._next_root_at() <= self.env.now
+            and self.env.now < self.issue_window_end_at
         ):
             row = self.root_arrivals[self._arrival_index]
             play = self._tree(self.graphs[row["trace_index"]], self._arrival_index)
@@ -84,14 +103,8 @@ class OpenRootReplay(AgentXReplay):
         self.maximum_active_plays = max(self.maximum_active_plays, len(self.trees))
 
     def _wait(self, boundary):
-        if (
-            self.accepting
-            and self.phase == "profiling"
-            and self._arrival_index < len(self.root_arrivals)
-        ):
-            boundary = min(
-                boundary, float(self.root_arrivals[self._arrival_index]["time_s"])
-            )
+        if self.accepting and self.phase == "profiling":
+            boundary = min(boundary, self._next_root_at())
         if not self.trees:
             yield self.env.timeout(max(0, boundary - self.env.now))
             return
@@ -127,11 +140,33 @@ class OpenRootReplay(AgentXReplay):
 
     def runtime_metadata(self):
         metadata = super().runtime_metadata()
+        start = self.profile_started_at
+        end = self.issue_window_end_at
+        observed_end = min(end, self.env.now) if end is not None else None
+        observed_seconds = observed_end - start if start is not None else 0.0
+        in_window = [
+            request
+            for request in self.requests
+            if observed_end is not None
+            and request.completed_at is not None
+            and request.completed_at < observed_end
+            and not request.cancel_requested
+        ]
+        output_tokens = sum(request.generation_idx for request in in_window)
         return dict(
             metadata,
             load_model="open_root_arrivals",
             scheduled_roots=len(self.root_arrivals),
             issued_roots=self._arrival_index,
+            issue_window_observed_s=observed_seconds,
+            issue_window_completed_requests=len(in_window),
+            issue_window_output_tokens=output_tokens,
+            issue_window_completion_rps=(
+                len(in_window) / observed_seconds if observed_seconds else None
+            ),
+            issue_window_output_token_tps=(
+                output_tokens / observed_seconds if observed_seconds else None
+            ),
             maximum_active_plays=self.maximum_active_plays,
             completed_plays=self.successful_plays
             + sum(play.finished() and not play.bad_outcome for play in self.trees),

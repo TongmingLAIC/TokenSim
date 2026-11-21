@@ -26,6 +26,7 @@ from .configuration import (
     validate_moe_parallel_config,
 )
 from TokenSim.reporting import write_failure
+from .lifecycle import request_observation_duration, run_simulation
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -131,6 +132,13 @@ def main(args, preloaded_agentx_traces=None):
     replay = logs = None
     requests = []
     if args.workload_type == "agentx_weka":
+        if any(
+            getattr(args, name, None) is not None
+            for name in ("trace_timestamp_scale", "trace_target_qps")
+        ):
+            raise ConfigurationError(
+                "trace timestamp scaling applies to ordinary request datasets"
+            )
         if not args.dataset_path:
             raise ConfigurationError("agentx_weka requires --dataset_path")
         if (
@@ -159,7 +167,6 @@ def main(args, preloaded_agentx_traces=None):
             engine.trace_session.run_phase = (
                 "warmup" if args.agentx_warmup else "profiling"
             )
-        logs = ReplayLogs(run.results_path / "replay", engine)
         replay_class = AgentXReplay
         replay_options = {}
         if getattr(args, "agentx_root_arrivals", None):
@@ -191,16 +198,18 @@ def main(args, preloaded_agentx_traces=None):
             tree_idle_cap=(
                 args.agentx_tree_idle_cap if args.agentx_tree_idle_cap > 0 else None
             ),
-            event_sink=lambda record: logs.write("events", record),
-            request_sink=lambda record: logs.write("requests", record),
             **replay_options,
         )
         progress.set_total(
             sum(g.request_count for g in graphs) * args.agentx_concurrency
         )
-        probe = replay.capacity_request()
-        engine.validate_request_capacity([probe])
-        probe.release_logical_blocks()
+        probe = replay.capacity_request(sim_time=args.sim_time)
+        if probe is not None:
+            engine.validate_request_capacity([probe])
+            probe.release_logical_blocks()
+        logs = ReplayLogs(run.results_path / "replay", engine)
+        replay.event_sink = lambda record: logs.write("events", record)
+        replay.request_sink = lambda record: logs.write("requests", record)
         source = env.process(replay.run())
         env.process(logs.monitor(env, replay))
     else:
@@ -227,76 +236,9 @@ def main(args, preloaded_agentx_traces=None):
     engine.start_debug_clock(wall_start)
     error = None
     try:
-        if args.sim_time is not None:
-            if replay is not None:
-                horizon = env.timeout(args.sim_time)
-                env.run(until=env.any_of([source, horizon]))
-                if not source.triggered:
-                    run.termination_reason = "sim_time_limit"
-            else:
-                # Stop at the cutoff, but keep the clock at the natural end
-                # when the workload finishes first: run(until=...) would
-                # advance an idle clock to the cutoff and dilute throughput.
-                while env.peek() < args.sim_time:
-                    env.step()
-                if env.peek() != float("inf"):
-                    env.run(until=args.sim_time)
-                    if any(not r.is_done for r in requests):
-                        run.termination_reason = "sim_time_limit"
-        elif replay is not None:
-            env.run(until=source)
-        else:
-            env.run()
-        engine.raise_if_failed()
-        if run.termination_reason == "completed":
-            if engine.cache_controller is not None:
-                engine.cache_controller.close()
-            connectors = [
-                w.connector for w in engine.request_workers if w.connector.async_offload
-            ]
-            deadline = env.now + (replay.cancellation_timeout if replay else 10.0)
-            if replay and replay.issue_window_end_at is not None:
-                deadline = (
-                    replay.issue_window_end_at
-                    + replay.grace_period
-                    + replay.cancellation_timeout
-                )
-            while any(
-                c.loads or c.write_jobs or c.pending_writes for c in connectors
-            ) or (
-                engine.cache_controller is not None and engine.cache_controller.pending
-            ):
-                if env.now >= deadline:
-                    raise SimulationStateError(
-                        "KV transfers exceeded the cancellation drain deadline"
-                    )
-                env.run(
-                    until=env.any_of(
-                        [c.changed for c in connectors]
-                        + (
-                            [engine.cache_controller.changed]
-                            if engine.cache_controller is not None
-                            and engine.cache_controller.pending
-                            else []
-                        )
-                        + [env.timeout(deadline - env.now)]
-                    )
-                )
-            for connector in connectors:
-                capture = getattr(connector, "capture_end_of_workload", None)
-                if capture is not None:
-                    capture()
-            for connector in connectors:
-                drain = getattr(connector, "post_workload_drain", None)
-                if drain is not None:
-                    env.run(until=env.process(drain()))
-            for w in engine.request_workers:
-                manager = getattr(w.scheduler, "block_manager", None)
-                if manager is not None and hasattr(manager, "validate_conservation"):
-                    manager.validate_conservation()
-            from TokenSim.kv_transfer.native_storage import validate_external_stores
-
-            validate_external_stores(connectors)
+        run.termination_reason = run_simulation(
+            engine, source, replay=replay, sim_time=args.sim_time
+        )
     except Exception as exc:
         error = exc
         run.termination_reason = "failed"
@@ -321,7 +263,7 @@ def main(args, preloaded_agentx_traces=None):
         duration = replay.metric_observation_duration or replay.profile_elapsed
         successful = [r for r in requests if r.is_done and not r.cancel_requested]
     else:
-        duration = env.now
+        duration = request_observation_duration(requests, env.now)
         successful = [r for r in requests if r.is_done and not r.cancel_requested]
     unfinished = (
         replay.unfinished_request_ids

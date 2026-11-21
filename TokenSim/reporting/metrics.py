@@ -186,6 +186,13 @@ def get_agentx_metrics(
             load_model="open_root_arrivals",
             scheduled_roots=metadata["scheduled_roots"],
             issued_roots=metadata["issued_roots"],
+            issue_window_observed_s=metadata.get("issue_window_observed_s"),
+            issue_window_completed_requests=metadata.get(
+                "issue_window_completed_requests"
+            ),
+            issue_window_output_tokens=metadata.get("issue_window_output_tokens"),
+            issue_window_completion_rps=metadata.get("issue_window_completion_rps"),
+            issue_window_output_token_tps=metadata.get("issue_window_output_token_tps"),
             maximum_active_plays=metadata["maximum_active_plays"],
             completed_plays=metadata["completed_plays"],
             censored_plays=metadata["censored_plays"],

@@ -59,14 +59,3 @@ def build_dp_coordinator(engine):
     if set(coordinators) == {None}:
         return coordinators[None]
     return DomainCoordinators(coordinators)
-
-
-def dispatch_finished_prefills(worker):
-    if worker.role != "prefill":
-        return
-    completed = [req for req in worker.scheduler.running if not req.is_context_build]
-    if completed:
-        worker.engine.dispatch_prefill_to_decode(worker, completed)
-        worker.scheduler.running = [
-            req for req in worker.scheduler.running if req.is_context_build
-        ]

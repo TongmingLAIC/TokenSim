@@ -14,6 +14,7 @@ from TokenSim.errors import WorkloadValidationError
 from TokenSim.moe.routing import normalize_expert_histogram
 from TokenSim.utils import get_decode_lens, get_prefill_lens
 from TokenSim.workload.user_request import (
+    _timestamp,
     UserRequest,
     UserRequestList,
     nonnegative_int,
@@ -25,6 +26,14 @@ logger = logging.getLogger(__name__)
 def load_workload(
     args: Any, workload_config: WorkloadConfig, *, num_experts: int = 0
 ) -> UserRequestList:
+    scale = getattr(args, "trace_timestamp_scale", None)
+    target_qps = getattr(args, "trace_target_qps", None)
+    if workload_config.distribution == "burst" and (
+        scale is not None or target_qps is not None
+    ):
+        raise WorkloadValidationError(
+            "trace timestamp scaling requires non-burst arrivals"
+        )
     workload_type = args.workload_type
     if args.dataset_path and workload_type == "synthetic":
         workload_type = "json_pairs"
@@ -58,26 +67,29 @@ def load_workload(
 
     return apply_trace_timestamp_scaling(
         user_requests,
-        trace_timestamp_scale=getattr(args, "trace_timestamp_scale", None),
-        trace_target_qps=getattr(args, "trace_target_qps", None),
+        trace_timestamp_scale=scale,
+        trace_target_qps=target_qps,
     )
 
 
 def load_synthetic_workload(
     args: Any, workload_config: WorkloadConfig
 ) -> UserRequestList:
+    count = _validate_request_count(args.request_count)
+    if count is None:
+        raise WorkloadValidationError("synthetic workloads require request_count")
     prefill_lens = get_prefill_lens(
         len_mean=workload_config.prefill_mean_len,
         len_range=workload_config.prefill_range_len,
-        request_count=args.request_count,
+        request_count=count,
         rng=random.Random(args.random_seed),
     )
     decode_lens = get_decode_lens(
         distribution=workload_config.decode_len_distribution,
         len_mean=workload_config.decode_mean_len,
         len_range=workload_config.decode_range_len,
-        request_count=args.request_count,
-        rng=random.Random(args.random_seed),
+        request_count=count,
+        rng=random.Random(f"{args.random_seed}:decode"),
         numpy_rng=np.random.RandomState(args.random_seed % (1 << 32)),
     )
     return UserRequestList(
@@ -110,7 +122,7 @@ def load_json_pairs_workload(
     if not isinstance(data, list):
         raise WorkloadValidationError(f"json_pairs workload {path} must be a JSON list")
 
-    data = _repeat_and_slice(data, request_count, dataset_skip_count)
+    data = _slice_dataset(data, request_count, dataset_skip_count)
     user_requests = UserRequestList()
     for request_id, item in enumerate(data):
         if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -195,21 +207,26 @@ def load_qwen_jsonl_workload(
                 )
             rows.append(row)
 
-    rows = _repeat_and_slice(rows, request_count, dataset_skip_count)
-    timestamps = [row.get("timestamp") for row in rows]
-    first_timestamp = None
-    if any(timestamp is not None for timestamp in timestamps):
-        first_timestamp = min(
-            float(timestamp) for timestamp in timestamps if timestamp is not None
+    rows = _slice_dataset(rows, request_count, dataset_skip_count)
+    timestamps = [
+        (
+            _timestamp(row["timestamp"], f"timestamp of record {index} in {path}")
+            if row.get("timestamp") is not None
+            else None
         )
+        for index, row in enumerate(rows)
+    ]
+    first_timestamp = min(
+        (time for time in timestamps if time is not None), default=None
+    )
 
     user_requests = UserRequestList()
     seen_request_ids: set[int] = set()
     for request_id, row in enumerate(rows):
-        timestamp = row.get("timestamp")
+        timestamp = timestamps[request_id]
         arrival_time = None
         if timestamp is not None and first_timestamp is not None:
-            arrival_time = float(timestamp) - first_timestamp
+            arrival_time = timestamp - first_timestamp
         trace_request_id = row.get("request_id")
         unique_request_id = request_id
         if trace_request_id is not None:
@@ -318,22 +335,33 @@ def apply_trace_timestamp_scaling(
             raise WorkloadValidationError(
                 "trace_target_qps requires at least two timestamped arrivals"
             )
-        last_ts = max(arrival_times)
-        if last_ts <= 0:
+        span = max(arrival_times) - min(arrival_times)
+        if span <= 0:
             raise WorkloadValidationError(
-                "trace_target_qps requires a positive maximum arrival timestamp"
+                "trace_target_qps requires arrivals that span a positive interval"
             )
-        original_trace_qps = (len(arrival_times) - 1) / last_ts
-        scale = original_trace_qps / target_qps
+        scale = _positive_finite_float(
+            ((len(arrival_times) - 1) / span) / target_qps, "derived timestamp scale"
+        )
 
+    # Check all transformed timestamps before changing any request.
+    scaled = [_timestamp(time * scale, "scaled arrival_time") for time in arrival_times]
+    arrivals = iter(scaled)
     for request in user_requests:
         if request.arrival_time is not None:
-            request.arrival_time *= scale
+            request.arrival_time = next(arrivals)
     return user_requests
 
 
 def _positive_finite_float(value: Any, field_name: str) -> float:
-    numeric_value = float(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise WorkloadValidationError(f"{field_name} must be a positive finite number")
+    try:
+        numeric_value = float(value)
+    except OverflowError as error:
+        raise WorkloadValidationError(
+            f"{field_name} must be a positive finite number"
+        ) from error
     if not math.isfinite(numeric_value) or numeric_value <= 0:
         raise WorkloadValidationError(
             f"{field_name} must be a positive finite number, got {value!r}"
@@ -341,21 +369,26 @@ def _positive_finite_float(value: Any, field_name: str) -> float:
     return numeric_value
 
 
-def _repeat_and_slice(
+def _validate_request_count(count: int | None) -> int | None:
+    if count is None:
+        return None
+    count = nonnegative_int(count, "request_count")
+    if not count:
+        raise WorkloadValidationError("request_count must be positive")
+    return count
+
+
+def _slice_dataset(
     data: list[Any], request_count: int | None, dataset_skip_count: int
 ) -> list[Any]:
-    if dataset_skip_count < 0:
-        raise WorkloadValidationError("dataset_skip_count must be non-negative")
-    data = data[dataset_skip_count:]
-    if not data:
+    count = _validate_request_count(request_count)
+    start = nonnegative_int(dataset_skip_count, "dataset_skip_count")
+    selected = data[start : None if count is None else start + count]
+    if not selected:
         raise WorkloadValidationError(
             "dataset is empty after applying dataset_skip_count"
         )
-    if request_count is not None and request_count > len(data):
-        data = data * (request_count // len(data) + 1)
-    if request_count is not None:
-        data = data[:request_count]
-    return data
+    return selected
 
 
 def _print_dataset_summary(path: Path, user_requests: UserRequestList) -> None:

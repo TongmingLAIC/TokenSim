@@ -37,7 +37,7 @@ def parallel_domain_stats(engine):
                 ]
             },
             placements={
-                role: dict(getattr(pool, "dp_placement_counts", {}))
+                role: pool.placements_in_domain(name)
                 for role, pool in [
                     ("prefill", engine.prefill_workers),
                     ("decode", engine.decode_workers),

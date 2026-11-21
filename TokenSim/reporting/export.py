@@ -134,6 +134,7 @@ def export_result(
     result_dict = {
         key: value for key, value in asdict(result).items() if value is not None
     }
+    result_dict["simulation_elapsed_s"] = engine.env.now
     result_dict["cluster"] = asdict(result.cluster)
     result_dict["request_time"] = asdict(result.request_time)
     result_dict["prefill_time"] = asdict(result.prefill_time)

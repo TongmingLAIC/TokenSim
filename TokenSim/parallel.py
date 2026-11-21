@@ -181,7 +181,7 @@ class ParallelCommunicator:
                 if config.expert_parallel_group(dp, tp) == my_ep_group:
                     ids.append(worker.id)
             elif kind == "pp_next":
-                next_pp = (me.pp_rank + 1) % self.parallel_config.pipeline_parallel_size
+                next_pp = me.pp_rank + 1
                 if dp == me.dp_rank and tp == me.tp_rank and pp == next_pp:
                     ids.append(worker.id)
         if self.worker_id not in ids and kind != "pp_next":

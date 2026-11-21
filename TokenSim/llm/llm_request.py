@@ -6,7 +6,7 @@ from typing import Any, Sequence
 from enum import Enum, auto
 
 from TokenSim.block.block import PhysicalTokenBlock
-from TokenSim.errors import SimulationStateError
+from TokenSim.errors import ConfigurationError, SimulationStateError
 
 
 class RequestStatus(Enum):
@@ -156,6 +156,7 @@ class Request:
     # Context-building steps this request's prompt took (1 without chunking).
     prefill_chunks: int = 0
     # Routing decision of session-aware routers.
+    dp_domain: str | None = field(default=None, repr=False)
     dp_rank: int | None = field(default=None, repr=False)
     routing_worker_id: int | None = field(default=None, repr=False)
     # Workload-specific provenance, for example an AgentX trace turn.
@@ -350,6 +351,13 @@ class Request:
     @property
     def arrival_time(self):
         return self.arrival_at
+
+    def validate_prompt_length(self, limit):
+        if limit is not None and self.prefill_len >= limit:
+            raise ConfigurationError(
+                f"request {self.id} prompt must leave room for an output token "
+                f"within max_model_len={limit}"
+            )
 
     def arrive(self, env: simpy.Environment):
         if self.cancel_requested:

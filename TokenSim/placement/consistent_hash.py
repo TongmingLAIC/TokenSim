@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import Counter
+from TokenSim.placement.policies import replica_key
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.config.router_config import validate_router_mapping
@@ -76,10 +77,18 @@ class ConsistentHashRouter:
     """
 
     def __init__(self, workers, *, backend_url="http://localhost:8889"):
-        self.workers = {w.dp_rank: w for w in workers}
+        scoped = len({replica_key(worker)[0] for worker in workers}) > 1
+        self.workers = {
+            (
+                f"{replica_key(worker)[0]}:{worker.dp_rank}"
+                if scoped
+                else worker.dp_rank
+            ): worker
+            for worker in workers
+        }
         if len(self.workers) != len(workers) or not workers:
             raise ConfigurationError(
-                "router needs exactly one schedulable leader per DP rank"
+                "router needs exactly one schedulable leader per serving replica"
             )
         self.urls = {rank: f"{backend_url}@{rank}" for rank in self.workers}
         ring = {}
@@ -107,10 +116,11 @@ class ConsistentHashRouter:
             self.sessions[session] = self.rank_for_key(f"header:x-session-id:{session}")
             self.session_counts[self.sessions[session]] += 1
         rank = self.sessions[session]
-        request.dp_rank = rank
-        request.routing_worker_id = self.workers[rank].id
+        worker = self.workers[rank]
+        request.dp_domain, request.dp_rank = replica_key(worker)
+        request.routing_worker_id = worker.id
         self.request_counts[rank] += 1
-        return self.workers[rank]
+        return worker
 
     def reset_stats(self):
         self.request_counts.clear()
@@ -138,6 +148,11 @@ class FixedWorkerRouter:
     """
 
     def __init__(self, workers, mapping, *, backend_url="http://localhost:8889"):
+        if len({replica_key(worker)[0] for worker in workers}) > 1:
+            raise ConfigurationError(
+                "Fixed worker mapping requires one prefill domain; use consistent_hash "
+                "for multiple prefill domains"
+            )
         self.workers = {w.dp_rank: w for w in workers}
         self.mapping = validate_router_mapping(mapping)
         if any(rank not in self.workers for rank in self.mapping.values()):
@@ -159,8 +174,8 @@ class FixedWorkerRouter:
             worker = self.fallback.select(request)
             rank = worker.dp_rank
         else:
-            request.dp_rank = rank
             worker = self.workers[rank]
+            request.dp_domain, request.dp_rank = replica_key(worker)
             request.routing_worker_id = worker.id
             self.mapped_request_counts[rank] += 1
         self.request_counts[rank] += 1

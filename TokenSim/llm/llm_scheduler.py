@@ -68,13 +68,19 @@ class LLMScheduler(ABC):
     def __init__(self, connector=None):
         self.running: list[Request] = []
         self.waiting: list[Request] = []
+        self.max_model_len: int | None = None
         self.connector = connector or NoopConnector(KVTransferConfig.default())
 
     def add_requests(self, requests: list[Request]):
         requests = [
             req for req in requests if not getattr(req, "cancel_requested", False)
         ]
+        if self.max_model_len is not None:
+            for req in requests:
+                req.validate_prompt_length(self.max_model_len)
         for req in requests:
+            if self.max_model_len is not None:
+                req.max_model_len = self.max_model_len
             self.connector.on_new_request(req)
         self.waiting.extend(requests)
 
@@ -275,17 +281,6 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         if set_releaser is not None:
             set_releaser(self._release_delayed_blocks)
 
-    def add_requests(self, requests):
-        limit = self.max_model_len
-        if limit is not None:
-            for req in requests:
-                if req.prefill_len >= limit:
-                    raise ConfigurationError(
-                        "prompt must leave room for an output token within max_model_len"
-                    )
-                req.max_model_len = limit
-        super().add_requests(requests)
-
     def _admit(self, req: Request, *, external=None) -> None:
         """Allocate KV blocks for the whole context and record what is already cached."""
         local_plan = self.block_manager.plan_reuse(req)
@@ -417,8 +412,9 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
             ]
 
     def _is_occupy_below_usage(self):
-        (_, used_blks, all_blks) = self.block_manager.get_gpu_status()
-        return used_blks / all_blks < self.max_occupy_ratio
+        free, _, total = self.block_manager.get_gpu_status()
+        usable = total - int(self.block_manager.grouped_cache)
+        return usable > 0 and (usable - free) / usable < self.max_occupy_ratio
 
     def _preempt(self, req: Request) -> None:
         if req.status != RequestStatus.RUNNING:

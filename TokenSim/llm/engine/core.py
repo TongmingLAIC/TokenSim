@@ -19,11 +19,13 @@ from TokenSim.placement import (
     LeastGpuMemoryWorkerPool,
     RoundRobinWorkerPool,
 )
+from TokenSim.placement.policies import replica_key
 from TokenSim.moe import build_expert_placement
 from TokenSim.config.model_config import ModelSpec
 from .messages import Task, Worker, RequestCompletionDebugPrinter
 from .worker import LLMWorker
 from .af import AFEngineMixin
+from .replicas import validate_layouts, validate_request_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,7 @@ class LLMEngine(AFEngineMixin, Worker):
             "balanced_load": BalancedLoadWorkerPool,
         }
         self.hardware = hardware
-        self.parallel_config = parallel_config or ParallelConfig.default()
+        self.parallel_config = cluster_config.effective_parallel_config(parallel_config)
         self.debug_printer = RequestCompletionDebugPrinter(config.debug_print)
         self.model_spec = model_spec
         self.moe_config = self.model_spec.moe
@@ -76,6 +78,14 @@ class LLMEngine(AFEngineMixin, Worker):
         self.max_num_batched_tokens = config.max_num_batched_tokens
 
         worker_configs = cluster_config.workers(self.parallel_config)
+        validate_layouts(
+            cluster_config,
+            worker_configs,
+            model_spec,
+            self.parallel_config,
+            config,
+            kv_transfer_config,
+        )
         self.placement = build_topology_placement(
             cluster_config, worker_configs, hardware
         )
@@ -235,64 +245,13 @@ class LLMEngine(AFEngineMixin, Worker):
             pool = getattr(self, pool_name, None)
             if pool is None:
                 continue
-            pool.placement_decision_count = 0
-            if hasattr(pool, "dp_placement_counts"):
-                pool.dp_placement_counts = {
-                    rank: 0 for rank in pool.dp_placement_counts
-                }
+            pool.reset_stats()
 
     def validate_request_capacity(self, requests: list[Request]) -> None:
-        role_pools = (
-            (
-                "prefill",
-                self.prefill_workers.workers,
-                lambda req: req.num_logical_token_blocks,
-            ),
-            (
-                "decode",
-                self.decode_workers.workers,
-                lambda req: (req.prefill_len + req.decode_len + req.block_size - 1)
-                // req.block_size,
-            ),
-        )
-        for role, workers, required_blocks in role_pools:
-            capacities = []
-            for worker in workers:
-                block_manager = getattr(worker.scheduler, "block_manager", None)
-                if block_manager is None:
-                    continue
-                capacities.append(
-                    block_manager.num_total_gpu_blocks - block_manager.watermark_blocks
-                )
-            if not capacities:
-                continue
-            available_blocks = min(capacities)
-            for req in requests:
-                layouts = [
-                    getattr(
-                        getattr(worker, "cache_config", None), "hybrid_layout", None
-                    )
-                    for worker in workers
-                ]
-                needed = max(
-                    (
-                        layout.max_request_slots(req.prefill_len + req.decode_len)
-                        if layout is not None
-                        else required_blocks(req)
-                    )
-                    for layout in layouts
-                )
-
-                if needed > available_blocks:
-                    raise ConfigurationError(
-                        f"request {req.id} cannot fit on every eligible {role} worker: "
-                        f"required_blocks={needed}, available_blocks={available_blocks}, "
-                        f"prefill_len={req.prefill_len}, decode_len={req.decode_len}, "
-                        f"block_size={req.block_size}"
-                    )
+        validate_request_capacity(self, requests)
 
     def _build_worker_pool(self, workers, pool_cls):
-        if len({getattr(worker, "dp_rank", 0) for worker in workers}) > 1:
+        if len({replica_key(worker) for worker in workers}) > 1:
             return DataParallelWorkerPool(
                 workers,
                 pool_cls,
@@ -331,21 +290,15 @@ class LLMEngine(AFEngineMixin, Worker):
         requests = [req for req in requests or [] if not req.cancel_requested]
         if not requests:
             return
-        if self.router is not None:
-            groups = {}
-            for request in requests:
+        for request in requests:
+            if self.router is None:
+                worker = self.prefill_workers.select_prefill_worker(request)
+            else:
                 worker = self.router.select(request)
-                self.prefill_workers.placement_decision_count += 1
-                if hasattr(self.prefill_workers, "dp_placement_counts"):
-                    self.prefill_workers._record(worker)
-                groups.setdefault(worker.id, (worker, []))[1].append(request)
-            for worker, batch in groups.values():
-                self.send_task(worker, Task.ADD, batch)
-            return
-        worker = self.prefill_workers.select_prefill_worker(
-            requests[0] if requests else None
-        )
-        self.send_task(worker, Task.ADD, requests)
+                self.prefill_workers.record_placement(worker)
+            if worker.execution_domain is not None:
+                request.dp_domain, request.dp_rank = replica_key(worker)
+            self.send_task(worker, Task.ADD, [request])
 
     def cancel_requests(self, requests: list[Request]) -> list[simpy.Event]:
         events = []

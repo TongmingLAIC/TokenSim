@@ -181,12 +181,20 @@ class AgentXReplay(ReplayClock, RequestLifecycle):
             "issue_mode": self.issue_mode,
         }
 
-    def capacity_request(self):
-        turns = [turn for graph in self.graphs for turn in graph.all_turns()]
-        maximum_input = max(t.request.input_length for t in turns)
-        maximum_context = max(
-            t.request.input_length + t.requested_output_tokens for t in turns
-        )
+    def capacity_graphs(self, *, sim_time=None):
+        return self.graphs
+
+    def capacity_request(self, *, sim_time=None):
+        maximum_input = maximum_context = 0
+        for graph in self.capacity_graphs(sim_time=sim_time):
+            for turn in graph.all_turns():
+                length = turn.request.input_length
+                maximum_input = max(maximum_input, length)
+                maximum_context = max(
+                    maximum_context, length + turn.requested_output_tokens
+                )
+        if not maximum_input:
+            return None
         return Request(
             -1, maximum_input, max(1, maximum_context - maximum_input), self.block_size
         )
