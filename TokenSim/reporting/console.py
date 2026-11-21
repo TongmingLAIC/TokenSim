@@ -17,6 +17,8 @@ from .stats import (
     get_mooncake_stats,
 )
 
+from .request_metrics import RequestLatencies
+
 if TYPE_CHECKING:
     from TokenSim.llm.llm_engine import LLMEngine
 
@@ -30,10 +32,15 @@ def print_all_stats(
     prefill_lens: list[int],
     slo: dict[str, Any] | None = None,
 ):
-    request_time = MetricData.from_list(g_time.request_time)
-    prefill_time = MetricData.from_list(g_time.prefill_time)
-    decode_time = MetricData.from_list(g_time.decode_time)
-    decode_max_time = MetricData.from_list(g_time.decode_max_time)
+    samples = RequestLatencies.finished(requests)
+    prefill_latency = [sample.first_token for sample in samples]
+    decode_latency = [sample.tpot for sample in samples if sample.tpot is not None]
+    request_time = MetricData.from_list([sample.end_to_end for sample in samples])
+    prefill_time = MetricData.from_list(prefill_latency)
+    decode_time = MetricData.from_list(decode_latency)
+    decode_max_time = MetricData.from_list(
+        [sample.max_gap for sample in samples if sample.max_gap is not None]
+    )
     prefill_idle_time = MetricData.from_list(g_time.prefill_idle)
     decode_idle_time = MetricData.from_list(g_time.decode_idle)
 
@@ -46,10 +53,6 @@ def print_all_stats(
         prefill_idle_time,
         decode_idle_time,
     )
-    prefill_latency = [req.prefill_latency for req in requests]
-    decode_latency = [
-        req.decode_time_sum / max(1, req.generation_idx - 1) for req in requests
-    ]
     # Print latency statistics.
     print_latency_stats(prefill_latency, decode_latency)
     # Print throughput statistics.
@@ -93,12 +96,11 @@ def print_metrics(
 
 
 def print_latency_stats(prefill_latency: List[float], decode_latency: List[float]):
-    print(f"Average prefill latency: {sum(prefill_latency) / len(prefill_latency)}")
-    print(f"Max prefill latency: {max(prefill_latency)}")
-    print(f"Min prefill latency: {min(prefill_latency)}")
-    print(f"Average decode latency: {sum(decode_latency) / len(decode_latency)}")
-    print(f"Max decode latency: {max(decode_latency)}")
-    print(f"Min decode latency: {min(decode_latency)}")
+    for phase, values in (("prefill", prefill_latency), ("decode", decode_latency)):
+        if values:
+            print(f"Average {phase} latency: {sum(values) / len(values)}")
+            print(f"Max {phase} latency: {max(values)}")
+            print(f"Min {phase} latency: {min(values)}")
 
 
 def print_throughput_stats(dur: float, request_count: int, output_tokens: List[int]):
@@ -212,9 +214,8 @@ def print_operator_latency_stats(engine: LLMEngine):
         if share > 0
     }
     if formula_share:
-        # Loud on purpose: any share here is simulated time resting on formulas
-        # rather than measurements, see missing_shapes_<qps>.json.
-        print(f"Latency WARNING analytical share per table: {formula_share}")
+        warning = " WARNING" if stats.get("operator_missing_shape_count") else ""
+        print(f"Latency{warning} analytical share per table: {formula_share}")
     for group in stats.get("operator_missing_shapes", [])[:5]:
         print(
             f"  missing {group['table']} {group['key']} axes={group['axes']} "

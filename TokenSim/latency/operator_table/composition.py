@@ -286,6 +286,8 @@ class StepComposition:
     def _communication(
         self, tokens: int, moe_comm_bytes: int, *, logits_rows: int = 0
     ) -> float:
+        if getattr(self, "trace_communication_start", None) is not None:
+            self.trace_communication_start()
         if self.communicator is None:
             return 0.0
         hidden_bytes = int(tokens * self.model.hidden_size * self.activation_bytes)

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
+from functools import cached_property
+from math import prod
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from TokenSim.config.validation import integer
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware._yaml import load_yaml_mapping, require
 from TokenSim.hardware.links import LinkCatalog, LinkClass
@@ -32,8 +36,8 @@ class TopologyLevel:
     collective_algorithm: str = "auto"
 
     def __post_init__(self) -> None:
-        if self.size is not None and self.size < 1:
-            raise ConfigurationError(f"topology level {self.name!r}: size must be >= 1")
+        if self.size is not None:
+            integer(self.size, f"topology level {self.name!r} size", minimum=1)
         if self.fabric not in FABRICS:
             raise ConfigurationError(
                 f"topology level {self.name!r}: fabric must be one of {FABRICS}"
@@ -53,7 +57,7 @@ class TopologyLevel:
         size = raw.get("size")
         return cls(
             name=name,
-            size=int(size) if size is not None else None,
+            size=size,
             link=str(require(raw, "link", f"{context} level {name!r}")),
             fabric=str(raw.get("fabric", "switched")),
             links_per_endpoint=int(raw.get("links_per_endpoint", 1)),
@@ -70,11 +74,13 @@ class GroupLayout:
     ``i == 0``) that participate inside one level ``i`` group. A TP group of
     16 GPUs over two 8-GPU nodes has ``fan == (8, 2)``; ``levels`` are the
     topology levels actually crossed (``fan[i] > 1``) plus the innermost.
+    ``node_count`` is the exact number of occupied level-zero groups.
     """
 
     ranks: tuple[int, ...]
     fan: tuple[int, ...]
     lowest_common_level: int  # -1: single device, 0: same level-0 group, ...
+    node_count: int | None = None
 
     @property
     def size(self) -> int:
@@ -178,59 +184,70 @@ class TopologySpec:
 
     # -- coordinates ------------------------------------------------------
 
+    @cached_property
+    def capacity(self) -> int | None:
+        """Number of devices in a finite topology."""
+        if self.levels[-1].size is None:
+            return None
+        return prod(level.size for level in self.levels)
+
+    def validate_device_index(self, device_index: int) -> int:
+        slot = integer(device_index, "device index")
+        if self.capacity is not None and slot >= self.capacity:
+            raise ConfigurationError(
+                f"topology {self.topology_id!r} has {self.capacity} device slots; "
+                f"device index {slot} is outside the inventory"
+            )
+        return slot
+
     def coordinates(self, device_index: int) -> tuple[int, ...]:
         """Group index of ``device_index`` at every level (innermost first)."""
-        if device_index < 0:
-            raise ConfigurationError("device index must be non-negative")
         coords: list[int] = []
-        cursor = device_index
+        cursor = self.validate_device_index(device_index)
         for level in self.levels:
-            if level.size is None:
-                # An unbounded level is a single group containing everything.
-                coords.append(0)
-                cursor = 0
-            else:
-                cursor = cursor // level.size
-                coords.append(cursor)
-        # coords[i] is the level-i group id containing the device.
+            cursor = 0 if level.size is None else cursor // level.size
+            coords.append(cursor)
         return tuple(coords)
 
-    def lowest_common_level(self, device_indices: Sequence[int]) -> int:
-        unique = sorted(set(device_indices))
-        if len(unique) <= 1:
+    def _occupied_groups(self, device_indices: Sequence[int]):
+        coordinates = {
+            index: self.coordinates(index) for index in dict.fromkeys(device_indices)
+        }
+        groups = tuple(set(level) for level in zip(*coordinates.values()))
+        return coordinates, groups
+
+    @staticmethod
+    def _common_level(coordinates, groups) -> int:
+        if len(coordinates) <= 1:
             return -1
-        coords = [self.coordinates(index) for index in unique]
-        for level_index in range(len(self.levels)):
-            if len({c[level_index] for c in coords}) == 1:
-                return level_index
-        # Outermost level is unbounded, so this is unreachable; keep a guard.
-        return len(self.levels) - 1
+        return next(
+            level for level, group_ids in enumerate(groups) if len(group_ids) == 1
+        )
+
+    def lowest_common_level(self, device_indices: Sequence[int]) -> int:
+        return self._common_level(*self._occupied_groups(device_indices))
 
     def group_layout(self, device_indices: Sequence[int]) -> GroupLayout:
         ranks = tuple(device_indices)
-        unique = sorted(set(ranks))
-        if not unique:
+        coords, groups = self._occupied_groups(ranks)
+        if not ranks:
             raise ConfigurationError("group layout requires at least one rank")
-        common = self.lowest_common_level(unique)
-        if common < 0:
-            return GroupLayout(
-                ranks=ranks, fan=(1,) * len(self.levels), lowest_common_level=-1
+        if len(coords) < len(ranks):
+            raise ConfigurationError("group layout requires unique device indices")
+        fan = [max(Counter(c[0] for c in coords.values()).values())]
+        for level_index, child_groups in enumerate(groups[:-1], 1):
+            # An unbounded level owns all child groups.
+            size = self.levels[level_index].size
+            parents = Counter(
+                0 if size is None else child // size for child in child_groups
             )
-        coords = [self.coordinates(index) for index in unique]
-        fan: list[int] = []
-        for level_index in range(len(self.levels)):
-            # children at this level: devices (level 0) or level-1 groups
-            if level_index == 0:
-                children = {(index, c[0]) for index, c in zip(unique, coords)}
-                parent_of = {child: child[1] for child in children}
-            else:
-                children = {tuple(c[level_index - 1 : level_index + 1]) for c in coords}
-                parent_of = {child: child[1] for child in children}
-            counts: dict[int, int] = {}
-            for child, parent in parent_of.items():
-                counts[parent] = counts.get(parent, 0) + 1
-            fan.append(max(counts.values()))
-        return GroupLayout(ranks=ranks, fan=tuple(fan), lowest_common_level=common)
+            fan.append(max(parents.values()))
+        return GroupLayout(
+            ranks=ranks,
+            fan=tuple(fan),
+            lowest_common_level=self._common_level(coords, groups),
+            node_count=len(groups[0]),
+        )
 
     def level_link(self, level_index: int, links: LinkCatalog) -> LinkClass:
         return links.get(self.levels[level_index].link)

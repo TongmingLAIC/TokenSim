@@ -1,14 +1,20 @@
 """Peer arrival accounting requires complete groups and a proven clock basis."""
 
 from copy import deepcopy
+from dataclasses import replace
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
+from TokenSim.errors import ConfigurationError
 from TokenSim.profiler.collectives import analyze_collectives, service_metrics
+from TokenSim.profiler.compatibility import validate_inputs
 from TokenSim.profiler.importer import ImportedTrace
+from TokenSim.profiler.matching import match_spans
 from TokenSim.profiler.records import Span
 from TokenSim.profiler.reporting import write_comparison
+from TokenSim.profiler.timeline import prepare_timeline
 
 
 def experiment(*, proof=True):
@@ -136,3 +142,91 @@ class CollectiveWaitTest(unittest.TestCase):
                     service_metrics(*pairs[0])["profiled_device_service_us"]
                 )
                 self.assertEqual(pairs[0][1].busy_us, 16)
+
+    def test_unmatched_shared_clock_aligns_the_same_in_chrome_and_timeline(self):
+        pairs, observed = experiment()
+        extra = replace(
+            observed.spans[0],
+            id="gpu:extra",
+            operation="attention",
+            rank="2",
+            clock="clock:2",
+            start_us=108,
+            end_us=120,
+            category="compute",
+            details={},
+        )
+        observed.spans.append(extra)
+        observed.diagnostics["collective_waits"] = analyze_collectives(pairs, observed)
+        simulated = ImportedTrace([left for left, _ in pairs], {}, [], {})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            report = write_comparison(
+                simulated,
+                observed,
+                pairs,
+                [dict(extra.as_dict(), status="unmatched", side="profiled")],
+                [],
+                output,
+                mapping_hash="hash",
+            )
+            chrome = json.loads((output / "comparison.trace.json").read_text())
+        row = next(
+            row for row in chrome["traceEvents"] if row["args"].get("id") == extra.id
+        )
+        bars = prepare_timeline(report, detail="module")["bars"]
+        bar = next(bar for bar in bars if bar.span_id == extra.id)
+        self.assertEqual(row["ts"], 8)
+        self.assertEqual(row["ts"], bar.start_us + bar.translation_us)
+
+    def test_repeated_collectives_do_not_pair_across_missing_callsites(self):
+        pairs, observed = experiment()
+        simulated = []
+        for left, right in pairs:
+            simulated.extend(
+                [
+                    replace(
+                        left,
+                        id=f"{left.id}:{site}",
+                        shape={"m": site},
+                        start_us=site * 6,
+                        end_us=site * 6 + 6,
+                    )
+                    for site in range(2)
+                ]
+            )
+            right.shape = {"m": int(right.rank)}
+        matched, _, _ = match_spans(simulated, observed.spans)
+        self.assertEqual(
+            [left.details["collective_callsite"] for left, _ in matched], [0, 1]
+        )
+        result = analyze_collectives(matched, observed)
+        self.assertEqual(result["analyzed_calls"], 0)
+
+    def test_rank_mapping_selects_the_declared_worker_domain_layout(self):
+        pairs, _ = experiment()
+        worker_parallelism = {
+            "0": {"domain": "prefill", "tensor_parallel_size": 4},
+            "1": {"domain": "decode", "tensor_parallel_size": 2},
+        }
+        simulated = ImportedTrace(
+            [left for left, _ in pairs],
+            {"worker_parallelism": worker_parallelism},
+            [],
+            {},
+        )
+        observed = ImportedTrace(
+            [replace(pairs[0][1], rank="local", source="trace.json")],
+            {},
+            [{"path": "trace.json", "manifest": {"tensor_parallel_size": 2}}],
+            {},
+        )
+        evidence = validate_inputs(simulated, observed, {"local": "1"})
+        self.assertIn(
+            {"source": "trace.json", "field": "tensor_parallel_size"},
+            evidence["checked"],
+        )
+        with self.assertRaisesRegex(
+            ConfigurationError, "incompatible tensor_parallel_size"
+        ):
+            validate_inputs(simulated, observed, {"local": "0"})

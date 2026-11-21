@@ -89,10 +89,7 @@ class AFEngineIntegrationTest(unittest.TestCase):
         self.assertEqual(request.generation_idx, 3)
         self.assertEqual(request.step_calls, 3)
         self.assertEqual(commit_input_cache.call_count, 2)
-        self.assertEqual(
-            [item["phase"] for item in engine.af_iteration_summaries],
-            ["decode", "decode"],
-        )
+        self.assertEqual(engine.af_iteration_count, 2)
         self.assertEqual({query.phase for query in compute.queries}, {"decode"})
         self.assertEqual({query.phase for query in transfer.queries}, {"decode"})
         self.assertTrue({query.stage for query in compute.queries})
@@ -133,10 +130,28 @@ class AFEngineIntegrationTest(unittest.TestCase):
             request = _run_request(env, engine, decode_len=2)
         self.assertTrue(request.is_done)
         self.assertEqual(prefill_calls, [(True,)])
-        self.assertEqual(
-            [item["phase"] for item in engine.af_iteration_summaries], ["decode"]
-        )
+        self.assertEqual(engine.af_iteration_count, 1)
         self.assertEqual({query.phase for query in transfer.queries}, {"decode"})
+
+    def test_warmup_iterations_are_excluded_from_profile_count(self):
+        env, engine, _ = _build_engine(
+            _typed_cluster(),
+            FixedComputeProvider(0.001, 0.001),
+            FixedTransferProvider(0.0001, 0.0001),
+        )
+        for index, phase in enumerate(("warmup", "profile")):
+            req = Request(index, 8, 2, 4, measurement_phase=phase)
+            req.arrive(env)
+            engine.add_requests_burst([req])
+            env.run(until=req.completion_event)
+            engine.raise_if_failed()
+            self.assertTrue(req.is_done)
+            if phase == "warmup":
+                engine.reset_profile_stats()
+        stats = get_af_stats(engine)
+        self.assertEqual(stats["af_warmup_iteration_count"], 1)
+        self.assertEqual(stats["af_iteration_count"], 1)
+        self.assertIsNone(stats["af_trace"])
 
     def test_af_disabled_keeps_complete_backend_and_creates_no_af_state(self):
         env, engine, roofline = _build_engine(_disabled_cluster())
@@ -275,9 +290,7 @@ class MixedServingTest(unittest.TestCase):
         self.assertEqual(complete.call_count, 1)
         self.assertEqual(complete.call_args.args[0], [prefill])
         self.assertEqual({query.phase for query in compute.queries}, {"decode"})
-        self.assertEqual(
-            [item["phase"] for item in engine.af_iteration_summaries], ["decode"]
-        )
+        self.assertEqual(engine.af_iteration_count, 1)
 
     def test_memory_pressure_recomputes_decode_context_through_af(self):
         env, engine, compute = self.engine(capacity=16, af_block_size=16)
@@ -306,9 +319,7 @@ class MixedServingTest(unittest.TestCase):
                 for q in compute.queries
             )
         )
-        self.assertEqual(
-            {item["phase"] for item in engine.af_iteration_summaries}, {"decode"}
-        )
+        self.assertGreater(engine.af_iteration_count, 0)
         self.assertEqual(engine.af_executor.active_iterations, {})
 
     def test_failed_decode_cancels_complete_prefill_and_releases_resources(self):

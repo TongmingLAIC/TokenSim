@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 from TokenSim.results import MetricData
 from TokenSim.llm.llm_request import Request
+from .request_metrics import request_tpot
 
 
 def _is_root_stream(stream_id: str | None) -> bool:
@@ -59,9 +60,7 @@ def get_agentx_metrics(
     e2e = [request.total_time for request in requests]
     # TPOT/ITL: mean inter-token latency excluding first token (matches vLLM).
     tpot = [
-        request.decode_time_sum / (request.generation_idx - 1)
-        for request in requests
-        if request.generation_idx > 1
+        value for request in requests if (value := request_tpot(request)) is not None
     ]
     normalized_latency = [
         request.total_time / request.generation_idx
@@ -242,9 +241,7 @@ def get_agentx_metrics(
         sub_ttft = [r.prefill_latency for r in subset]
         sub_e2e = [r.total_time for r in subset]
         sub_tpot = [
-            r.decode_time_sum / (r.generation_idx - 1)
-            for r in subset
-            if r.generation_idx > 1
+            value for request in subset if (value := request_tpot(request)) is not None
         ]
         result[f"{label}_ttft_s"] = summary(sub_ttft)
         result[f"{label}_tpot_s"] = summary(sub_tpot)
@@ -282,7 +279,7 @@ def _percentile_summary(values: list[float]) -> dict[str, float | int]:
 def slo_report(
     workload_config,
     first_token: list[float],
-    decode_token: list[float],
+    decode_token: list[float | None],
     duration: float,
 ) -> dict[str, Any] | None:
     """Attainment of the workload's latency targets; ``None`` without targets.
@@ -290,8 +287,11 @@ def slo_report(
     ``first_token`` and ``decode_token`` hold each request's time to first
     token and mean inter-token latency. A ``max`` target bounds every request
     and goodput counts the requests within all of them; ``p50`` and ``p99``
-    targets bound the run's percentiles.
+    targets bound the run's percentiles. Requests without a token gap are
+    excluded from TPOT statistics and exempt from the per-request TPOT bound.
     """
+    if len(first_token) != len(decode_token):
+        raise ValueError("latency samples must cover the same requests")
     report: dict[str, Any] = {}
     within = [True] * len(first_token)
     bounded = False
@@ -307,9 +307,11 @@ def slo_report(
         }
         if not bounds:
             continue
-        observed = asdict(MetricData.from_list(values))
+        measured = [value for value in values if value is not None]
+        observed = asdict(MetricData.from_list(measured))
         report[name] = {
             "target": bounds,
+            "sample_count": len(measured),
             "observed": {key: observed[key] for key in bounds},
             "met": {
                 key: observed[key] is not None and bool(observed[key] <= bound)
@@ -319,7 +321,8 @@ def slo_report(
         if "max" in bounds:
             bounded = True
             within = [
-                ok and value <= bounds["max"] for ok, value in zip(within, values)
+                ok and (value is None or value <= bounds["max"])
+                for ok, value in zip(within, values)
             ]
     if not report:
         return None

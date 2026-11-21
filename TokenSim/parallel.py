@@ -135,6 +135,7 @@ class ParallelCommunicator:
         self.parallel_config = parallel_config
         self.dtype = dtype
         self.stats = ParallelStats()
+        self.collective_observer = None
         self._group_cache: dict[str, tuple[int, ...]] = {}
 
     # -- group discovery ------------------------------------------------------
@@ -361,6 +362,8 @@ class ParallelCommunicator:
         group: Sequence[int],
         estimate: CollectiveEstimate,
     ) -> None:
+        if self.collective_observer is not None:
+            self.collective_observer(kind, bytes_, latency, group, estimate)
         self.stats.record_event(
             ParallelSyncEvent(
                 kind=kind,

@@ -6,6 +6,7 @@ import math
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.profiler.annotations import kernel_operation
+from TokenSim.profiler.clocks import profile_clock_shifts
 
 
 @dataclass(frozen=True)
@@ -209,39 +210,20 @@ def prepare_timeline(
     shared = clock_alignment.get("cross_rank_overlap_available", False)
     if type(shared) is not bool:
         raise ConfigurationError("cross_rank_overlap_available must be a boolean")
-    shifts, warnings = {}, []
-    for side, span, _ in spans:
-        if side == "profiled" and span["clock"] not in shifts:
-            clock = span["clock"]
-            anchor = anchors.get(clock)
-            if anchor is not None:
-                if not isinstance(anchor, dict):
-                    raise ConfigurationError(
-                        "comparison clock anchor must be an object"
-                    )
-                shifts[clock] = _number(anchor.get("translation_us"))
-            else:
-                shifts[clock] = -min(
-                    _number(s.get("start_us"))
-                    for k, s, _ in spans
-                    if k == side and s["clock"] == clock
-                )
-                warnings.append(
-                    f"{clock} has no matched anchor; its own origin is used"
-                )
-    if shared and shifts:
-        known = {value for clock, value in shifts.items() if clock in anchors}
-        if len(known) > 1:
-            raise ConfigurationError(
-                "shared profile clocks have inconsistent translations"
-            )
-        shared_shift = next(iter(known)) if known else max(shifts.values())
-        for clock in shifts.keys() - anchors.keys():
-            shifts[clock] = shared_shift
-        warnings = [
-            note.replace("its own origin is used", "the shared profile origin is used")
-            for note in warnings
-        ]
+    shifts = profile_clock_shifts(
+        (
+            (span["clock"], _number(span.get("start_us")))
+            for side, span, _ in spans
+            if side == "profiled"
+        ),
+        anchors,
+        shared=shared,
+    )
+    origin_label = "the shared profile" if shared else "its own"
+    warnings = [
+        f"{clock} has no matched anchor; {origin_label} origin is used"
+        for clock in sorted(shifts.keys() - anchors.keys())
+    ]
     if isinstance(ranks, str):
         ranks = [ranks]
     ranks = {str(rank) for rank in ranks} if ranks is not None else None
@@ -257,7 +239,11 @@ def prepare_timeline(
         ):
             continue
         for bar in _span_bars(side, span, status, detail):
-            bars.append(replace(bar, translation_us=shifts.get(bar.clock, 0)))
+            bars.append(
+                replace(
+                    bar, translation_us=shifts[bar.clock] if side == "profiled" else 0
+                )
+            )
     if not bars:
         raise ConfigurationError("no intervals match the timeline selection")
     if len({bar.clock for bar in bars if bar.side == "profiled"}) > 1 and not shared:

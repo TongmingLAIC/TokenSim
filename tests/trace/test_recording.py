@@ -66,7 +66,11 @@ class SharedRecordingTest(unittest.TestCase):
                         )
                     ]
                 )
+                session.closed = False
                 session.transfers = SimpleNamespace(partial_events=lambda: ())
+                session.endpoint_transfers = SimpleNamespace(
+                    sync=lambda: None, partial_events=lambda _: ()
+                )
                 session.pending = {}
                 observed = list(session.events())[0]
                 self.assertEqual(observed.end_at, 1.0)

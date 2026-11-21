@@ -9,7 +9,7 @@ def get_af_stats(engine) -> dict[str, Any]:
     runtime_summary = getattr(engine, "af_runtime_summary", None)
     stats: dict[str, Any] = {
         "af_enabled": executor is not None,
-        "af_iteration_count": len(summaries),
+        "af_iteration_count": getattr(engine, "af_iteration_count", len(summaries)),
         "af_trace": (
             [dict(summary) for summary in summaries]
             if executor is not None and executor.trace.enabled
@@ -33,6 +33,7 @@ def get_af_stats(engine) -> dict[str, Any]:
     }
     if executor is None:
         return stats
+    stats["af_warmup_iteration_count"] = getattr(engine, "af_warmup_iteration_count", 0)
     # Provenance of the AF service times: which provider answered and, for the
     # operator-table provider, the same match-type / missing-shape accounting
     # the step-level backend reports.

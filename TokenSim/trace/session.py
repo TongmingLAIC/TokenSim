@@ -6,11 +6,12 @@ import math
 from pathlib import Path
 
 from TokenSim.errors import SimulationStateError
-from TokenSim.config.cache_config import stage_layer_range
 from TokenSim.trace.archive import ArchivedTraceRecorder
-from TokenSim.trace.composition import Segment, expand_composition
+from TokenSim.trace.af_scope import AFTraceObserver
+from TokenSim.trace.pd_scope import EndpointTransferObserver
+from TokenSim.trace.composition import Segment
+from TokenSim.trace.forward_capture import ForwardCapture
 from TokenSim.trace.events import TraceEvent
-from TokenSim.trace.execution import observe_service
 from TokenSim.trace.formats import write_trace
 from TokenSim.trace.transient import ValidationTraceRecorder
 from TokenSim.trace.transfers import TransferObserver
@@ -30,147 +31,88 @@ class TraceSession:
         self.iteration = 0
         self.run_phase = "profiling"
         self.completed = 0
+        self.closed = False
         self.active_budgets = {}
         self.transfers = TransferObserver(self)
+        self.af = AFTraceObserver(self)
+        self.endpoint_transfers = EndpointTransferObserver(self)
+        self.forward_capture = {}
         for worker in engine.request_workers:
             self._attach_worker(worker)
         engine.attach_trace(self)
-        original = engine.run_complete_compute
 
-        def compute(worker_id, latency):
-            info = self.pending.get(worker_id)
-            if info is not None:
-                info["submitted"] = True
-            try:
-                yield from observe_service(
-                    original(worker_id, latency),
-                    lambda: self.mark_started(worker_id, engine.env.now, latency),
-                )
-            except BaseException:
-                if info is not None:
-                    info["stopped_at"] = engine.env.now
-                raise
-            self.finish(worker_id, engine.env.now - latency, latency)
+    def close(self):
+        """Release private archives once trace inspection or export is complete."""
+        if self.closed:
+            return
+        self.closed = True
+        self.transfers.close()
+        self.recorder.close()
+        for capture in self.forward_capture.values():
+            capture.close()
+        if self.engine.trace_session is self:
+            self.engine.trace_session = None
+        if self.engine.af_executor is not None:
+            executor = self.engine.af_executor
+            executor.trace_observer = None
+            executor.trace.event_transform = None
+            executor.trace.enabled = False
+            executor.trace.close()
 
-        engine.run_complete_compute = compute
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def mark_submitted(self, worker_id):
+        if worker_id in self.pending:
+            self.pending[worker_id]["submitted"] = True
+
+    def mark_stopped(self, worker_id, now):
+        if worker_id in self.pending:
+            self.pending[worker_id]["stopped_at"] = now
 
     def _attach_worker(self, worker):
-        backend = worker.latency_backend
-        captured = []
-        communications = []
-        active_communications = []
-        original_record = worker.parallel_communicator._record
-
-        def record(kind, target, bytes_, latency, group, estimate):
-            active_communications.append(
-                dict(
-                    kind=kind,
-                    bytes=bytes_,
-                    seconds=latency,
-                    group=tuple(group),
-                    estimate=estimate,
-                )
-            )
-            return original_record(kind, target, bytes_, latency, group, estimate)
-
-        worker.parallel_communicator._record = record
-
-        def attach(current):
-            original_comm = current._communication
-
-            def communication(*args, **kwargs):
-                active_communications.clear()
-                result = original_comm(*args, **kwargs)
-                communications[:] = active_communications
-                return result
-
-            current._communication = communication
-            current.trace_composition = lambda estimator, values: captured.extend(
-                expand_composition(estimator, values, communications)
-            )
-            if current.native_attention:
-                current.native_attention.trace_layer_costs = {}
-            for child in current._layer_backends:
-                owned = stage_layer_range(
-                    current.model.num_layers,
-                    current.parallel_config.pipeline_parallel_size,
-                    current.rank_info.pp_rank,
-                    current.pipeline_layer_counts,
-                )
-                child.trace_layer_indices = tuple(
-                    layer
-                    for layer in owned
-                    if current.model.attention_window(layer)
-                    == child.model.sliding_window
-                    and current.model.attention_geometry(layer)
-                    == child.model.attention_geometry(layer)
-                )
-                attach(child)
-
-        attach(backend)
-        original_batch = worker.dynamic_batch
-
-        def batch(requests):
-            captured.clear()
-            if backend.native_attention:
-                backend.native_attention.trace_layer_costs.clear()
-            phases = {
-                "prefill" if req.is_context_build else "decode" for req in requests
-            }
-            info = dict(
-                ready=worker.env.now,
-                requests=tuple(req.id for req in requests),
-                tokens=sum(req.query_tokens for req in requests),
-                phase=next(iter(phases)) if len(phases) == 1 else "mixed",
-                run_phase=self.run_phase,
-            )
-            info["iteration"] = self.iteration
-            self.iteration += 1
-            duration = original_batch(requests)
-            # Cost grouping must not reorder mixed geometries on the timeline.
-            leading = {"step_overhead", "embedding_lookup", "embedding_scale"}
-            info["segments"] = sorted(
-                captured,
-                key=lambda s: (
-                    (
-                        0
-                        if s.layer < 0
-                        and (
-                            s.operation in leading
-                            or s.details.get("collective_scope") == "tp_embedding"
-                        )
-                        else 2 if s.layer < 0 else 1
-                    ),
-                    s.layer,
-                ),
-            )
-            info["duration"] = duration
-            self.pending[worker.id] = info
-            return duration
-
-        worker.dynamic_batch = batch
-        original_complete = worker.complete_step
-
-        def complete(requests, latency):
-            # Lockstep execution bypasses run_complete_compute.
-            self.finish(worker.id, worker.env.now - latency, latency)
-            result = original_complete(requests, latency)
-            if result > 0:
-                plans = tuple(worker.connector._metadata.saves)
-                own = getattr(worker.connector, "_own_plans", None)
-                if own is not None:
-                    plans = tuple(own(plans))
-                if plans:
-                    self._record_load(worker, plans, result, kind="save")
-            for request in requests:
-                if request.is_done:
-                    self.request_tails.pop(request.id, None)
-            return result
-
-        worker.complete_step = complete
+        self.forward_capture[worker.id] = ForwardCapture(worker)
         self.transfers.attach(worker)
 
+    def set_run_phase(self, phase):
+        self.endpoint_transfers.sync()
+        self.run_phase = phase
+
+    def estimate_forward(self, worker, requests):
+        # Import completed handoffs before the receiving forward captures its tail.
+        self.endpoint_transfers.sync()
+        phases = {"prefill" if req.is_context_build else "decode" for req in requests}
+        info = dict(
+            ready=worker.env.now,
+            requests=tuple(req.id for req in requests),
+            tokens=sum(req.query_tokens for req in requests),
+            phase=next(iter(phases)) if len(phases) == 1 else "mixed",
+            run_phase=self.run_phase,
+            iteration=self.iteration,
+        )
+        self.iteration += 1
+        duration, segments = self.forward_capture[worker.id].estimate(requests)
+        info.update(duration=duration, segments=segments)
+        self.pending[worker.id] = info
+        return duration
+
+    def step_completed(self, worker, requests, save_duration):
+        if save_duration > 0:
+            plans = tuple(worker.connector._metadata.saves)
+            own = getattr(worker.connector, "_own_plans", None)
+            if own is not None:
+                plans = tuple(own(plans))
+            if plans:
+                self._record_load(worker, plans, save_duration, kind="save")
+        for request in requests:
+            if request.is_done:
+                self.request_tails.pop(request.id, None)
+
     def record_connector_load(self, worker, duration):
+        self.endpoint_transfers.sync()
         plans = tuple(worker.connector._metadata.loads)
         own = getattr(worker.connector, "_own_plans", None)
         if own is not None:
@@ -341,13 +283,17 @@ class TraceSession:
         self.completed += 1
 
     def events(self):
+        if self.closed:
+            raise SimulationStateError("trace session is closed")
         from TokenSim.trace.views import expand_af_events
 
+        self.endpoint_transfers.sync()
         af = self.engine.af_executor
         histories = [
             self.recorder.events,
             self._pending_events(),
             self.transfers.partial_events(),
+            self.endpoint_transfers.partial_events(self.engine.env.now),
         ]
         if af is not None:
             histories.append(expand_af_events(af.trace.events))
@@ -373,7 +319,29 @@ class TraceSession:
             else:
                 yield event
 
+    def _worker_parallelism(self):
+        layout = {
+            str(worker.id): dict(
+                domain=worker.execution_domain,
+                tensor_parallel_size=worker.parallel_config.tensor_parallel_size,
+            )
+            for worker in self.engine.request_workers
+            if getattr(worker, "execution_domain", None) is not None
+        }
+        for worker in self.engine.workers:
+            bindings = {
+                (binding.domain, len(binding.tp_group))
+                for binding in getattr(worker, "af_runtime_bindings", ())
+            }
+            if len(bindings) == 1:
+                domain, tp = next(iter(bindings))
+                layout[str(worker.id)] = dict(domain=domain, tensor_parallel_size=tp)
+        return layout
+
     def export(self, directory, *, termination="completed", result_name=None):
+        if self.closed:
+            raise SimulationStateError("trace session is closed")
+        self.endpoint_transfers.sync()
         active_budgets = sum(
             end > self.engine.env.now for end in self.active_budgets.values()
         )
@@ -383,10 +351,18 @@ class TraceSession:
             completed_scopes=self.completed - active_budgets,
             incomplete=any(info.get("submitted") for info in self.pending.values())
             or bool(self.transfers.pending)
+            or bool(self.endpoint_transfers.pending)
             or bool(active_budgets)
             or termination != "completed",
         )
         if self.options.mode == "full":
+            worker_parallelism = self._worker_parallelism()
+            tp = self.engine.parallel_config.tensor_parallel_size
+            if worker_parallelism:
+                sizes = {
+                    item["tensor_parallel_size"] for item in worker_parallelism.values()
+                }
+                tp = next(iter(sizes)) if len(sizes) == 1 else None
             path = (
                 Path(self.options.output)
                 if self.options.output
@@ -411,7 +387,12 @@ class TraceSession:
                     hidden_size=self.engine.model_spec.hidden_size,
                     num_layers=self.engine.model_spec.num_layers,
                     num_attention_heads=self.engine.model_spec.num_attention_heads,
-                    tensor_parallel_size=self.engine.parallel_config.tensor_parallel_size,
+                    tensor_parallel_size=tp,
+                    **(
+                        {"worker_parallelism": worker_parallelism}
+                        if worker_parallelism
+                        else {}
+                    ),
                 ),
                 trace_config=self.options,
                 trace_format=self.options.format,

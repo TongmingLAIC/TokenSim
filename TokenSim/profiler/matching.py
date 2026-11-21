@@ -92,6 +92,7 @@ def _merge(members, operation, rule, *, owner=None):
                 dict(
                     operation=item.operation,
                     participants=list(item.details["participants"]),
+                    callsite=item.details.get("collective_callsite"),
                 )
                 for item in members
                 if item.details.get("participants")
@@ -179,6 +180,29 @@ def _groups(spans, rules):
     return result
 
 
+def _label_collective_callsites(spans):
+    counts = defaultdict(int)
+    result = []
+    for span in sorted(spans, key=lambda item: (item.start_us, item.id)):
+        participants = span.details.get("participants")
+        if participants and span.category == "collective":
+            signature = (
+                span.rank,
+                span.forward,
+                span.layer,
+                span.phase,
+                span.operation,
+                tuple(sorted(map(str, participants))),
+            )
+            occurrence = counts[signature]
+            counts[signature] += 1
+            span = replace(
+                span, details=dict(span.details, collective_callsite=occurrence)
+            )
+        result.append(span)
+    return result
+
+
 def match_spans(simulated, observed, mapping=None):
     if mapping is None:
         mapping = {}
@@ -194,7 +218,9 @@ def match_spans(simulated, observed, mapping=None):
     rules = mapping.get("groups", [])
     if not isinstance(rank_map, dict) or not isinstance(rules, list):
         raise ConfigurationError("rank_map must be an object and groups must be a list")
-    simulated = _observed_groups(simulated, observed, rank_map)
+    simulated = _observed_groups(
+        _label_collective_callsites(simulated), observed, rank_map
+    )
     groups = [defaultdict(list), defaultdict(list)]
     excluded = []
     for side, spans in enumerate((simulated, observed)):

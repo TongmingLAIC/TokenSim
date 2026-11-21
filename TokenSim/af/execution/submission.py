@@ -123,6 +123,14 @@ class ExecutorSubmissionMixin:
         )
         self.native_batches.register(iteration)
         self.layer_barrier.register(iteration)
+        if all(
+            getattr(request, "measurement_phase", None) == "warmup"
+            for request in requests
+        ):
+            iteration.run_phase = "warmup"
+        observer = getattr(self, "trace_observer", None)
+        if observer is not None:
+            observer.submit(source_a_worker_id, iteration)
         return iteration
 
     def _runtime_layer_types(self) -> dict[int, str]:

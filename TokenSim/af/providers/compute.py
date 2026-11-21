@@ -156,7 +156,7 @@ class ComputeEstimateMixin:
     @cached_estimate
     def estimate(self, query: AFComputeQuery) -> AFServiceEstimate:
         tokens, tp_size = self._validate_local_work(query)
-        resolver = self.resolver_for(query.device_type)
+        resolver = self.resolver_for(query.device_type, query.physical_worker)
         dtype = normalize_dtype(query.dtype)
         weight_dtype = normalize_dtype(query.weight_dtype or dtype)
         from TokenSim.af.providers.compressed import compressed_components

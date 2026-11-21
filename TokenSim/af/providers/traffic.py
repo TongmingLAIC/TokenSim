@@ -226,13 +226,23 @@ class TransferPlanMixin:
         self.fallback = fallback
         self._worker_ids: dict[str, int] = {}
         initialize_cache(self, cluster_config.af.service_estimate_cache)
-        self._hardware_by_identity: dict[str, str] = {}
+        requested_scopes = {}
+        af_endpoints = {}
         for worker_id, worker in enumerate(worker_configs):
             ref = getattr(worker, "physical_worker_ref", None)
             if ref is None:
                 continue
+            backend = worker.operator_backend or self.backend_by_device.get(
+                worker.hardware, self.operator_backend
+            )
             self._worker_ids[ref.identity] = worker_id
-            self._hardware_by_identity[ref.identity] = worker.hardware
+            requested_scopes[worker_id] = (
+                self.hardware.device(worker.hardware).device_id,
+                backend,
+            )
+            if {"af_attention", "af_ffn"}.intersection(worker.capabilities):
+                af_endpoints[ref.identity] = (worker.hardware, backend)
+        self.operator_data_by_endpoint = snapshot(af_endpoints)
         # Fail before the event loop when an AF network has no link class.
         self.link_classes = {
             link.network: self.link_class(link.network)
@@ -269,15 +279,18 @@ class TransferPlanMixin:
         records = []
         resolved_backends = {}
         if fallback != "analytical_only":
-            for hardware_name in sorted(set(self._hardware_by_identity.values())):
-                device = self.hardware.device(hardware_name)
-                backend = self.backend_by_device.get(
-                    hardware_name, self.operator_backend
-                )
-                package = self.hardware.operator_package(device.device_id, backend)
+            af_scopes = {
+                requested_scopes[self._worker_ids[endpoint]]
+                for endpoint in af_endpoints
+            }
+            for scope in sorted(
+                af_scopes, key=lambda scope: (scope[0], scope[1] or "")
+            ):
+                device_id, backend = scope
+                package = self.hardware.operator_package(device_id, backend)
                 if package is not None:
                     backend = getattr(package.meta, "backend", backend)
-                    resolved_backends[hardware_name] = backend
+                    resolved_backends[scope] = (device_id, backend)
                     for record in package.meta.extra.get(
                         "communication_phase_services", ()
                     ):
@@ -288,7 +301,7 @@ class TransferPlanMixin:
                                 "phase measurement participants must be a positive integer"
                             )
                         if explicit_scope is None:
-                            scope = ((device.device_id, backend),) * count
+                            participant_scope = ((device_id, backend),) * count
                         else:
                             if (
                                 not isinstance(explicit_scope, (list, tuple))
@@ -302,14 +315,14 @@ class TransferPlanMixin:
                                 raise ConfigurationError(
                                     "phase measurement hardware/backend scope must match participants"
                                 )
-                            scope = tuple(
+                            participant_scope = tuple(
                                 (self.hardware.device(item[0]).device_id, item[1])
                                 for item in explicit_scope
                             )
                         if any(
                             value is not None
                             and (not isinstance(value, str) or not value)
-                            for _, value in scope
+                            for _, value in participant_scope
                         ):
                             raise ConfigurationError(
                                 "phase measurement package backend must be a nonempty string or unspecified"
@@ -322,9 +335,9 @@ class TransferPlanMixin:
                         candidate = {
                             **record,
                             "dataset_version": package.meta.dataset_version,
-                            "measurement_device": device.device_id,
+                            "measurement_device": device_id,
                             "measurement_backend": backend,
-                            "participant_hardware_backends": scope,
+                            "participant_hardware_backends": participant_scope,
                             "transport_backend": transport,
                             "applicability_origin": (
                                 "explicit"
@@ -338,18 +351,8 @@ class TransferPlanMixin:
         self.phase_measurements = snapshot(tuple(records))
         self._scope_by_worker = snapshot(
             {
-                worker_id: (
-                    self.hardware.device(
-                        self._hardware_by_identity[identity]
-                    ).device_id,
-                    resolved_backends.get(
-                        self._hardware_by_identity[identity],
-                        self.backend_by_device.get(
-                            self._hardware_by_identity[identity], self.operator_backend
-                        ),
-                    ),
-                )
-                for identity, worker_id in self._worker_ids.items()
+                worker_id: resolved_backends.get(scope, scope)
+                for worker_id, scope in requested_scopes.items()
             }
         )
         self._estimate_namespace += (

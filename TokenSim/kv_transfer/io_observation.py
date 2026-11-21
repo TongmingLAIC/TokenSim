@@ -83,13 +83,9 @@ class IOObservation:
         self.worker = worker
         self.compute = []
         self.loads = []
-        original = worker.step
 
-        def completed(requests, latency):
-            append_union(self.compute, worker.env.now - latency, worker.env.now)
-            return original(requests, latency)
-
-        worker.step = completed
+    def forward(self, start, end):
+        append_union(self.compute, start, end)
 
     def read(self, req, start, end, *, prefetch):
         self.loads.append(

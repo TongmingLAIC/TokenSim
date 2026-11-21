@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import json
+import math
 from pathlib import Path
 from dataclasses import asdict
 from typing import Any
@@ -13,6 +14,7 @@ from TokenSim.config.config import ClusterConfig
 from TokenSim.llm.llm_request import LLMTime, Request
 from .metrics import RunReport, get_agentx_metrics, slo_report
 from .af import get_af_stats
+from .request_metrics import RequestLatencies
 from .stats import (
     get_prefix_reuse_stats,
     get_connector_stats,
@@ -40,17 +42,14 @@ def export_result(
     duration: float,
     simulator_wall_time: float = 0,
 ):
-    if run.agentx_concurrency is not None:
-        request_time = MetricData.from_list([req.total_time for req in requests])
-        first_token = [req.prefill_latency for req in requests]
-        decode_token = [
-            req.decode_time_sum / max(1, req.generation_idx - 1) for req in requests
-        ]
-    else:
-        request_time = MetricData.from_list(g_time.request_time)
-        first_token, decode_token = g_time.prefill_time, g_time.decode_time
+    samples = RequestLatencies.finished(requests)
+    first_token = [sample.first_token for sample in samples]
+    decode_token = [sample.tpot for sample in samples]
+    request_time = MetricData.from_list([sample.end_to_end for sample in samples])
     prefill_time = MetricData.from_list(first_token)
-    decode_time = MetricData.from_list(decode_token)
+    decode_time = MetricData.from_list(
+        [value for value in decode_token if value is not None]
+    )
     prefix_reuse_stats = get_prefix_reuse_stats(requests)
     connector_stats = get_connector_stats(engine)
     parallel_stats = get_parallel_stats(engine)
@@ -60,7 +59,10 @@ def export_result(
     latency_stats = get_latency_stats(engine)
 
     result = LLMResult(
-        qps=run.qps,
+        qps=run.qps if math.isfinite(run.qps) else None,
+        arrival_distribution=getattr(
+            getattr(engine, "workload_config", None), "distribution", None
+        ),
         cluster=cluster,
         request_time=request_time,
         prefill_time=prefill_time,
@@ -139,8 +141,13 @@ def export_result(
     result_dict["request_time"] = asdict(result.request_time)
     result_dict["prefill_time"] = asdict(result.prefill_time)
     result_dict["decode_time"] = asdict(result.decode_time)
+    result_dict["qps"] = result.qps
     if getattr(engine, "pd_handoff", None) is not None:
-        result_dict["pd_transport"] = engine.pd_handoff.report()
+        transport = engine.pd_handoff.report()
+        result_dict["pd_transport"] = transport
+        (results_path / "pd_transport.json").write_text(
+            json.dumps(transport, indent=2, allow_nan=False) + "\n"
+        )
 
     if getattr(engine, "af_executor", None) is None:
         for name in (
@@ -160,7 +167,7 @@ def export_result(
         )
     result_file = results_path / run.result_name
     with open(result_file, "w") as f:
-        json.dump(result_dict, f, indent=4)
+        json.dump(result_dict, f, indent=4, allow_nan=False)
     if latency_stats.get("operator_missing_shape_groups"):
         # Shapes the tables could not answer, grouped by table and discrete key
         # with the requested axis ranges: the collection checklist for the next

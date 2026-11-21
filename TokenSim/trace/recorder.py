@@ -14,9 +14,12 @@ class TraceRecorder:
         self.iteration_event_indices = {}
         self.resource_capacities = dict(resource_capacities or {})
         self.event_validator = None
+        self.event_transform = None
 
     def record(self, event):
         if self.enabled:
+            if self.event_transform is not None:
+                event = self.event_transform(event)
             index = len(self.events)
             self.events.append(event)
             self.iteration_event_indices.setdefault(event.iteration_id, []).append(

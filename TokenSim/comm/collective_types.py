@@ -6,7 +6,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware.topology import GroupLayout
+from TokenSim.hardware.links import LinkClass
+from TokenSim.hardware.topology import GroupLayout, TopologyLevel
 
 
 OPERATIONS = (
@@ -70,6 +71,15 @@ class CollectiveQuery:
             raise ConfigurationError(
                 f"unsupported collective schedule {self.schedule!r}"
             )
+        if self.schedule == "global_ring":
+            if self.algorithm not in {"auto", "ring"}:
+                raise ConfigurationError("global_ring schedule requires ring or auto")
+            if self.operation not in {"all_reduce", "all_gather", "reduce_scatter"}:
+                raise ConfigurationError(
+                    "global_ring supports AR, AG and RS collectives"
+                )
+            if len(set(self.layout.ranks)) != self.layout.size:
+                raise ConfigurationError("global_ring participants must be unique")
 
     @property
     def group_size(self) -> int:
@@ -136,6 +146,21 @@ class CollectiveEstimate:
         if not self.levels:
             return None
         return max(self.levels, key=lambda item: item.latency_us).level
+
+
+def endpoint_bandwidth(
+    level: TopologyLevel, link: LinkClass, message_bytes: float, *, collective: bool
+) -> float:
+    """Usable directional bandwidth for the level's link or endpoint budget."""
+    ports = 1 if link.bandwidth_scope == "endpoint" else level.links_per_endpoint
+    efficiency = link.collective_efficiency if collective else 1
+    return (
+        link.bandwidth_per_direction_bytes_per_s
+        * ports
+        * efficiency
+        * link.efficiency(message_bytes)
+        / level.oversubscription
+    )
 
 
 def _rounds(

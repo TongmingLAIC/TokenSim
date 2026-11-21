@@ -290,6 +290,9 @@ class LLMWorker(Worker):
         return self.scheduler.cpu_workload()
 
     def step(self, requests: list[Request], latency: float):
+        observation = getattr(self.connector, "observation", None)
+        if observation is not None:
+            observation.forward(self.env.now - latency, self.env.now)
         for request in requests:
             if request.cancel_requested:
                 continue
@@ -371,6 +374,9 @@ class LLMWorker(Worker):
                 self.send_task(self.engine, Task.STOP)
 
     def dynamic_batch(self, requests: list[Request]) -> float:
+        trace = getattr(self.engine, "trace_session", None)
+        if trace is not None:
+            return trace.estimate_forward(self, requests)
         return self.latency_backend.estimate_step_latency(requests)
 
     def prepare_step(self):
@@ -396,10 +402,15 @@ class LLMWorker(Worker):
         return [r for r in output.running if not r.cancel_requested], load_latency
 
     def complete_step(self, running, latency):
+        trace = getattr(self.engine, "trace_session", None)
+        if trace is not None:
+            trace.finish(self.id, self.env.now - latency, latency)
         self.step(running, latency)
         self.scheduler.update(running)
         self.connector.set_simulation_time(self.env.now)
         save_latency = self.connector.wait_for_save()
+        if trace is not None:
+            trace.step_completed(self, running, save_latency)
         return save_latency
 
     def finalize_connector_step(self):

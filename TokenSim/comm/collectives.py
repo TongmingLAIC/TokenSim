@@ -30,11 +30,11 @@ and tree per level, matching what NCCL's tuner does in practice."""
 
 from __future__ import annotations
 
-import math
 from typing import Any, Mapping
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware.links import LinkCatalog, LinkClass
 from TokenSim.hardware.topology import GroupLayout, TopologySpec
+from TokenSim.comm.scoped_measurements import ScopedCollectiveMeasurements
 from TokenSim.operator_data.coverage import MissingShapeReport
 from TokenSim.operator_data.lookup import FALLBACK_POLICIES, MissingOperatorDataError
 from TokenSim.comm.collective_types import (
@@ -47,6 +47,7 @@ from TokenSim.comm.collective_types import (
     EPAllToAllQuery,
     LevelEstimate,
     CollectiveEstimate,
+    endpoint_bandwidth,
     _rounds,
 )
 
@@ -90,6 +91,11 @@ class CollectiveModel:
         self.measured_lookup = (
             measured_lookup if fallback != "analytical_only" else None
         )
+        self._collective_measurements = (
+            ScopedCollectiveMeasurements(topology, self.measured_lookup)
+            if self.measured_lookup is not None
+            else None
+        )
         self.measured_nodes_field = measured_nodes_field
         self.fallback = fallback
         self.missing_report = missing_report
@@ -102,9 +108,10 @@ class CollectiveModel:
             return CollectiveEstimate(
                 0.0, query.operation, n, query.message_bytes, "analytical", "trivial"
             )
-        measured = self._measured(query)
-        if measured is not None:
-            return measured
+        if self.fallback != "analytical_only":
+            measured = self._measured(query)
+            if measured is not None:
+                return measured
         return self.analytical(query)
 
     def analytical(self, query: CollectiveQuery) -> CollectiveEstimate:
@@ -130,22 +137,10 @@ class CollectiveModel:
             level = self.topology.levels[level_index]
             link = self.links.get(level.link)
             level_bytes = query.message_bytes * remaining_share
-            algorithm = self._pick_algorithm(
-                query, level.collective_algorithm, fan, link, level_bytes
+            bandwidth = endpoint_bandwidth(level, link, level_bytes, collective=True)
+            algorithm, steps, injected, latency_us = self._level_cost(
+                query, level.collective_algorithm, fan, link, level_bytes, bandwidth
             )
-            steps, injected = _rounds(query.operation, algorithm, fan, level_bytes)
-            bandwidth = (
-                link.bandwidth_per_direction_bytes_per_s
-                * level.links_per_endpoint
-                * link.collective_efficiency
-                / level.oversubscription
-            )
-            transfer_us = (
-                injected / (bandwidth * link.efficiency(level_bytes)) * 1e6
-                if injected > 0
-                else 0.0
-            )
-            latency_us = steps * link.latency_us + transfer_us
             levels.append(
                 LevelEstimate(
                     level=level.name,
@@ -225,7 +220,9 @@ class CollectiveModel:
         )
 
     def _nodes(self, layout: GroupLayout) -> int:
-        return int(math.prod(layout.fan[1:])) if layout.lowest_common_level >= 1 else 1
+        if layout.node_count is not None:
+            return layout.node_count
+        return len({self.topology.coordinates(rank)[0] for rank in layout.ranks})
 
     def _ep_all2all_key(
         self, query: EPAllToAllQuery, mode: str, phase: str
@@ -347,12 +344,8 @@ class CollectiveModel:
             )
         level = self.topology.levels[layout.lowest_common_level]
         link = self.links.get(level.link)
-        # Oversubscription reduces the effective bandwidth available to this
-        # endpoint.  It must never make a path faster (the old division did).
-        latency_us = (
-            link.transfer_us(message_bytes, streams=level.links_per_endpoint)
-            * level.oversubscription
-        )
+        bandwidth = endpoint_bandwidth(level, link, message_bytes, collective=False)
+        latency_us = link.latency_us + message_bytes / bandwidth * 1e6
         return CollectiveEstimate(
             latency_us=latency_us,
             operation="send_recv",
@@ -378,7 +371,24 @@ class CollectiveModel:
             "nodes": self._nodes(layout),
             "message_bytes": int(round(query.message_bytes)),
         }
-        lookup = self.measured_lookup
+        scopes = self._collective_measurements
+        lookup = scopes.for_query(query) if scopes else None
+        if query.schedule == "global_ring" and lookup is None:
+            self._miss(
+                MissingOperatorDataError(
+                    "collective",
+                    {
+                        **key,
+                        "schedule": query.schedule,
+                        "algorithm": "ring",
+                        "topology_id": self.topology.topology_id,
+                        "ranks": layout.ranks,
+                    },
+                    "Global Ring requires measurements scoped to this topology and rank order",
+                    kind="no_measured_mode",
+                )
+            )
+            return None
         if lookup is None or not lookup.has_table("collective"):
             self._miss(
                 MissingOperatorDataError(
@@ -423,30 +433,24 @@ class CollectiveModel:
             },
         )
 
-    def _pick_algorithm(
-        self,
+    @staticmethod
+    def _level_cost(
         query: CollectiveQuery,
         level_default: str,
         fan: int,
         link: LinkClass,
         message_bytes: float,
-    ) -> str:
+        bandwidth: float,
+    ) -> tuple[str, int, float, float]:
         algorithm = query.algorithm if query.algorithm != "auto" else level_default
-        if algorithm != "auto":
-            return algorithm
-        if query.operation in {"all_to_all", "send_recv", "broadcast"}:
-            return "direct" if query.operation != "broadcast" else "tree"
-        # Latency-optimal tree for small messages, ring for large ones.
-        candidates = {}
-        bandwidth = (
-            link.bandwidth_per_direction_bytes_per_s * link.collective_efficiency
-        )
-        for name in ("ring", "tree"):
+
+        def cost(name):
             steps, injected = _rounds(query.operation, name, fan, message_bytes)
-            transfer = (
-                injected / (bandwidth * link.efficiency(message_bytes)) * 1e6
-                if injected
-                else 0.0
-            )
-            candidates[name] = steps * link.latency_us + transfer
-        return min(candidates, key=candidates.get)
+            transfer = injected / bandwidth * 1e6 if injected > 0 else 0.0
+            return name, steps, injected, steps * link.latency_us + transfer
+
+        if algorithm != "auto":
+            return cost(algorithm)
+        if query.operation in {"all_to_all", "send_recv", "broadcast"}:
+            return cost("tree" if query.operation == "broadcast" else "direct")
+        return min((cost("ring"), cost("tree")), key=lambda candidate: candidate[3])

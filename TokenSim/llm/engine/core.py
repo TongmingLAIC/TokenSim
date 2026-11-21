@@ -191,7 +191,10 @@ class LLMEngine(AFEngineMixin, Worker):
 
         self.timing_recorder.reset()
         if self.trace_session is not None:
-            self.trace_session.run_phase = "profiling"
+            self.trace_session.set_run_phase("profiling")
+        reset_af = getattr(self.af_compute_provider, "reset_profile_stats", None)
+        if reset_af is not None:
+            reset_af()
         self.connector_stats = ConnectorStats()
         if self.router is not None:
             self.router.reset_stats()

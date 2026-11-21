@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import count
 from typing import Any, Sequence
 
 from TokenSim.errors import ConfigurationError
@@ -18,59 +19,87 @@ def build_topology_placement(
     """Resolve the cluster's topology and each worker's device index.
 
     AF physical mode uses explicit communication-domain node inventory.
-    For other modes, when the cluster names a ``topology`` from the catalog, workers are placed
-    either at the explicit ``device_indices`` of their group or sequentially.
-    Otherwise a two-level topology is synthesized from the legacy ``networks``
-    section: workers sharing a named network form one node connected by the
-    device's scale-up link, and nodes are joined by the network's link class.
+    With a named topology, explicit slots are reserved before filling the
+    remaining slots in device order. A synthesized topology places each
+    network on one node. Explicit slots select that node and local slots.
     """
     af = getattr(cluster_config, "af", None)
     domains = physical_domain_config(af) if af is not None else None
     if domains is not None:
         return build_domain_placement(cluster_config, worker_configs, hardware, domains)
-    explicit: dict[int, int] = {}
     for worker in worker_configs:
         hardware.link(worker.nettype)
-    cursor = 0
-    worker_id = 0
-    for group in cluster_config.worker_groups:
-        indices = getattr(group, "device_indices", None)
-        if indices is not None:
-            if len(indices) != group.num_workers:
-                raise ConfigurationError(
-                    f"worker group {group.role!r}: device_indices has {len(indices)} entries "
-                    f"for num_workers={group.num_workers}"
-                )
-        for position in range(group.num_workers):
-            explicit[worker_id] = (
-                int(indices[position]) if indices is not None else cursor
-            )
-            cursor += 1
-            worker_id += 1
 
     topology_id = getattr(cluster_config, "topology", None)
-    if topology_id:
-        topology = hardware.topology(topology_id)
-        if len(set(explicit.values())) != len(explicit):
-            raise ConfigurationError("two workers are placed on the same device index")
-        return TopologyPlacement(topology=topology, device_index_by_worker=explicit)
+    topology = (
+        hardware.topology(topology_id)
+        if topology_id
+        else synthesize_topology(cluster_config, worker_configs, hardware)
+    )
+    explicit = {
+        rank: topology.validate_device_index(slot)
+        for rank, worker in enumerate(worker_configs)
+        if (slot := getattr(worker, "device_index", None)) is not None
+    }
+    if len(set(explicit.values())) != len(explicit):
+        raise ConfigurationError("two workers are placed on the same device index")
 
-    topology = synthesize_topology(cluster_config, worker_configs, hardware)
-    # Assign contiguous device indices per named network so that the level-0
-    # group boundaries coincide with the network groups.
-    node_size = topology.levels[0].size or 1
-    per_network: dict[str, int] = {}
-    order: list[str] = []
-    placement: dict[int, int] = {}
-    for index, worker in enumerate(worker_configs):
-        network = getattr(worker, "network", "net")
-        if network not in per_network:
-            per_network[network] = 0
-            order.append(network)
-        node_index = order.index(network)
-        placement[index] = node_index * node_size + per_network[network]
-        per_network[network] += 1
+    if topology_id:
+        slots = count() if topology.capacity is None else range(topology.capacity)
+        occupied = set(explicit.values())
+        available = (slot for slot in slots if slot not in occupied)
+        placement = _fill_device_slots(worker_configs, explicit, available)
+    else:
+        placement = _place_synthesized_networks(
+            worker_configs, explicit, topology.levels[0].size
+        )
     return TopologyPlacement(topology=topology, device_index_by_worker=placement)
+
+
+def _fill_device_slots(worker_configs, explicit, available):
+    placement = dict(explicit)
+    for rank in range(len(worker_configs)):
+        if rank not in placement:
+            slot = next(available, None)
+            if slot is None:
+                raise ConfigurationError("worker placement exceeds topology inventory")
+            placement[rank] = slot
+    return placement
+
+
+def _place_synthesized_networks(worker_configs, explicit, node_size):
+    networks = [worker.network for worker in worker_configs]
+    network_nodes = {}
+    node_networks = {}
+    occupied = set(explicit.values())
+    for rank, slot in explicit.items():
+        network, node = networks[rank], slot // node_size
+        if network_nodes.setdefault(network, node) != node:
+            raise ConfigurationError(
+                f"network {network!r} spans device slots on multiple synthesized nodes; "
+                "declare a topology for this placement"
+            )
+        if node_networks.setdefault(node, network) != network:
+            raise ConfigurationError(
+                f"device indices place multiple networks on synthesized node {node}; "
+                "declare a topology for this placement"
+            )
+
+    nodes = (node for node in count() if node not in node_networks)
+    free_slots = {}
+    placement = dict(explicit)
+    for rank, network in enumerate(networks):
+        if network not in network_nodes:
+            network_nodes[network] = next(nodes)
+        if rank in placement:
+            continue
+        if network not in free_slots:
+            start = network_nodes[network] * node_size
+            free_slots[network] = (
+                slot for slot in range(start, start + node_size) if slot not in occupied
+            )
+        placement[rank] = next(free_slots[network])
+    return placement
 
 
 def build_domain_placement(cluster_config, worker_configs, hardware, config):

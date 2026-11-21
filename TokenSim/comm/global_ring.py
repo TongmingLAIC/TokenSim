@@ -3,8 +3,12 @@
 from collections import Counter
 from functools import lru_cache
 
-from TokenSim.comm.collective_types import CollectiveEstimate, LevelEstimate, _rounds
-from TokenSim.errors import ConfigurationError
+from TokenSim.comm.collective_types import (
+    CollectiveEstimate,
+    LevelEstimate,
+    endpoint_bandwidth,
+    _rounds,
+)
 
 
 @lru_cache(maxsize=256)
@@ -37,13 +41,7 @@ def estimate_global_ring(query, topology, links, launch_us):
     Message-size efficiency uses the collective buffer, as in the existing
     hierarchical estimator, rather than applying a launch penalty per shard.
     """
-    if query.algorithm not in {"auto", "ring"}:
-        raise ConfigurationError("global_ring schedule requires ring or auto")
-    if query.operation not in {"all_reduce", "all_gather", "reduce_scatter"}:
-        raise ConfigurationError("global_ring supports AR, AG and RS collectives")
     ranks = query.layout.ranks
-    if len(set(ranks)) != len(ranks):
-        raise ConfigurationError("global_ring participants must be unique")
     rounds, injected = _rounds(query.operation, "ring", len(ranks), query.message_bytes)
     if not rounds:
         return CollectiveEstimate(
@@ -57,13 +55,7 @@ def estimate_global_ring(query, topology, links, launch_us):
             continue
         level = topology.levels[index]
         link = links.get(level.link)
-        budget = (
-            link.bandwidth_per_direction_bytes_per_s
-            * level.links_per_endpoint
-            * link.collective_efficiency
-            * link.efficiency(query.message_bytes)
-            / level.oversubscription
-        )
+        budget = endpoint_bandwidth(level, link, query.message_bytes, collective=True)
         time_us = rounds * (link.latency_us + per_round * simultaneous / budget * 1e6)
         estimates.append(
             LevelEstimate(

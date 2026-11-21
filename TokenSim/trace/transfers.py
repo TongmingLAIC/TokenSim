@@ -11,6 +11,7 @@ class TransferObserver:
         self.session = session
         self.links = {}
         self.pending = {}
+        self.closed = False
 
     def attach(self, worker):
         connector = worker.connector
@@ -19,6 +20,17 @@ class TransferObserver:
                 link = getattr(child, direction + "_link", None)
                 if link is not None:
                     self._attach_link(link, worker.id, direction)
+
+    def close(self):
+        self.closed = True
+        for binding in self.links.values():
+            link, original, wrapper = binding["binding"]
+            if link.transfer is wrapper:
+                del link.transfer
+                if link.transfer != original:
+                    link.transfer = original
+        self.links.clear()
+        self.pending.clear()
 
     def _attach_link(self, link, worker_id, direction):
         if isinstance(link, QueuedKVLink):
@@ -35,6 +47,9 @@ class TransferObserver:
             original = link.transfer
 
             def transfer(size):
+                if self.closed:
+                    yield from original(size)
+                    return
                 index = self.session.iteration
                 self.session.iteration += 1
                 job = dict(
@@ -62,11 +77,12 @@ class TransferObserver:
                 except BaseException:
                     job["stopped_at"] = link.env.now
                     raise
-                if "start" in job:
+                if "start" in job and not self.closed:
                     self.session.recorder.record(self._event(job, link.env.now))
                     self.session._complete(index)
                 self.pending.pop(index, None)
 
+            binding["binding"] = link, original, transfer
             link.transfer = transfer
             return
         for name in ("host", "network"):

@@ -140,6 +140,7 @@ class AFIteration:
     end_at: float | None = None
     block_completed_at: dict[int, float] = field(default_factory=dict)
     barrier_wait: dict[int, float] = field(default_factory=dict)
+    run_phase: Literal["warmup", "profiling"] = "profiling"
 
     @property
     def makespan(self) -> float | None:

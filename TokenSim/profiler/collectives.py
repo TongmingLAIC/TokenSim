@@ -50,56 +50,79 @@ def analyze_collectives(pairs, observed, rank_map=None):
         if not calls:
             continue
         specifications = left.details.get("collective_groups", [])
-        if left.details.get("participants"):
+        if not specifications and left.details.get("participants"):
             specifications = [
                 dict(
-                    operation=left.operation, participants=left.details["participants"]
+                    operation=left.operation,
+                    participants=left.details["participants"],
+                    callsite=left.details.get("collective_callsite"),
                 )
             ]
-        for ordinal, call in enumerate(calls):
-            if call.get("wait_model") != "peer_start_barrier":
-                unresolved.append(
-                    dict(id=right.id, reason="unproven_collective_start_barrier")
+        simulated_by_operation = defaultdict(list)
+        for spec in specifications:
+            simulated_by_operation[spec["operation"]].append(spec)
+        observed_by_operation = defaultdict(list)
+        for call in calls:
+            observed_by_operation[call["operation"]].append(call)
+        for operation, observed_calls in observed_by_operation.items():
+            candidates = simulated_by_operation[operation]
+            callsites = {candidate.get("callsite") for candidate in candidates}
+            if (
+                not clock["available"]
+                or len(candidates) != len(observed_calls)
+                or (
+                    len(candidates) > 1
+                    and (None in callsites or len(callsites) != len(candidates))
                 )
-                continue
-            candidates = [
-                spec
-                for spec in specifications
-                if spec["operation"] == call["operation"]
-            ]
-            if not clock["available"] or len(candidates) != 1:
+            ):
                 unresolved.append(
                     dict(id=right.id, reason="unproven_clock_or_collective_group")
                 )
                 continue
-            participants = tuple(
-                sorted(str(rank) for rank in candidates[0]["participants"])
-            )
-            rank = str(rank_map.get(right.rank, right.rank))
-            key = (
-                participants,
-                left.forward,
-                left.layer,
-                left.operation,
-                call["operation"],
-                ordinal,
-            )
-            if rank not in participants or rank in groups[key]:
-                unresolved.append(
-                    dict(id=right.id, reason="duplicate_or_unexpected_collective_rank")
+            for spec, call in zip(candidates, observed_calls):
+                if call.get("wait_model") != "peer_start_barrier":
+                    unresolved.append(
+                        dict(id=right.id, reason="unproven_collective_start_barrier")
+                    )
+                    continue
+                participants = tuple(sorted(str(rank) for rank in spec["participants"]))
+                rank = str(rank_map.get(right.rank, right.rank))
+                key = (
+                    participants,
+                    left.forward,
+                    left.layer,
+                    left.phase,
+                    operation,
+                    spec.get("callsite"),
                 )
-                continue
-            groups[key][rank] = right, call
+                if rank not in participants:
+                    unresolved.append(
+                        dict(
+                            id=right.id,
+                            reason="duplicate_or_unexpected_collective_rank",
+                        )
+                    )
+                    continue
+                groups[key].setdefault(rank, []).append((right, call))
     analyzed = 0
     for key, members in groups.items():
         participants = key[0]
+        if any(len(calls) != 1 for calls in members.values()):
+            unresolved.append(
+                dict(
+                    participants=participants,
+                    reason="duplicate_or_unexpected_collective_rank",
+                )
+            )
+            continue
         if set(members) != set(participants):
             unresolved.append(
                 dict(participants=participants, reason="missing_collective_rank")
             )
             continue
-        arrival = max(call["start_us"] for _, call in members.values())
-        if any(call["end_us"] < arrival for _, call in members.values()):
+        calls = [entries[0] for entries in members.values()]
+        arrival = max(call["start_us"] for _, call in calls)
+        if any(call["end_us"] < arrival for _, call in calls):
             unresolved.append(
                 dict(
                     participants=participants,
@@ -107,7 +130,7 @@ def analyze_collectives(pairs, observed, rank_map=None):
                 )
             )
             continue
-        for span, call in members.values():
+        for span, call in calls:
             call.update(
                 peer_arrival_us=arrival,
                 peer_wait_us=arrival - call["start_us"],

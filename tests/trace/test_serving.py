@@ -13,6 +13,7 @@ import simpy
 
 from TokenSim.cli import build_parser, main
 from TokenSim.config.simulation import SimulationConfig
+from TokenSim.errors import SimulationStateError
 from TokenSim.config.config import KVTransferConfig, ClusterConfig
 from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.trace.config import TraceConfig
@@ -179,37 +180,73 @@ class ServingTraceTest(unittest.TestCase):
                 self.assertEqual(results[0], results[2])
 
     def test_pd_transfer_has_producer_and_decode_dependencies(self):
-        with tempfile.TemporaryDirectory() as directory:
-            engine, result = self.run_cli(
-                directory, "full", "--cluster", "data/clusters/8_a100/p2d5.json"
-            )
-            _, baseline = self.run_cli(
-                Path(directory) / "off",
-                "off",
-                "--cluster",
-                "data/clusters/8_a100/p2d5.json",
-            )
-            self.assertEqual(result, baseline)
-            events = list(engine.trace_session.events())
-            transfers = [event for event in events if event.operation == "kv_transfer"]
-            self.assertTrue(transfers)
-            by_id = {event.node_id: event for event in events}
-            for transfer in transfers:
-                self.assertTrue(transfer.predecessor_ids)
-                self.assertTrue(
-                    all(
-                        by_id[key].end_at <= transfer.start_at + 1e-12
-                        for key in transfer.predecessor_ids
+        for endpoint in (False, True):
+            with (
+                self.subTest(endpoint=endpoint),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory)
+                args = ["--cluster", "data/clusters/8_a100/p2d5.json"]
+                if endpoint:
+                    config = path / "endpoint.json"
+                    config.write_text(
+                        json.dumps(
+                            {
+                                "kv_connector": "P2PConnector",
+                                "kv_connector_extra_config": {
+                                    "pd_endpoint_limits": {
+                                        "send_bytes_per_second": 1e10,
+                                        "receive_bytes_per_second": 1e10,
+                                        "fabric_bytes_per_second": 1e10,
+                                    }
+                                },
+                            }
+                        )
                     )
-                )
+                    args += [
+                        "--batching",
+                        "paged-attn",
+                        "--kv_transfer_config",
+                        str(config),
+                    ]
 
-                self.assertTrue(
-                    any(
-                        transfer.node_id in event.predecessor_ids
-                        for event in events
-                        if event.phase == "decode"
+                engine, result = self.run_cli(path / "full", "full", *args)
+                _, baseline = self.run_cli(path / "off", "off", *args)
+                self.assertEqual(result, baseline)
+                session = engine.trace_session
+                events = list(session.events())
+                transfers = [
+                    event for event in events if event.operation == "kv_transfer"
+                ]
+                self.assertTrue(transfers)
+                by_id = {event.node_id: event for event in events}
+                for transfer in transfers:
+                    self.assertTrue(transfer.predecessor_ids)
+                    self.assertGreater(transfer.payload_bytes, 0)
+                    self.assertTrue(
+                        all(
+                            by_id[key].end_at <= transfer.start_at + 1e-12
+                            for key in transfer.predecessor_ids
+                        )
                     )
-                )
+                    self.assertTrue(
+                        any(
+                            transfer.node_id in event.predecessor_ids
+                            for event in events
+                            if event.phase == "decode"
+                        )
+                    )
+                if endpoint:
+                    summary = json.loads(
+                        (path / "full" / "pd_transport.json").read_text()
+                    )
+                    self.assertEqual(summary, result["pd_transport"])
+                archive_path = session.recorder.archive.path
+                self.assertTrue(archive_path.is_file())
+                session.close()
+                self.assertFalse(archive_path.exists())
+                with self.assertRaisesRegex(SimulationStateError, "session is closed"):
+                    list(session.events())
 
     def test_partial_prefill_normalizes_hidden_rows_without_logits(self):
         with tempfile.TemporaryDirectory() as directory:

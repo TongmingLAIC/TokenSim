@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Mapping, Sequence
 from dataclasses import replace
 
@@ -55,6 +56,7 @@ class OperatorTableAFComputeProvider(
         "lookup_policy",
         "operator_backend",
         "backend_by_device",
+        "operator_data_by_endpoint",
         "cluster_config",
         "placement",
         "dtype",
@@ -70,6 +72,7 @@ class OperatorTableAFComputeProvider(
         *,
         operator_backend: str | None = None,
         backend_by_device: Mapping[str, str | None] | None = None,
+        operator_data_by_endpoint: Mapping[str, tuple[str, str | None]] | None = None,
         fallback: str = "table_first",
         lookup_policy: LookupPolicy | None = None,
         cache_enabled: bool = True,
@@ -88,6 +91,7 @@ class OperatorTableAFComputeProvider(
         self.model = snapshot(model)
         self.operator_backend = operator_backend
         self.backend_by_device = snapshot(dict(backend_by_device or {}))
+        self.operator_data_by_endpoint = snapshot(dict(operator_data_by_endpoint or {}))
         self.fallback = fallback
         self.lookup_policy = snapshot(lookup_policy)
         self.execution_protocol = execution_protocol
@@ -100,21 +104,30 @@ class OperatorTableAFComputeProvider(
         self._estimate_namespace += (
             ("graph_device_kernel_us", graph_device_kernel_us),
         )
-        self._resolvers: dict[str, OperatorResolver] = {}
+        self._resolvers: dict[tuple[str, str | None], OperatorResolver] = {}
         routing = model.moe.routing.distribution if model.moe.routing else "uniform"
         self.moe_distributions = _MOE_DISTRIBUTION_CANDIDATES.get(
             routing, ("uniform", "balanced")
         )
 
-    def resolver_for(self, device_type: str) -> OperatorResolver:
-        """The per-device resolver (loads the operator package on first use)."""
-        resolver = self._resolvers.get(device_type)
+    def resolver_for(
+        self, device_type: str, physical_worker: str | None = None
+    ) -> OperatorResolver:
+        """Share a resolver among endpoints using the same device and backend."""
+        key = self.operator_data_by_endpoint.get(
+            physical_worker,
+            (
+                device_type,
+                self.backend_by_device.get(device_type, self.operator_backend),
+            ),
+        )
+        resolver = self._resolvers.get(key)
         if resolver is not None:
             return resolver
+        device_type, backend = key
         device = analytical_execution_device(
             self.hardware.device(device_type), self.graph_device_kernel_us
         )
-        backend = self.backend_by_device.get(device_type, self.operator_backend)
         package = None
         if self.fallback != "analytical_only":
             package = self.hardware.operator_package(device.device_id, backend)
@@ -125,7 +138,7 @@ class OperatorTableAFComputeProvider(
             lookup_policy=self.lookup_policy,
             gated=self.model.gated,
         )
-        self._resolvers[device_type] = resolver
+        self._resolvers[key] = resolver
         return resolver
 
     def estimate_signature(self, query):
@@ -156,6 +169,16 @@ class OperatorTableAFComputeProvider(
             aggregate = aggregate.aggregate(resolver.stats)
         return aggregate
 
+    def reset_profile_stats(self) -> None:
+        for resolver in self._resolvers.values():
+            resolver.stats = OperatorStats()
+            # A cached analytical fallback has no record of the failed lookup.
+            resolver._cache.clear()
+        self._estimate_cache.clear()
+        getattr(self, "_compressed_states", {}).clear()
+        self.estimate_requests = 0
+        self.estimate_cache_hits = 0
+
     def stats_dict(self) -> dict[str, Any]:
         stats = self.stats
         return {
@@ -166,6 +189,7 @@ class OperatorTableAFComputeProvider(
         }
 
     def describe(self) -> dict[str, Any]:
+        device_counts = Counter(device for device, _ in self._resolvers)
         return {
             "provider": "operator_table",
             "model_id": self.model.model_id,
@@ -173,7 +197,11 @@ class OperatorTableAFComputeProvider(
             "fallback": self.fallback,
             "graph_device_kernel_us_assumption": self.graph_device_kernel_us,
             "devices": {
-                device_type: {
+                (
+                    f"{device_type}:{backend}"
+                    if device_counts[device_type] > 1 and backend is not None
+                    else device_type
+                ): {
                     "device_id": resolver.device.device_id,
                     "operator_backend": resolver.operator_backend,
                     "dataset_version": resolver.dataset_version,
@@ -181,7 +209,10 @@ class OperatorTableAFComputeProvider(
                         resolver.lookup.semantics if resolver.lookup else None
                     ),
                 }
-                for device_type, resolver in sorted(self._resolvers.items())
+                for (device_type, backend), resolver in sorted(
+                    self._resolvers.items(),
+                    key=lambda item: (item[0][0], item[0][1] or ""),
+                )
             },
         }
 
@@ -284,16 +315,20 @@ def build_operator_table_af_providers(
     """
     if latency_backend_type == "analytical":
         fallback = "analytical_only"
-    backend_by_device = {
-        worker.hardware: worker.operator_backend
-        for worker in worker_configs
-        if getattr(worker, "operator_backend", None)
-    }
+    transfer = TopologyAFTransferProvider(
+        hardware,
+        cluster_config,
+        worker_configs,
+        placement,
+        dtype=dtype,
+        operator_backend=operator_backend,
+        fallback=fallback,
+    )
     compute = OperatorTableAFComputeProvider(
         hardware,
         model,
         operator_backend=operator_backend,
-        backend_by_device=backend_by_device,
+        operator_data_by_endpoint=transfer.operator_data_by_endpoint,
         fallback=fallback,
         cache_enabled=cluster_config.af.service_estimate_cache,
         execution_protocol=cluster_config.af.execution_protocol,
@@ -304,18 +339,8 @@ def build_operator_table_af_providers(
             else None
         ),
     )
-    transfer = TopologyAFTransferProvider(
-        hardware,
-        cluster_config,
-        worker_configs,
-        placement,
-        dtype=dtype,
-        operator_backend=operator_backend,
-        backend_by_device=backend_by_device,
-        fallback=fallback,
-    )
-    for hardware_name in sorted({worker.hardware for worker in worker_configs}):
-        compute.resolver_for(hardware_name)
+    for endpoint, (hardware_name, _) in transfer.operator_data_by_endpoint.items():
+        compute.resolver_for(hardware_name, endpoint)
     if cluster_config.af.engine_overhead_profile is not None:
         from TokenSim.af.calibration.host import content_fingerprint
 

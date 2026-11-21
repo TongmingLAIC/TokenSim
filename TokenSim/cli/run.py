@@ -289,12 +289,6 @@ def main(args, preloaded_agentx_traces=None):
         notdone=unfinished,
         simulator_wall_time=wall_time,
     )
-    if engine.pd_handoff is not None:
-        import json
-
-        (run.results_path / "pd_transport.json").write_text(
-            json.dumps(engine.pd_handoff.report(), indent=2) + "\n"
-        )
     if successful and duration > 0:
         print_all_stats(
             engine.timing_recorder.timing,

@@ -7,6 +7,7 @@ from tempfile import NamedTemporaryFile
 
 from TokenSim.profiler.records import union_duration, intervals_for as _intervals
 from TokenSim.profiler.collectives import service_metrics
+from TokenSim.profiler.clocks import profile_clock_shifts
 
 
 def _accounting(spans):
@@ -212,20 +213,19 @@ def write_comparison(
     )
     tracks = {}
     events = []
-    translated = []
-    for side, spans in (("simulated", simulated.spans), ("profiled", observed.spans)):
-        for span in spans:
-            shift = (
-                anchors.get(span.clock, {}).get("translation_us", 0)
-                if side == "profiled"
-                else 0
-            )
-            if side == "profiled" and span.clock not in anchors:
-                shift = -min(
-                    (item.start_us for item in spans if item.clock == span.clock),
-                    default=0,
-                )
-            translated.append((side, span, span.start_us + shift))
+    shifts = profile_clock_shifts(
+        ((span.clock, span.start_us) for span in observed.spans),
+        anchors,
+        shared=report["alignment"]["cross_rank_overlap_available"],
+    )
+    translated = [
+        (side, span, span.start_us + (shifts[span.clock] if side == "profiled" else 0))
+        for side, spans in (
+            ("simulated", simulated.spans),
+            ("profiled", observed.spans),
+        )
+        for span in spans
+    ]
     origin = min((start for _, _, start in translated), default=0)
     for side, span, start in translated:
         key = side, span.rank, span.clock

@@ -30,7 +30,7 @@ class MetricData:
 @dataclass(config=ConfigDict(extra="forbid"))
 class LLMResult:
     cluster: ClusterConfig
-    qps: float
+    qps: float | None
     request_count: int
     prefill_lens: list[int]
     decode_lens: list[int]
@@ -42,6 +42,7 @@ class LLMResult:
     output_qps: float
     output_token_ps: float
     notdone: list[int]
+    arrival_distribution: str | None = None
     preemption_count: int = 0
     recomputation_count: int = 0
     recomputed_tokens: int = 0
@@ -151,6 +152,7 @@ class LLMResult:
     af_phase_fidelity: dict[str, str] | None = None
     af_enabled: bool = False
     af_iteration_count: int = 0
+    af_warmup_iteration_count: int | None = None
     af_trace: list[dict[str, Any]] | None = None
     af_runtime_state: dict[str, Any] | None = None
     af_latency_providers: dict[str, Any] | None = None

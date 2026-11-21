@@ -5,7 +5,22 @@ from pathlib import Path
 from TokenSim.errors import ConfigurationError
 
 
-def validate_inputs(simulated, observed):
+def _expected_tp(simulated, observed, source, rank_map):
+    layout = simulated.metadata.get("worker_parallelism")
+    if not layout:
+        return simulated.metadata.get("tensor_parallel_size")
+    ranks = {
+        str(rank_map.get(span.rank, span.rank))
+        for span in observed.spans
+        if span.source == source["path"]
+    }
+    if not ranks or not ranks <= layout.keys():
+        return None
+    values = {layout[rank]["tensor_parallel_size"] for rank in ranks}
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def validate_inputs(simulated, observed, rank_map=None):
     checked, unavailable = [], []
     for source in observed.inputs:
         manifest = source["manifest"]
@@ -19,7 +34,11 @@ def validate_inputs(simulated, observed):
             tensor_parallel_size=manifest.get("tensor_parallel_size"),
         )
         for field, value in actual.items():
-            expected = simulated.metadata.get(field)
+            expected = (
+                _expected_tp(simulated, observed, source, rank_map or {})
+                if field == "tensor_parallel_size"
+                else simulated.metadata.get(field)
+            )
             if expected is None or value in (None, ""):
                 unavailable.append(dict(source=source["path"], field=field))
                 continue

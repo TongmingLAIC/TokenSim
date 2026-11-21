@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 from TokenSim.af.runtime.topology import AFCacheConfig
@@ -19,7 +18,6 @@ from TokenSim.block.replica_kv import ReplicaKVBlockManager
 from TokenSim.config.config import WorkerConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.llm.llm_request import Request
-from TokenSim.trace.events import TraceEvent
 from .worker import LLMWorker
 from .replicas import bind_ordinary_replicas
 from .af_worker import AFComputeWorker
@@ -27,83 +25,9 @@ from .af_worker import AFComputeWorker
 
 class AFEngineMixin:
     def attach_trace(self, session):
-        executor = self.af_executor
-        if executor is None:
-            return
-        owners = {}
-        original_submit = executor.submit
-        original_record = executor.trace.record
-        original_finish = self.record_af_iteration
-
-        def submit(worker, requests):
-            requests = tuple(requests)
-            iteration = original_submit(worker, requests)
-            ids = tuple(request.id for request in requests)
-            dependencies = dict(
-                session.request_tails[r] for r in ids if r in session.request_tails
-            )
-            owners[iteration.iteration_id] = (
-                worker,
-                ids,
-                dependencies,
-                session.run_phase,
-            )
-            return iteration
-
-        def record(event):
-            owner = owners.get(event.iteration_id)
-            if owner is not None:
-                details = dict(event.details, run_phase=owner[3])
-                if not event.predecessor_ids:
-                    details["external_predecessors"] = owner[2]
-                event = replace(event, details=details, run_phase=owner[3])
-            original_record(event)
-
-        def finish(iteration):
-            original_finish(iteration)
-            owner = owners.pop(iteration.iteration_id, None)
-            if owner is None:
-                return
-            worker, ids, _, run_phase = owner
-            events = executor.trace.events_for(iteration.iteration_id)
-            ends = {
-                event.node_id: event.end_at
-                for event in events
-                if abs(event.end_at - iteration.end_at) < 1e-12
-            }
-            node = f"af:completion:{iteration.iteration_id}"
-            session.recorder.record(
-                TraceEvent(
-                    iteration_id=session.iteration,
-                    block_id=worker,
-                    layer_id=-1,
-                    phase="decode",
-                    event_type="synchronize",
-                    resource_id=f"af:completion:{worker}",
-                    ready_at=iteration.end_at,
-                    start_at=iteration.end_at,
-                    end_at=iteration.end_at,
-                    service_duration=0,
-                    queue_duration=0,
-                    request_count=len(ids),
-                    token_count=0,
-                    source_id="af_execution",
-                    operation="af_completion",
-                    worker_id=worker,
-                    node_id=node,
-                    predecessor_ids=tuple(ends),
-                    details={"request_ids": ids, "run_phase": run_phase},
-                    run_phase=run_phase,
-                )
-            )
-            session._complete(session.iteration, ends)
-            session.iteration += 1
-            for request_id in ids:
-                session.request_tails[request_id] = node, iteration.end_at
-
-        executor.submit = submit
-        executor.trace.record = record
-        self.record_af_iteration = finish
+        if self.af_executor is not None:
+            self.af_executor.trace_observer = session.af
+            self.af_executor.trace.event_transform = session.af.record
 
     def _initialize_workers(
         self,
@@ -150,6 +74,8 @@ class AFEngineMixin:
         )
         self.af_executor: AFExecutor | None = None
         self.af_iteration_summaries: list[dict[str, Any]] = []
+        self.af_iteration_count = 0
+        self.af_warmup_iteration_count = 0
         self.workers: list[LLMWorker | AFComputeWorker] = []
         self.request_workers: list[LLMWorker] = []
         for worker_id, worker_config in enumerate(worker_configs):
@@ -258,6 +184,7 @@ class AFEngineMixin:
             worker.connector.bind_runtime(worker)
             worker.parallel_communicator.workers = self.workers
 
+        self.af_compute_provider: AFComputeLatencyProvider | None = None
         if cluster_config.af.enabled:
             af_compute_provider, af_transfer_provider = self._resolve_af_providers(
                 af_compute_provider,
@@ -391,21 +318,46 @@ class AFEngineMixin:
         )
 
     def run_complete_compute(self, worker_id: int, latency: float):
-        if self.af_resources is None:
-            yield self.env.timeout(latency)
-            return
-        resource = self.af_resources.compute_slots[worker_id]
-        with resource.request() as request:
-            yield request
-            yield self.env.timeout(latency)
+        trace = getattr(self, "trace_session", None)
+        if trace is not None:
+            trace.mark_submitted(worker_id)
+        try:
+            if self.af_resources is None:
+                yield from self._compute_service(worker_id, latency, trace)
+            else:
+                resource = self.af_resources.compute_slots[worker_id]
+                with resource.request() as request:
+                    yield request
+                    yield from self._compute_service(worker_id, latency, trace)
+        except BaseException:
+            if trace is not None:
+                trace.mark_stopped(worker_id, self.env.now)
+            raise
+        if trace is not None:
+            trace.finish(worker_id, self.env.now - latency, latency)
+
+    def _compute_service(self, worker_id, latency, trace):
+        if trace is not None:
+            trace.mark_started(worker_id, self.env.now, latency)
+        yield self.env.timeout(latency)
 
     def record_af_iteration(self, iteration: AFIteration) -> None:
         """Keep aggregates here; complete trace events remain owned by the recorder."""
         if self.af_executor is None:
             return
-        self.af_iteration_summaries.append(
-            summarize_iteration(self.af_executor.trace, iteration)
-        )
+        if iteration.run_phase == "warmup":
+            self.af_warmup_iteration_count += 1
+        else:
+            self.af_iteration_count += 1
+            if self.af_executor.trace.enabled:
+                self.af_iteration_summaries.append(
+                    dict(
+                        summarize_iteration(self.af_executor.trace, iteration),
+                        run_phase=iteration.run_phase,
+                    )
+                )
+        if self.trace_session is not None:
+            self.trace_session.af.finish(iteration)
 
     def af_runtime_summary(self) -> dict[str, Any] | None:
         if self.af_runtime_plan is None:

@@ -33,8 +33,10 @@ def compare_traces(
         raise ConfigurationError(
             "comparison requires nonempty simulated and GPU activity windows"
         )
-    profiled.diagnostics["compatibility"] = validate_inputs(simulated, profiled)
     pairs, unmatched, excluded = match_spans(simulated.spans, profiled.spans, mapping)
+    profiled.diagnostics["compatibility"] = validate_inputs(
+        simulated, profiled, mapping.get("rank_map")
+    )
     profiled.diagnostics["collective_waits"] = analyze_collectives(
         pairs, profiled, mapping.get("rank_map")
     )
