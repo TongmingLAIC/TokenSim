@@ -55,6 +55,7 @@ class CollectiveQuery:
     layout: GroupLayout
     dtype: str = "fp16"
     algorithm: str = "auto"
+    schedule: str = "hierarchical"
 
     def __post_init__(self) -> None:
         if self.operation not in OPERATIONS:
@@ -64,6 +65,10 @@ class CollectiveQuery:
         if self.algorithm not in ALGORITHMS:
             raise ConfigurationError(
                 f"unsupported collective algorithm {self.algorithm!r}"
+            )
+        if self.schedule not in {"hierarchical", "global_ring"}:
+            raise ConfigurationError(
+                f"unsupported collective schedule {self.schedule!r}"
             )
 
     @property

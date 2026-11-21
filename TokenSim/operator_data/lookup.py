@@ -99,6 +99,7 @@ class LookupPolicy:
     interpolate: bool = True
     extrapolate: str = "analytical"
     max_extrapolation_ratio: float = 16.0
+    interpolation_space: str = "axis"
 
     def __post_init__(self) -> None:
         boolean(self.interpolate, "interpolate")
@@ -107,6 +108,8 @@ class LookupPolicy:
             raise ConfigurationError(
                 f"extrapolate must be one of {EXTRAPOLATION_MODES}"
             )
+        if self.interpolation_space not in ("axis", "analytical"):
+            raise ConfigurationError("interpolation_space must be axis or analytical")
 
 
 class OperatorLookup:
@@ -299,6 +302,15 @@ class OperatorLookup:
                 spec, rest, node[hi], key_hi, table_name, scaler
             )
             weight = _blend_weight(axis, lo, hi, target)
+            if self.policy.interpolation_space == "analytical":
+                physical = _analytical_weight(
+                    scaler, table_name, key, axis.name, lo, hi
+                )
+                if physical is not None:
+                    weight = physical
+                    flag_lo |= {"analytical_interpolated"}
+                else:
+                    flag_lo |= {"axis_interpolation_fallback"}
             latency = lat_lo + weight * (lat_hi - lat_lo)
             return latency, src_lo | src_hi, flag_lo | flag_hi | {"interpolated"}
         # Out of range on this axis.
@@ -432,6 +444,19 @@ class OperatorLookup:
         # Clamp: negative alpha is nonsensical for work-growing axes, and
         # alpha > 1.0 should use the roofline model instead.
         return None if alpha > 1.0 else max(0.0, alpha)
+
+
+def _analytical_weight(scaler, table, key, axis, lo, hi):
+    if scaler is None:
+        return None
+    values = [scaler(table, {**key, axis: value}) for value in (lo, hi, key[axis])]
+    if any(value is None or not math.isfinite(value) for value in values):
+        return None
+    lower, upper, target = values
+    if upper <= lower:
+        return None
+    weight = (target - lower) / (upper - lower)
+    return min(1.0, max(0.0, weight)) if -1e-12 <= weight <= 1 + 1e-12 else None
 
 
 def _blend_weight(axis: AxisSpec, lo: Any, hi: Any, target: Any) -> float:

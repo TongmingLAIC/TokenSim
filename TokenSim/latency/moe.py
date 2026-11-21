@@ -304,10 +304,11 @@ class MegaMoEEstimator:
 
     def estimate(self, local_tokens, *, layers=None):
         if not self.topology_checked and self.backend.communicator is not None:
-            description = self.backend.communicator.describe()
+            communicator = self.backend.communicator
+            group = communicator.ep_group()
             if (
-                description["ep_group_link"] not in ("local", "node")
-                or description["ep_group_size"] != self.backend.moe_ep
+                len(group) != self.backend.moe_ep
+                or communicator.placement.lowest_common_level(group) > 0
             ):
                 raise ConfigurationError(
                     "borrowed MegaMoE curves require a complete single-node EP group"

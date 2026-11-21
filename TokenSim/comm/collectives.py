@@ -108,6 +108,12 @@ class CollectiveModel:
         return self.analytical(query)
 
     def analytical(self, query: CollectiveQuery) -> CollectiveEstimate:
+        if query.schedule == "global_ring":
+            from TokenSim.comm.global_ring import estimate_global_ring
+
+            return estimate_global_ring(
+                query, self.topology, self.links, self.launch_us
+            )
         layout = query.layout
         n = query.group_size
         levels: list[LevelEstimate] = []
@@ -393,6 +399,7 @@ class CollectiveModel:
                 layout,
                 query.dtype,
                 query.algorithm,
+                query.schedule,
             )
             return self.analytical(probe).latency_us
 
