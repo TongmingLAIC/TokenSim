@@ -3,7 +3,7 @@
 from collections import Counter, defaultdict
 from types import SimpleNamespace
 
-from TokenSim.af.providers.compute import OperatorComponent
+from TokenSim.af.providers.compute import OperatorComponent, _worst_match
 from TokenSim.config.parallel_config import ParallelConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.latency.attention.estimator import CompressedAttentionEstimator
@@ -151,8 +151,7 @@ def _attention(provider, resolver, query, tokens, tp):
             )
             matches.append(sample.match)
             sources.append(sample.source_id)
-        order = {"exact": 0, "interpolated": 1, "extrapolated": 2, "analytical": 3}
-        match = max(matches, key=lambda value: order[value])
+        match = _worst_match(matches)
         source = "compose:" + ":".join(dict.fromkeys(sources))
     key = dict(
         layer_kind=layer.attention_kind,

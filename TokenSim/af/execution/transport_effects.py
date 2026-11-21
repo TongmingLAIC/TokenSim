@@ -41,15 +41,12 @@ def packet_tail(config, identity, payload, request_ids):
 
 
 class ReceiverQueue:
-    def __init__(self, env, capacity, ordered):
-        self.env, self.ordered = env, ordered
+    def __init__(self, env, capacity):
+        self.env = env
         self.slots = simpy.Resource(env, capacity=capacity)
         self.entries = {}
-        self.order = []
-        self.changed = env.event()
         self.max_occupied = 0
         self.max_ready = 0
-        self.overtakes = 0
         self.history = []
 
     def _reserve(self, entry):
@@ -79,7 +76,6 @@ class ReceiverQueue:
                 key=key,
             )
             self.entries[key] = entry
-            self.order.append(key)
             entry["process"] = self.env.process(self._reserve(entry))
         yield self.entries[key]["admitted"]
 
@@ -88,10 +84,6 @@ class ReceiverQueue:
         self.max_ready = max(
             self.max_ready, sum(e["arrived"] for e in self.entries.values())
         )
-        if self.order[0] != key:
-            self.overtakes += 1
-        while self.ordered and self.order[0] != key:
-            yield self.changed
 
     def release(self, key):
         entry = self.entries.pop(key, None)
@@ -111,10 +103,6 @@ class ReceiverQueue:
                 time=self.env.now, action="release", key=key, occupied=self.slots.count
             )
         )
-        self.order.remove(key)
-        if not self.changed.triggered:
-            self.changed.succeed()
-        self.changed = self.env.event()
 
 
 class OrderedArrivalStream:
@@ -158,7 +146,7 @@ class AFTransportEffects:
     def __init__(self, executor):
         self.executor, self.env = executor, executor.env
         self.config = executor.cluster_config.af.transport_effects
-        self.receiver = ReceiverQueue(self.env, self.config.receive_cohorts, False)
+        self.receiver = ReceiverQueue(self.env, self.config.receive_cohorts)
         self.streams = {}
         self.consumers = {}
         self.inflight_bytes = Counter()
@@ -252,7 +240,7 @@ class AFTransportEffects:
         finally:
             self.inflight_bytes[link] -= payload
         if step.direction == "a_to_f":
-            yield from self.receiver.arrived(key)
+            self.receiver.arrived(key)
             blockers = yield from stream.arrived(flow)
         end = self.env.now
         row = dict(

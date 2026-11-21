@@ -1,35 +1,13 @@
 """Reusable LP30 live scratch reservations independent of weights and KV leases."""
 
-from dataclasses import dataclass
-
-from TokenSim.config.validation import integer
 from TokenSim.dtypes import dtype_size_bytes
 from TokenSim.errors import ConfigurationError
+from TokenSim.hardware.device.lpx import LP30Memory
 
 
-@dataclass(frozen=True)
-class LP30Memory:
-    prefill_chunk: int = 16
-    maximum_context: int = 102000
-    attention_tile_keys: int = 256
-    tile_buffers: int = 2
-    reserve_bytes: int = 5_000_000
-
-    def __post_init__(self):
-        for name in (
-            "prefill_chunk",
-            "maximum_context",
-            "attention_tile_keys",
-            "tile_buffers",
-        ):
-            integer(getattr(self, name), f"LP30 memory {name}", minimum=1)
-        integer(self.reserve_bytes, "LP30 memory reserve_bytes")
-        if self.prefill_chunk > self.maximum_context:
-            raise ConfigurationError("LP30 prefill chunk exceeds maximum context")
-
-
-def workspace_components(components, model, raw):
-    policy = LP30Memory(**raw)
+def workspace_components(components, model, policy):
+    if not isinstance(policy, LP30Memory):
+        policy = LP30Memory(**policy)
     tokens = policy.prefill_chunk
     activation_bytes = dtype_size_bytes(model.activation_dtype, role="activation_dtype")
     cache_bytes = dtype_size_bytes(model.kv_cache_dtype, role="kv_cache_dtype")
@@ -85,9 +63,15 @@ def workspace_components(components, model, raw):
 
 def memory_policies(hardware, workers):
     return tuple(
-        LP30Memory(**raw)
-        for name in sorted({worker.hardware for worker in workers})
-        if (raw := hardware.device(name).analytical.get("lpx_memory")) is not None
+        policy
+        for name in sorted(
+            {
+                worker.hardware
+                for worker in workers
+                if {"af_attention", "af_ffn"}.intersection(worker.capabilities)
+            }
+        )
+        if (policy := hardware.device(name).lpx_memory) is not None
     )
 
 

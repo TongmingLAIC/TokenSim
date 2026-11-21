@@ -4,40 +4,15 @@ MXM rates come from the device catalog; VXM and SXM rates are independent
 assumptions because published FP8 matrix peaks do not specify those units.
 """
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 import math
 
-from TokenSim.config.validation import integer, number
+from TokenSim.config.validation import number
 from TokenSim.dtypes import dtype_size_bytes
 from TokenSim.errors import ConfigurationError
+from TokenSim.hardware.device.lpx import LP30Pipeline
 from TokenSim.operator_data.analytical.base import AnalyticalEstimate, Calibration
 from TokenSim.operator_data.workload import work_for_table
-
-
-@dataclass(frozen=True)
-class LP30Pipeline:
-    activation_dtype: str = "bf16"
-    vector_ops_per_s: float = 20e12
-    exp_ops_per_s: float = 1e12
-    shuffle_bytes_per_s: float = 10e12
-    vector_efficiency: float = 0.5
-    shuffle_efficiency: float = 0.8
-    vector_bytes: int = 320
-    attention_tile_keys: int = 256
-    fill_drain_us: float = 0.05
-    schedule: str = "tiled"
-
-    def __post_init__(self):
-        dtype_size_bytes(self.activation_dtype, role="activation_dtype")
-        for name in ("vector_ops_per_s", "exp_ops_per_s", "shuffle_bytes_per_s"):
-            number(getattr(self, name), f"LP30 {name}", positive=True)
-        for name in ("vector_efficiency", "shuffle_efficiency"):
-            number(getattr(self, name), f"LP30 {name}", positive=True, maximum=1)
-        for name in ("vector_bytes", "attention_tile_keys"):
-            integer(getattr(self, name), f"LP30 {name}", minimum=1)
-        number(self.fill_drain_us, "LP30 fill/drain", minimum=0)
-        if self.schedule not in {"tiled", "serialized"}:
-            raise ConfigurationError("LP30 schedule must be tiled or serialized")
 
 
 def _rounded(elements, element_bytes, vector_bytes):
@@ -65,7 +40,7 @@ def _attention_units(table, key, work, policy):
 
 
 def estimate_lp30(table, key, device, calibration=None):
-    policy = LP30Pipeline(**device.analytical["lpx_pipeline"])
+    policy = device.lpx_pipeline
     params = device.analytical
     work = work_for_table(table, key)
     matrix_ops, vector_ops, exps, shuffle, tiles = 0.0, 0.0, 0.0, 0.0, 1

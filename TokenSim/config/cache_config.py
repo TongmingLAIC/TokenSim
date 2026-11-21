@@ -127,14 +127,19 @@ class CacheConfig:
         self.hybrid_layout = None
         self.memory_budget = None
         if model.components is not None:
+            from TokenSim.config.moe_execution import MoEExecutionConfig
             from TokenSim.config.weight_memory import packed_weight_memory
 
+            execution = MoEExecutionConfig.for_compressed_memory(
+                self.parallel_config, moe_execution
+            )
             self.weight_memory_report = packed_weight_memory(
                 model,
                 self.parallel_config,
                 self.rank_info,
                 self.expert_placement,
                 include_mtp=speculative_tokens > 0,
+                layout_backend=execution.weight_layout,
             )
             self.model_param_size_unsharded = packed_weight_memory(
                 model, include_mtp=speculative_tokens > 0

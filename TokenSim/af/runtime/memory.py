@@ -380,8 +380,16 @@ def _compile_physical_states(
                     ("f_topk_ids_weights", tokens * moe_config.num_experts_per_tok * 8),
                 )
             buffers += (("control_staging", 8 + len(encode_eager_control(tokens))),)
-        policy = hardware_conf.analytical.get("lpx_memory")
-        if hardware_conf.device_id == "groq_lp30" and policy is not None:
+        pipeline = hardware_conf.lpx_pipeline
+        if (
+            pipeline is not None
+            and pipeline.activation_dtype != effective_dtypes.activation_dtype
+        ):
+            raise ConfigurationError(
+                f"{hardware_conf.device_id}: LP30 pipeline activation dtype must match AF activation dtype"
+            )
+        policy = hardware_conf.lpx_memory
+        if policy is not None:
             from TokenSim.af.runtime.lpx_memory import workspace_components
 
             buffers += workspace_components(components, model, policy)

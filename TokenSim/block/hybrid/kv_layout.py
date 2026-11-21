@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from math import lcm
 
+from TokenSim.config.validation import integer
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware.device import dtype_bytes
 
@@ -171,21 +172,35 @@ def hybrid_kv_layout(
         raise ConfigurationError(
             "native compressed attention layout needs complete structural metadata"
         )
-    if (
-        block_size <= 0
-        or block_size % 128
-        or max_num_batched_tokens <= 0
-        or max_concurrent_batches <= 0
-    ):
+    integer(block_size, "compressed attention block size", minimum=1)
+    integer(max_num_batched_tokens, "compressed attention token budget", minimum=1)
+    integer(
+        max_concurrent_batches, "compressed attention concurrent batches", minimum=1
+    )
+    integer(retention_interval, "compressed attention retention interval")
+    integer(speculative_tokens, "compressed attention speculative lookahead")
+    if block_size % 128:
         raise ConfigurationError(
-            "compressed attention logical blocks must be a positive multiple of 128; token budgets must be positive"
+            "compressed attention logical blocks must be a multiple of 128"
         )
-    if retention_interval < 0 or retention_interval % block_size:
+    if retention_interval % block_size:
         raise ConfigurationError(
             "retention must be zero or a multiple of the scheduler block"
         )
-    if speculative_tokens < 0 or speculative_tokens > block_size:
+    if speculative_tokens > block_size:
         raise ConfigurationError("invalid compressed attention speculative lookahead")
+    layers = model.layer_specs(include_mtp=include_mtp)
+    ratios = sorted(
+        {layer.compress_ratio for layer in layers if layer.compress_ratio > 1}
+    )
+    if not ratios:
+        raise ConfigurationError(
+            "grouped KV layout requires at least one full compressed layer"
+        )
+    if any(block_size % ratio for ratio in ratios):
+        raise ConfigurationError(
+            f"compressed attention block size {block_size} must be divisible by every compression ratio: {ratios}"
+        )
     # Bytes per cached entry: one latent vector, and an index key that is
     # either MXFP4 (two values per byte plus one scale byte per group) or
     # FP8 with one FP32 scale.
@@ -202,7 +217,7 @@ def hybrid_kv_layout(
     # State pages are 4 tokens wide for overlapping windows and 8 otherwise;
     # sliding-window pages are 64 tokens wide.
     pages = []
-    for layer in model.layer_specs(include_mtp=include_mtp):
+    for layer in layers:
         prefix = f"{'mtp' if layer.is_mtp else 'layers'}.{layer.layer_id}"
         # Attention registration order: CSA indexer is constructed first,
         # then SWA, full compressed cache and its compressor state.

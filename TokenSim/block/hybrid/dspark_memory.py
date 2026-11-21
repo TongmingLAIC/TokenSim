@@ -24,7 +24,9 @@ def persistent_allocations(model, tokens, max_num_seqs, drafts):
             if model.dspark.draft_sample_method == "probabilistic"
             else 0
         ),
-        dspark_confidence_probabilities=max_num_seqs * drafts * 4,
+        dspark_confidence_probabilities=(
+            max_num_seqs * drafts * 4 if model.dspark.confidence_head else 0
+        ),
         dspark_anchor_indices=max_num_seqs * 8,
         dspark_step_columns=drafts * 4,
     )

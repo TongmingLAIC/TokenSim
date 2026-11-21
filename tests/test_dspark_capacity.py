@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import unittest
 
 from TokenSim.block.hybrid.dspark_memory import persistent_allocations
+from TokenSim.block.hybrid.kv_layout import hybrid_kv_layout
 from TokenSim.block.hybrid.manager import HybridKVBlockManager
 from TokenSim.config.cache_config import CacheConfig
 from TokenSim.config.parallel_config import ParallelConfig
+from TokenSim.config.weight_memory import packed_weight_memory
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import HardwareContext
 from tests.test_dspark import model
@@ -35,7 +37,9 @@ class DSparkCapacityTest(unittest.TestCase):
     def test_packed_element_sizes_round_up_to_whole_storage_bytes(self):
         candidate = SimpleNamespace(
             dspark=SimpleNamespace(
-                target_layer_ids=(0,), draft_sample_method="probabilistic"
+                target_layer_ids=(0,),
+                draft_sample_method="probabilistic",
+                confidence_head=True,
             ),
             hidden_size=2,
             vocab_size=3,
@@ -43,6 +47,56 @@ class DSparkCapacityTest(unittest.TestCase):
         )
         self.assertEqual(
             persistent_allocations(candidate, 1, 1, 1)["dspark_draft_logits"], 2
+        )
+
+    def test_grouped_cache_rejects_unsupported_compression_geometry(self):
+        value = model()
+        for ratio, reason in (
+            (1, "at least one full compressed layer"),
+            (3, "must be divisible"),
+            (512, "must be divisible"),
+        ):
+            candidate = replace(
+                value,
+                components=replace(
+                    value.components,
+                    compress_ratios=(ratio,) * value.num_layers
+                    + (1,) * value.dspark.num_layers,
+                ),
+            )
+            with (
+                self.subTest(ratio=ratio),
+                self.assertRaisesRegex(ConfigurationError, reason),
+            ):
+                hybrid_kv_layout(candidate, block_size=256)
+
+    def test_weight_budget_uses_selected_moe_execution_layout(self):
+        hardware = HardwareContext.load(ROOT / "data")
+        value = model()
+        parallel = ParallelConfig(
+            tensor_parallel_size=2,
+            data_parallel_size=4,
+            enable_expert_parallel=True,
+            expert_parallel_scope="global",
+            expert_parallel_size=8,
+        )
+        cache = CacheConfig(
+            256,
+            hardware.device("gb200"),
+            value,
+            parallel_config=parallel,
+            attention_backend="module",
+            moe_execution={"backend": "generic"},
+        )
+        generic = packed_weight_memory(
+            value, parallel, include_mtp=False, layout_backend="fused"
+        )
+        mega = packed_weight_memory(
+            value, parallel, include_mtp=False, layout_backend="mega_moe"
+        )
+        self.assertNotEqual(generic["total_bytes"], mega["total_bytes"])
+        self.assertEqual(
+            cache.memory_budget["deductions"]["weights"], generic["total_bytes"]
         )
 
     def test_original_gb200_decode_settings_produce_floor_conserving_slots(self):

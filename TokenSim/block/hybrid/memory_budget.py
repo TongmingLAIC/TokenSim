@@ -183,16 +183,7 @@ def hybrid_memory_budget(
         raise ConfigurationError(
             "native compressed attention memory geometry requires complete local attention groups"
         )
-    if moe_execution is None:
-        execution = MoEExecutionConfig(
-            backend=(
-                "deep_gemm_amxf4_mega_moe"
-                if parallel.enable_expert_parallel
-                else "generic"
-            )
-        )
-    else:
-        execution = MoEExecutionConfig.from_value(moe_execution)
+    execution = MoEExecutionConfig.for_compressed_memory(parallel, moe_execution)
     mtp = bool(speculative_tokens and spec.num_nextn_predict_layers)
     kinds = sorted(
         {layer.attention_kind for layer in model.layer_specs(include_mtp=False)}

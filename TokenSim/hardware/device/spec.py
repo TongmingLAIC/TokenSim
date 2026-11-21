@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any, Iterable, Mapping
 
 from TokenSim.errors import ConfigurationError
@@ -12,6 +13,7 @@ from TokenSim.hardware.device.dtypes import (
     compute_dtype,
     normalize_dtype,
 )
+from TokenSim.hardware.device.lpx import LP30Memory, LP30Pipeline, read_lpx_policy
 from TokenSim.hardware.device.sourced_value import EVIDENCE_GRADES, SourcedValue
 
 DEFAULT_ANALYTICAL_PARAMETERS: dict[str, dict[str, float]] = {
@@ -74,7 +76,7 @@ class DeviceSpec:
     scale_up_ports: int
     host_link: str | None
     step_overhead_us: SourcedValue
-    analytical: Mapping[str, float]
+    analytical: Mapping[str, float | Mapping[str, Any]]
     on_chip_memory_bytes: SourcedValue | None = None
     on_chip_bandwidth_bytes_per_s: SourcedValue | None = None
     sources: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -120,7 +122,9 @@ class DeviceSpec:
             raise ConfigurationError(f"{context}: memory must be a mapping")
         on_chip = raw.get("on_chip_memory") or {}
         interconnect = raw.get("interconnect") or {}
-        analytical = dict(DEFAULT_ANALYTICAL_PARAMETERS[family])
+        analytical: dict[str, float | Mapping[str, Any]] = dict(
+            DEFAULT_ANALYTICAL_PARAMETERS[family]
+        )
         analytical_raw = raw.get("analytical") or {}
         if not isinstance(analytical_raw, Mapping):
             raise ConfigurationError(f"{context}: analytical must be a mapping")
@@ -134,6 +138,9 @@ class DeviceSpec:
             )
         for key, value in analytical_raw.items():
             if key in _ANALYTICAL_META_KEYS:
+                continue
+            if key in {"lpx_pipeline", "lpx_memory"}:
+                analytical[key] = value
                 continue
             try:
                 analytical[str(key)] = float(value)
@@ -164,7 +171,7 @@ class DeviceSpec:
         )
         power = raw.get("power") or {}
         aliases = tuple(str(alias) for alias in raw.get("aliases", []))
-        return cls(
+        device = cls(
             device_id=device_id,
             family=family,
             display_name=str(raw.get("display_name", device_id)),
@@ -236,6 +243,11 @@ class DeviceSpec:
                 }
             },
         )
+        if "lpx_pipeline" in analytical:
+            _ = device.lpx_pipeline
+        if "lpx_memory" in analytical:
+            _ = device.lpx_memory
+        return device
 
     @classmethod
     def simple(
@@ -285,6 +297,14 @@ class DeviceSpec:
         )
 
     # -- queries -----------------------------------------------------------
+
+    @cached_property
+    def lpx_pipeline(self) -> LP30Pipeline | None:
+        return read_lpx_policy(self, "lpx_pipeline", LP30Pipeline)
+
+    @cached_property
+    def lpx_memory(self) -> LP30Memory | None:
+        return read_lpx_policy(self, "lpx_memory", LP30Memory)
 
     def peak_compute_for(self, dtype: str) -> SourcedValue:
         """Peak dense throughput (ops/s) of the pipe a storage dtype runs on."""

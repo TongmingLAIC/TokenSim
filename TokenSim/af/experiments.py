@@ -170,14 +170,6 @@ class AFExperimentRunner:
                 directory
                 / f"decode-layers{self.runtime.plan.total_layers}-b{batch}.trace{TRACE_SUFFIXES[trace_format]}"
             )
-            kwargs = (
-                {"trace_config": options} if options != TraceConfig(mode="full") else {}
-            )
-            # The original seed default keeps diagnostic wrappers compatible.
-            if seed != 42:
-                kwargs["seed"] = seed
-            if trace_format != "json":
-                kwargs["trace_format"] = trace_format
             executor, measurements, compute, transfer = (
                 self._simulate or factory.simulate_decode
             )(
@@ -188,7 +180,9 @@ class AFExperimentRunner:
                 trace=True,
                 fallback=fallback,
                 trace_output=trace_path,
-                **kwargs,
+                seed=seed,
+                trace_config=options,
+                trace_format=trace_format,
             )
             try:
                 step_us = sum(row["makespan_us"] for row in measurements) / steps

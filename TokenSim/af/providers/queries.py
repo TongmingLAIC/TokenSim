@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Literal, Mapping, Protocol
+from typing import Literal, Mapping, Protocol, get_args
 
 from TokenSim.af.planning.batching import ForwardPhase
 
 
-# How a provider answered: measured row, interpolated between rows, extrapolated
-# beyond the measured range, or the device family's analytical formula.
-AF_MATCH_TYPES = ("exact", "interpolated", "extrapolated", "analytical")
+# Order used to combine estimates from several operators or measured shapes.
+AFMatchType = Literal["exact", "interpolated", "clamped", "extrapolated", "analytical"]
+AF_MATCH_TYPES = get_args(AFMatchType)
 
 
 AFLayerType = Literal["dense", "moe"]
@@ -266,7 +266,7 @@ class AFServiceEstimate:
     source_id: str
     payload_bytes: int | None = None
     dataset_version: str = "test-stub"
-    match_type: Literal["exact", "interpolated", "extrapolated", "analytical"] = "exact"
+    match_type: AFMatchType = "exact"
     details: Mapping[str, object] = field(default_factory=dict)
 
 

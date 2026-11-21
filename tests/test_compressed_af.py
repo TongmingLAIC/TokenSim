@@ -21,15 +21,15 @@ from TokenSim.trace.host import run_environment
 from tests.af.support.config import _cluster
 
 
-def compressed_runtime(a_tp=1):
+def compressed_runtime(a_tp=1, *, device="b200_sxm", topology="hgx_b200_8x_xdr"):
     hardware = HardwareContext.load(Path(__file__).resolve().parents[1] / "data")
     model = hardware.models.resolve("deepseek-v4-pro")
     cluster = _cluster(a_tp=a_tp, a_dp=4 // a_tp, f_tp=1, f_dp=12, f_ep=12)
     doc = TypeAdapter(ClusterConfig).dump_python(cluster, exclude_none=True)
-    doc["topology"] = "hgx_b200_8x_xdr"
+    doc["topology"] = topology
     doc["networks"] = {"af-net": "ethernet400Gb"}
     for group in doc["worker_groups"]:
-        group["hardware"] = "b200_sxm"
+        group["hardware"] = device
     doc["af"].update(
         af_block_size=4, max_inflight_blocks=2, routed_expert_execution="grouped"
     )

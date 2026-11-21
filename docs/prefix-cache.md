@@ -87,6 +87,7 @@ A request without `hash_ids` computes its prompt without prefix reuse and report
 When every prompt block hits, the last prompt token is still computed so that the request can sample.
 
 Grouped KV caches store several types of cache pages, such as compressed attention pages and sliding-window pages.
+The grouped layout requires a full compressed layer and a logical block size divisible by every compression ratio.
 They use the same ordered block identifiers to identify reusable prefixes.
 A prefix can be reused only if the pages needed by every cache group are still in memory, so the reusable prefix can be shorter than the matching identifier sequence.
 

@@ -60,9 +60,6 @@ def configuration(
     ffn_batch_wait_us=5.0,
 ):
     boolean(colocated_dense_reuse, "colocated dense reuse")
-    policy = hardware.device(layout.a_device).analytical.get("lpx_pipeline")
-    if policy and policy.get("activation_dtype", "bf16") != model.activation_dtype:
-        raise ConfigurationError("LP30 pipeline activation dtype must match the model")
     if layout.a_cp != 1:
         raise ConfigurationError(
             "context parallelism needs a native distributed-attention plan"

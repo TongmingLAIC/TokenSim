@@ -5,6 +5,7 @@ import os
 import simpy
 import tomllib
 import unittest
+import yaml
 from TokenSim.af.runtime.lpx_memory import (
     LP30Memory,
     validate_queries,
@@ -15,6 +16,7 @@ from TokenSim.af.serving.service import AFService
 from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import DeviceCatalog, HardwareContext
+from TokenSim.hardware.device import DeviceSpec
 from TokenSim.hardware.placement import build_topology_placement
 from TokenSim.operator_data.analytical import analytical_model_for
 from TokenSim.operator_data.analytical.lp30 import LP30Pipeline
@@ -172,6 +174,17 @@ class UnitAccountingTest(unittest.TestCase):
         device = replace(base, analytical={**base.analytical, "lpx_pipeline": policy})
         return analytical_model_for(device.family).estimate(table, key, device)
 
+    def test_custom_device_catalog_selects_unit_accounting_through_configuration(self):
+        raw = yaml.safe_load((ROOT / "data/devices/groq_lp30.yaml").read_text())
+        raw["device_id"] = "custom-lpx"
+        raw["analytical"].update(lpx_pipeline={}, lpx_memory={"prefill_chunk": 4})
+        device = DeviceSpec.from_mapping(raw)
+        estimate = analytical_model_for(device.family).estimate(
+            "gemm", dict(dtype="fp8", m=3, n=64, k=128), device
+        )
+        self.assertIn("mxm", estimate.details["unit_service_us"])
+        self.assertEqual(device.lpx_memory.prefill_chunk, 4)
+
     def test_mixed_precision_counts_external_bytes_and_vector_casts(self):
         key = dict(dtype="fp8", m=3, n=64, k=128)
         estimate = self.estimate("gemm", key)
@@ -277,6 +290,7 @@ class WorkspaceTest(unittest.TestCase):
         device = self.hardware.device("groq_lp30")
         altered = replace(
             device,
+            device_id="custom-lpx",
             analytical={
                 **device.analytical,
                 "lpx_memory": {"prefill_chunk": 2, "maximum_context": 24},
@@ -292,7 +306,9 @@ class WorkspaceTest(unittest.TestCase):
         runtime = configuration(
             hardware,
             self.model,
-            Layout(a_device="groq_lp30", f_device="groq_lp30", a_tp=2, f_tp=2, f_ep=1),
+            Layout(
+                a_device="custom-lpx", f_device="custom-lpx", a_tp=2, f_tp=2, f_ep=1
+            ),
             namespace="memory",
         )
         self.assertTrue(

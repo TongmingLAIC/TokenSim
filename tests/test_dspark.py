@@ -101,11 +101,14 @@ class DSparkTest(unittest.TestCase):
         self.assertEqual(buffers["dspark_draft_logits"], 8 * 5 * value.vocab_size * 2)
         self.assertEqual(persistent_allocations(value, 8192, 8, 0), {})
         greedy = replace(
-            value, dspark=replace(value.dspark, draft_sample_method="greedy")
+            value,
+            dspark=replace(
+                value.dspark, draft_sample_method="greedy", confidence_head=False
+            ),
         )
-        self.assertEqual(
-            persistent_allocations(greedy, 8192, 8, 5)["dspark_draft_logits"], 0
-        )
+        greedy_buffers = persistent_allocations(greedy, 8192, 8, 5)
+        self.assertEqual(greedy_buffers["dspark_draft_logits"], 0)
+        self.assertEqual(greedy_buffers["dspark_confidence_probabilities"], 0)
         with self.assertRaises(ConfigurationError):
             replace(value, dspark=DSparkConfig(num_layers=2))
         with self.assertRaises(ConfigurationError):
@@ -114,6 +117,35 @@ class DSparkTest(unittest.TestCase):
             yaml.safe_load((ROOT / "data/models/deepseek-v4-pro.yaml").read_text())
         )
         self.assertNotIn("dspark", legacy.to_dict())
+
+    def test_greedy_draft_prices_argmax_without_probabilistic_sampling(self):
+        value = model()
+        greedy = replace(
+            value, dspark=replace(value.dspark, draft_sample_method="greedy")
+        )
+        hardware = HardwareContext.load(ROOT / "data")
+        backend = OperatorTableLatencyBackend(
+            device=hardware.device("gb200"),
+            model=greedy,
+            fallback="analytical_only",
+            expected_decode_query_len=6,
+            max_num_seqs=8,
+        )
+        request = Request(1, 64, 64, 256)
+        request.generation_idx = 1
+        request.num_computed_tokens = 64
+        request.scheduled_tokens = 3
+        request.scheduled_query_tokens = 6
+        with patch.object(
+            backend, "elementwise", wraps=backend.elementwise
+        ) as elementwise:
+            backend.native_mtp.estimate([request])
+        argmax_calls = [
+            call.args for call in elementwise.call_args_list if call.args[0] == "argmax"
+        ]
+        self.assertEqual(argmax_calls, [("argmax", 2, value.vocab_size)] * 5)
+        self.assertNotIn("dspark_markov_sampling", backend.stats.table_match_counts)
+        self.assertIn("greedy selection", backend.native_mtp.describe()["sampling"])
 
 
 if __name__ == "__main__":

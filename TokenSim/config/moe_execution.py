@@ -26,3 +26,13 @@ class MoEExecutionConfig:
     @property
     def native(self):
         return self.backend == "deep_gemm_amxf4_mega_moe"
+
+    @property
+    def weight_layout(self):
+        return "mega_moe" if self.native else "fused"
+
+    @classmethod
+    def for_compressed_memory(cls, parallel, value):
+        if value is None and parallel.enable_expert_parallel:
+            return cls(backend="deep_gemm_amxf4_mega_moe")
+        return cls.from_value(value)

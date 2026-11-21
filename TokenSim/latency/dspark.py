@@ -181,11 +181,16 @@ class DSparkEstimator(SpeculativeEstimator):
                 self.draft.markov_rank,
                 dtype=self.model.operator_dtype("lm_head"),
             )
-            values["elementwise"] += self._stream_us(
-                "dspark_markov_sampling",
-                request_rows * self.model.vocab_size * 12,
-                flops=request_rows * self.model.vocab_size * 8,
-            )
+            if self.draft.draft_sample_method == "greedy":
+                values["elementwise"] += b.elementwise(
+                    "argmax", request_rows, self.model.vocab_size
+                )
+            else:
+                values["elementwise"] += self._stream_us(
+                    "dspark_markov_sampling",
+                    request_rows * self.model.vocab_size * 12,
+                    flops=request_rows * self.model.vocab_size * 8,
+                )
         self.counts.update(
             target_steps=1,
             context_rows=context_rows,
@@ -209,7 +214,15 @@ class DSparkEstimator(SpeculativeEstimator):
             K=self.k,
             draft=self.draft.to_dict(),
             passes="One eager target-hidden projection and per-layer context-KV insertion, then one block-parallel draft backbone",
-            sampling="K sequential full-vocabulary Markov projections and probabilistic draws; confidence weights resident, adaptive verification disabled",
+            sampling=(
+                "K sequential full-vocabulary Markov projections; "
+                + (
+                    "greedy selection"
+                    if self.draft.draft_sample_method == "greedy"
+                    else "probabilistic draws"
+                )
+                + "; adaptive verification disabled"
+            ),
             query_width=self.query_width,
             capture_token_rows=self.capture_rows,
             attention="Noncausal query block plus the retained SWA context; analytical single-latent core",

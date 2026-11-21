@@ -60,27 +60,6 @@ class PacketTailTest(unittest.TestCase):
 
 
 class ReceiveQueueTest(unittest.TestCase):
-    def test_ordered_receive_holds_a_fast_later_cohort(self):
-        for ordered in (True, False):
-            env = simpy.Environment()
-            queue = ReceiverQueue(env, 2, ordered)
-            completed = []
-
-            def cohort(key, flight):
-                yield from queue.enter(key)
-                yield env.timeout(flight)
-                yield from queue.arrived(key)
-                completed.append((key, env.now))
-                queue.release(key)
-
-            env.process(cohort(0, 10))
-            env.process(cohort(1, 1))
-            env.run()
-            self.assertEqual(completed[0][0], 0 if ordered else 1)
-            self.assertEqual(queue.slots.count, 0)
-            self.assertEqual(queue.max_occupied, 2)
-            self.assertGreater(queue.overtakes, 0)
-
     def test_stream_order_releases_before_consumer_compute_finishes(self):
         env = simpy.Environment()
         stream = OrderedArrivalStream(env, True)
@@ -102,7 +81,7 @@ class ReceiveQueueTest(unittest.TestCase):
 
     def test_finite_receiver_backpressures_and_releases_cancelled_reservation(self):
         env = simpy.Environment()
-        queue = ReceiverQueue(env, 1, False)
+        queue = ReceiverQueue(env, 1)
         first = env.process(queue.enter(0))
         second = env.process(queue.enter(1))
         env.run()
@@ -221,7 +200,7 @@ class ReceiveQueueTest(unittest.TestCase):
 
     def test_cancel_pending_reservation_leaves_no_reserve_process(self):
         env = simpy.Environment()
-        receiver = ReceiverQueue(env, 1, False)
+        receiver = ReceiverQueue(env, 1)
         env.process(receiver.enter(0))
 
         def waiter():
