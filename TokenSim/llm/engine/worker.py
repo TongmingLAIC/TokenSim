@@ -66,7 +66,12 @@ class LLMWorker(Worker):
         runtime_bindings=(),
         runtime_state=None,
     ):
-        config = engine.config
+        from TokenSim.config.serving_domains import resolve_worker_config
+
+        config = resolve_worker_config(
+            engine.config, worker_config.simulation_overrides
+        )
+        self.config = config
         super().__init__(env, id)
         self.hardware_context = hardware
         self.engine = engine
@@ -82,6 +87,7 @@ class LLMWorker(Worker):
         self.model = model_spec.model_id
         self.model_spec = model_spec
         self.parallel_config = parallel_config or ParallelConfig.default()
+        self.execution_domain = worker_config.execution_domain
         self.moe_config = moe_config or model_spec.moe
         self.expert_placement = expert_placement
         bind_af_worker(self, worker_config, runtime_bindings, runtime_state)
@@ -116,6 +122,13 @@ class LLMWorker(Worker):
             raise ConfigurationError(
                 "runtime memory profiles cannot replace an AF cache configuration"
             )
+        if (
+            config.kv_cache_memory_bytes is not None
+            and cache_config_override is not None
+        ):
+            raise ConfigurationError(
+                "Physical KV byte budget requires ordinary serving workers"
+            )
         self.cache_config = cache_config_override or CacheConfig(
             self.block_size,
             self.device,
@@ -124,6 +137,7 @@ class LLMWorker(Worker):
             rank_info=self.rank_info,
             expert_placement=self.expert_placement,
             usable_memory_fraction=config.gpu_memory_utilization,
+            kv_cache_memory_bytes=config.kv_cache_memory_bytes,
             max_num_batched_tokens=config.max_num_batched_tokens
             or DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=config.max_num_seqs,
@@ -340,6 +354,11 @@ class LLMWorker(Worker):
                                 f"worker {self.id} received STEP while {self.status}"
                             )
                         running, load_latency = self.prepare_step()
+                        handoff = getattr(self.engine, "pd_handoff", None)
+                        if not running and handoff is not None and handoff.jobs:
+                            self.status = WorkerStatus.WAITING
+                            handoff.blocked_workers.add(self.id)
+                            continue
                         if not running and self.connector.async_offload:
                             # Transfers advance independently; a worker with
                             # only loading/capacity-blocked requests must yield.
@@ -403,6 +422,9 @@ class LLMWorker(Worker):
                             and not getattr(self.scheduler, "loaded_waiting", [])
                         ):
                             self.status = WorkerStatus.WAITING
+                handoff = getattr(self.engine, "pd_handoff", None)
+                if handoff is not None:
+                    handoff.notify()
             except Exception as exc:
                 logger.exception(
                     "worker %s failed while handling %s for requests=%s metadata=%s",

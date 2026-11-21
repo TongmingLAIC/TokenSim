@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections import OrderedDict
 
 from TokenSim.block.block import Device, PhysicalTokenBlock
+from TokenSim.config.validation import integer
 from TokenSim.errors import OutOfBlocksError
 from .allocator import SlotAllocatorMixin
 from .external_cache import ExternalCacheMixin
 from .kv_layout import HybridKVLayout
+from .handoff import GroupedHandoffMixin
 from .prefix_cache import PrefixCacheMixin
 
 
@@ -65,7 +67,9 @@ class _HybridBlockTable:
         return sum(len(table) for table in tables.values()) if tables else 0
 
 
-class HybridKVBlockManager(PrefixCacheMixin, SlotAllocatorMixin, ExternalCacheMixin):
+class HybridKVBlockManager(
+    PrefixCacheMixin, SlotAllocatorMixin, ExternalCacheMixin, GroupedHandoffMixin
+):
     """Group-aware slot allocation with atomic prefix recovery and retention.
 
     Short-block identities use the containing known prefix hash and a subblock
@@ -83,6 +87,7 @@ class HybridKVBlockManager(PrefixCacheMixin, SlotAllocatorMixin, ExternalCacheMi
     def __init__(
         self, layout: HybridKVLayout, num_slots: int, model: str, *, watermark=0.0
     ):
+        num_slots = integer(num_slots, "hybrid physical slot count")
         if num_slots < 2:
             raise OutOfBlocksError(
                 "native hybrid pool needs a null slot and usable slots"

@@ -192,21 +192,34 @@ class AFEngineMixin:
                 else:
                     block_manager = None
                     cache_config_override = None
-                    worker_parallel_config = self.parallel_config
+                    worker_parallel_config = (
+                        worker_config.parallel_config or self.parallel_config
+                    )
+                from TokenSim.moe import build_expert_placement
+
+                worker_experts = (
+                    build_expert_placement(
+                        self.moe_config,
+                        worker_parallel_config,
+                        total_layers=self.model_spec.num_layers,
+                    )
+                    if worker_config.parallel_config is not None
+                    else self.expert_placement
+                )
                 worker = LLMWorker(
                     env=env,
                     id=worker_id,
                     engine=self,
                     worker_config=worker_config,
-                    kv_transfer_config=kv_transfer_config,
+                    kv_transfer_config=worker_config.kv_transfer or kv_transfer_config,
                     hardware=hardware,
                     model_spec=self.model_spec,
                     placement=self.placement,
                     parallel_config=worker_parallel_config,
                     moe_config=self.moe_config,
-                    expert_placement=self.expert_placement,
+                    expert_placement=worker_experts,
                     kv_cache_capacity_tokens_per_dp_rank=cluster_config.effective_kv_cache_capacity_per_dp_rank(
-                        self.parallel_config
+                        worker_parallel_config
                     ),
                     runtime_role=self._runtime_role(worker_config),
                     cache_config_override=cache_config_override,

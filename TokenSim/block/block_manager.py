@@ -127,6 +127,7 @@ class BlockManager:
         plan = self.kv_cache_manager.plan_reuse(req)
         num_required_blocks = plan.miss_block_count
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_free_gpu_blocks += getattr(self, "transfer_reservations", {}).get(req.id, 0)
         # Zero-ref hits sit in the free queue until acquired, so they must not
         # be counted as capacity available for miss/private allocations.
         num_free_gpu_blocks -= plan.zero_ref_hit_blocks
@@ -138,6 +139,10 @@ class BlockManager:
             raise SimulationStateError(
                 f"request {req.id} already has blocks in this block manager"
             )
+        reservations = getattr(self, "transfer_reservations", {})
+        transferred = reservations.pop(req.id, 0)
+        if transferred:
+            self.release_reserved_blocks(transferred)
         plan = self.kv_cache_manager.plan_reuse(req)
         blocks: list[PhysicalTokenBlock] = []
         try:
@@ -154,6 +159,8 @@ class BlockManager:
         self.block_table.add_blocks(req.id, blocks)
         self._sync_request_blocks(req, blocks)
         self._mark_input_blocks_pending(req, blocks, plan)
+        if transferred:
+            self.pd_handoff.admitted(req)
 
     def get_num_free_blocks(self):
         return self.gpu_allocator.get_num_free_blocks()

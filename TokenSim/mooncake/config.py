@@ -30,12 +30,14 @@ class MooncakeConfig:
     tenant_id: str = "default"
     cache_prefix: str = ""
     cache_layout: str = "uniform"
+    aggregate_tensor_parallel: bool = False
     mode: str = "embedded"
     protocol: str = "rdma"
     global_segment_size: int = 8 * _GB
     local_buffer_size: int = 1 * _GB
     offload: BackendSpec | dict[str, Any] | None = None
     enable_offload: bool = False
+    enable_lookup: bool = True
     offload_tier: str = "ssd"
     ssd_capacity_bytes: int = 0
     ssd_read_bandwidth_bytes_per_s: float = 7 * _GB
@@ -75,6 +77,8 @@ class MooncakeConfig:
                 )
         if self.cache_layout not in {"uniform", "grouped"}:
             raise ConfigurationError("cache_layout must be uniform or grouped")
+        if self.cache_layout == "grouped" and self.aggregate_tensor_parallel:
+            raise ConfigurationError("aggregate_tensor_parallel requires uniform cache")
         if self.mode not in SUPPORTED_MODES:
             raise ConfigurationError(
                 f"unsupported Mooncake mode {self.mode!r}; expected one of "
@@ -138,7 +142,13 @@ class MooncakeConfig:
             ):
                 raise ConfigurationError(f"{name} must be an integer >= {minimum}")
             setattr(self, name, int(value))
-        for name in ("enable_offload", "load_async", "transfer_overlap"):
+        for name in (
+            "enable_offload",
+            "enable_lookup",
+            "load_async",
+            "transfer_overlap",
+            "aggregate_tensor_parallel",
+        ):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"{name} must be a boolean")
         if self.transfer_overlap and not self.load_async:

@@ -34,6 +34,7 @@ class CacheConfig:
         attention_backend: str = "generic",
         runtime_memory_profile=None,
         runtime_memory_context=None,
+        kv_cache_memory_bytes: int | None = None,
     ):
         self.block_size: int = block_size
         self.device = device
@@ -255,6 +256,35 @@ class CacheConfig:
             self.num_gpu_blocks = (
                 kv_cache_capacity_tokens_per_dp_rank // self.block_size
             )
+
+        if kv_cache_memory_bytes is not None:
+            from TokenSim.config.validation import integer
+
+            integer(kv_cache_memory_bytes, "physical KV byte budget", minimum=1)
+            if (
+                runtime_memory_profile is not None
+                or kv_cache_capacity_tokens_per_dp_rank is not None
+            ):
+                raise ConfigurationError(
+                    "Choose one KV capacity source: bytes, tokens or runtime observation"
+                )
+            available = self.num_gpu_blocks * self.physical_slot_bytes
+            if kv_cache_memory_bytes > available:
+                raise ConfigurationError(
+                    "Physical KV byte budget exceeds available KV memory"
+                )
+            slots = kv_cache_memory_bytes // self.physical_slot_bytes
+            if slots < 2:
+                raise ConfigurationError(
+                    "Physical KV byte budget needs a null slot and usable slots"
+                )
+            self.num_gpu_blocks = slots
+            if self.memory_budget is not None:
+                self.memory_budget = dict(self.memory_budget)
+                self.memory_budget["explicit_kv_budget_bytes"] = kv_cache_memory_bytes
+                self.memory_budget["available_kv_bytes"] = (
+                    slots * self.physical_slot_bytes
+                )
 
     # -- parameter sharding ----------------------------------------------------
 

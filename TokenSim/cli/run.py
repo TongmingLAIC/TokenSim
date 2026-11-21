@@ -126,6 +126,8 @@ def main(args, preloaded_agentx_traces=None):
         af_dtype=getattr(args, "af_dtype", None),
     )
     progress = TqdmManager(verbose=args.verbose, program_id=args.program_id)
+    if engine.cache_controller is not None:
+        engine.cache_controller.configure_log(run.results_path)
     replay = logs = None
     requests = []
     if args.workload_type == "agentx_weka":
@@ -158,7 +160,14 @@ def main(args, preloaded_agentx_traces=None):
                 "warmup" if args.agentx_warmup else "profiling"
             )
         logs = ReplayLogs(run.results_path / "replay", engine)
-        replay = AgentXReplay(
+        replay_class = AgentXReplay
+        replay_options = {}
+        if getattr(args, "agentx_root_arrivals", None):
+            from TokenSim.workload.open_agentx import OpenRootReplay
+
+            replay_class = OpenRootReplay
+            replay_options["root_arrivals"] = args.agentx_root_arrivals
+        replay = replay_class(
             env,
             engine,
             graphs,
@@ -184,6 +193,7 @@ def main(args, preloaded_agentx_traces=None):
             ),
             event_sink=lambda record: logs.write("events", record),
             request_sink=lambda record: logs.write("requests", record),
+            **replay_options,
         )
         progress.set_total(
             sum(g.request_count for g in graphs) * args.agentx_concurrency
@@ -239,6 +249,8 @@ def main(args, preloaded_agentx_traces=None):
             env.run()
         engine.raise_if_failed()
         if run.termination_reason == "completed":
+            if engine.cache_controller is not None:
+                engine.cache_controller.close()
             connectors = [
                 w.connector for w in engine.request_workers if w.connector.async_offload
             ]
@@ -249,7 +261,11 @@ def main(args, preloaded_agentx_traces=None):
                     + replay.grace_period
                     + replay.cancellation_timeout
                 )
-            while any(c.loads or c.write_jobs or c.pending_writes for c in connectors):
+            while any(
+                c.loads or c.write_jobs or c.pending_writes for c in connectors
+            ) or (
+                engine.cache_controller is not None and engine.cache_controller.pending
+            ):
                 if env.now >= deadline:
                     raise SimulationStateError(
                         "KV transfers exceeded the cancellation drain deadline"
@@ -257,15 +273,30 @@ def main(args, preloaded_agentx_traces=None):
                 env.run(
                     until=env.any_of(
                         [c.changed for c in connectors]
+                        + (
+                            [engine.cache_controller.changed]
+                            if engine.cache_controller is not None
+                            and engine.cache_controller.pending
+                            else []
+                        )
                         + [env.timeout(deadline - env.now)]
                     )
                 )
+            for connector in connectors:
+                capture = getattr(connector, "capture_end_of_workload", None)
+                if capture is not None:
+                    capture()
+            for connector in connectors:
+                drain = getattr(connector, "post_workload_drain", None)
+                if drain is not None:
+                    env.run(until=env.process(drain()))
             for w in engine.request_workers:
                 manager = getattr(w.scheduler, "block_manager", None)
                 if manager is not None and hasattr(manager, "validate_conservation"):
                     manager.validate_conservation()
-                if w.connector.async_offload:
-                    w.connector.store.validate()
+            from TokenSim.kv_transfer.native_storage import validate_external_stores
+
+            validate_external_stores(connectors)
     except Exception as exc:
         error = exc
         run.termination_reason = "failed"
@@ -316,6 +347,12 @@ def main(args, preloaded_agentx_traces=None):
         notdone=unfinished,
         simulator_wall_time=wall_time,
     )
+    if engine.pd_handoff is not None:
+        import json
+
+        (run.results_path / "pd_transport.json").write_text(
+            json.dumps(engine.pd_handoff.report(), indent=2) + "\n"
+        )
     if successful and duration > 0:
         print_all_stats(
             engine.timing_recorder.timing,
@@ -328,4 +365,6 @@ def main(args, preloaded_agentx_traces=None):
         )
     if error:
         raise error
+    if engine.cache_controller is not None:
+        engine.cache_controller.write_summary(run.results_path)
     return engine

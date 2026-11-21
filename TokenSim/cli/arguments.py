@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from TokenSim.cli.cache_policy_arguments import add_cache_policy_arguments
+from TokenSim.cli.open_root_arguments import add_open_root_arguments
 from TokenSim.config.parallel_config import EXPERT_PARALLEL_SCOPES
 from TokenSim.config.paths import default_data_root
 from TokenSim.latency import FALLBACK_POLICIES
@@ -489,10 +491,6 @@ def build_parser():
         default=10.0,
         help="Seconds to drain cancellation and transfer ownership.",
     )
-    parser.add_argument(
-        "--sticky_sessions",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Retain bounded chat affinity with the ordinary DP placement policy.",
-    )
+    add_cache_policy_arguments(parser)
+    add_open_root_arguments(parser)
     return parser

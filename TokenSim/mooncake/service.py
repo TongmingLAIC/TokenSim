@@ -114,6 +114,7 @@ def _config_fingerprint(config: MooncakeConfig) -> str:
         "admission_policy",
         "save_policy",
         "load_async",
+        "enable_lookup",
         "transfer_overlap",
         "local_buffer_size",
     ]

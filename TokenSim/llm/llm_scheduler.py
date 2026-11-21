@@ -18,6 +18,8 @@ from TokenSim.errors import ConfigurationError
 from TokenSim.kv_transfer import NoopConnector
 from TokenSim.llm.paged_scheduling import PagedSchedulingMixin
 from TokenSim.llm.paged_tokens import PagedTokenBudgetMixin
+from TokenSim.llm.admission_observation import observe_uniform_sources
+from TokenSim.llm.async_admission import admit_async
 
 logger = logging.getLogger(__name__)
 
@@ -288,24 +290,7 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         """Allocate KV blocks for the whole context and record what is already cached."""
         local_plan = self.block_manager.kv_cache_manager.plan_reuse(req)
         if self.connector.async_offload:
-            self.block_manager.allocate(req)
-            req.gpu_cached_context_tokens = local_plan.hit_tokens
-            req.gpu_cached_prefill_tokens = min(req.prefill_len, local_plan.hit_tokens)
-            req.external_cached_prefill_tokens = 0
-            req.external_cached_context_tokens = 0
-            if external and external[1]:
-                self.connector.begin_load(req, *external)
-                req.record_context_admission(
-                    local_plan.hit_tokens, req.external_cached_context_tokens
-                )
-                self.inflight_prefills[req.id] = req
-                return
-            if req.needs_recompute:
-                req.recompute_tokens = max(0, req.context_len - local_plan.hit_tokens)
-            req.start_context_build(local_plan.hit_tokens)
-            req.record_context_admission(local_plan.hit_tokens, 0)
-            req.status = RequestStatus.RUNNING
-            return
+            return admit_async(self, req, local_plan, external)
         # Reuse the already-built prefix chain in external-cache connectors.
         req.input_cache_keys = list(local_plan.input_keys)
         num_external_tokens = self.connector.get_num_new_matched_tokens(
@@ -318,6 +303,16 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
                 req.context_len - local_plan.hit_tokens - num_external_tokens,
             )
         self.block_manager.allocate(req)
+        observed_gpu = min(local_plan.hit_tokens, max(0, req.context_len - 1))
+        observed_cpu = min(
+            num_external_tokens, max(0, req.context_len - 1 - observed_gpu)
+        )
+        req.gpu_cached_context_tokens = observed_gpu
+        req.external_cached_context_tokens = observed_cpu
+        req.gpu_cached_prefill_tokens = min(req.prefill_len, observed_gpu)
+        req.external_cached_prefill_tokens = min(
+            observed_cpu, max(0, req.prefill_len - req.gpu_cached_prefill_tokens)
+        )
         self.connector.update_state_after_alloc(
             req,
             self.block_manager.block_table.get_blocks(req.id),
@@ -335,6 +330,8 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         req.status = RequestStatus.RUNNING
         if self.block_manager.grouped_cache:
             req.record_context_admission(local_plan.hit_tokens, num_external_tokens)
+        else:
+            observe_uniform_sources(req, local_plan.hit_tokens, num_external_tokens)
 
     def _spec_decode_step_blocks(self):
         if not self.speculative_tokens:
@@ -353,6 +350,8 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         )
 
     def _can_admit_external(self, req, local_plan, external):
+        if not self.block_manager.grouped_cache:
+            return self.block_manager.can_allocate(req)
         reserved = self._inflight_prefill_reserved_blocks()
         self.stats["max_inflight_prefill_reserved_slots"] = max(
             self.stats["max_inflight_prefill_reserved_slots"], reserved
@@ -391,6 +390,8 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
     def on_tokens_computed(self, req: Request) -> None:
         if self.block_manager.grouped_cache:
             self.block_manager.cache_computed(req)
+        elif self.connector.async_offload:
+            self.connector.on_tokens_computed(req)
 
     def update(self, requests: list[Request]):
         for req in requests:
@@ -430,6 +431,8 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
 
     def free(self, req: Request):
         self.inflight_prefills.pop(req.id, None)
+        if getattr(self, "cache_controller", None) is not None:
+            self.cache_controller.completed(self, req)
         block_ids = [
             block.block_number
             for block in self.block_manager.block_table.get_blocks(req.id)
@@ -439,6 +442,9 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
             req.status = RequestStatus.WAITING_FOR_CONNECTOR_FREE
             return
         self.block_manager.free(req)
+        controller = getattr(self, "cache_controller", None)
+        if controller is not None and hasattr(controller, "after_free"):
+            controller.after_free(self, req, block_ids)
         req.status = (
             RequestStatus.FINISHED_LENGTH_CAPPED
             if req.max_model_len is not None and req.context_len >= req.max_model_len
@@ -447,6 +453,8 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
 
     def cancel_request(self, req: Request) -> bool:
         self.running = [r for r in self.running if r.id != req.id]
+        if getattr(self, "cache_controller", None) is not None:
+            self.cache_controller.cancelled(req)
         self.waiting = [r for r in self.waiting if r.id != req.id]
         self.loading.pop(req.id, None)
         self.inflight_prefills.pop(req.id, None)

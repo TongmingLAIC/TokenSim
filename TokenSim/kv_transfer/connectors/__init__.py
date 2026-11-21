@@ -16,12 +16,16 @@ from TokenSim.kv_transfer.connectors.multi import MultiConnector
 from TokenSim.kv_transfer.connectors.noop import NoopConnector
 from TokenSim.kv_transfer.connectors.p2p import P2PConnector
 from TokenSim.kv_transfer.connectors.simple_cpu import SimpleCPUOffloadConnector
+from TokenSim.kv_transfer.connectors.tiered import TieredKVConnector
+from TokenSim.kv_transfer.connectors.uniform_async import UniformAsyncStore
 
+KVConnectorFactory.register_connector("TieredKVConnector", TieredKVConnector)
 KVConnectorFactory.register_connector("NoopConnector", NoopConnector)
 KVConnectorFactory.register_connector("P2PConnector", P2PConnector)
 KVConnectorFactory.register_connector("MooncakeConnector", MooncakeConnector)
 KVConnectorFactory.register_connector("MooncakeStoreConnector", MooncakeStoreConnector)
 KVConnectorFactory.register_connector("MultiConnector", MultiConnector)
+KVConnectorFactory.register_connector("UniformAsyncStore", UniformAsyncStore)
 KVConnectorFactory.register_connector(
     "SimpleCPUOffloadConnector", SimpleCPUOffloadConnector
 )

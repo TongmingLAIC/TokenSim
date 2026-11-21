@@ -56,6 +56,8 @@ def get_connector_stats(engine: LLMEngine) -> dict[str, float | int]:
 
 
 def get_parallel_stats(engine: LLMEngine) -> dict[str, Any]:
+    from .serving_domains import parallel_domain_stats
+
     parallel_config = getattr(engine, "parallel_config", None)
     workers = getattr(engine, "workers", [])
     aggregate = None
@@ -109,6 +111,7 @@ def get_parallel_stats(engine: LLMEngine) -> dict[str, Any]:
         "parallel_dp_placement_counts": dp_counts,
         "parallel_groups": groups,
         **stats_dict,
+        **parallel_domain_stats(engine),
     }
 
 
@@ -118,7 +121,10 @@ def get_cache_capacity_stats(engine: LLMEngine) -> dict[str, Any]:
     for worker in getattr(engine, "workers", []):
         if getattr(worker, "tp_rank", 0) != 0 or getattr(worker, "pp_rank", 0) != 0:
             continue
-        replica_workers.setdefault(getattr(worker, "dp_rank", 0), worker)
+        replica_workers.setdefault(
+            (getattr(worker, "execution_domain", None), getattr(worker, "dp_rank", 0)),
+            worker,
+        )
     if not replica_workers:
         return {}
 
@@ -334,7 +340,7 @@ def analytical_share_by_table(latency_stats: dict[str, Any]) -> dict[str, float]
     return shares
 
 
-def get_moe_stats(engine: LLMEngine) -> dict[str, Any]:
+def get_moe_stats(engine: LLMEngine, *, split_domains=True) -> dict[str, Any]:
     aggregate: MoEStats | None = None
     placement = getattr(engine, "expert_placement", None)
     moe_config = getattr(engine, "moe_config", None)
@@ -350,7 +356,12 @@ def get_moe_stats(engine: LLMEngine) -> dict[str, Any]:
         aggregate.expert_placement = placement.to_dict()
     if moe_config is not None:
         aggregate.effective_moe_config = moe_config.to_dict()
-    return aggregate.as_dict()
+    result = aggregate.as_dict()
+    if split_domains:
+        from .serving_domains import moe_domain_stats
+
+        result.update(moe_domain_stats(engine, get_moe_stats))
+    return result
 
 
 def get_mooncake_stats(engine: LLMEngine) -> dict[str, Any]:

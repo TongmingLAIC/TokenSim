@@ -67,6 +67,7 @@ class Conversation:
     agent_depth: int
     turns: list[GraphTurn]
     is_auxiliary: bool = False
+    cache_one_shot: bool = False
 
     @property
     def replay_scope_id(self) -> str:

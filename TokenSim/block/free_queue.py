@@ -34,6 +34,7 @@ class FreeBlockQueue:
         self._heap: list[tuple[int, int, _Entry]] = []
         self._entries: dict[int, _Entry] = {}
         self._seq = 0
+        self._priority_queue = None
         for block in blocks or []:
             self.append(block)
 
@@ -67,7 +68,25 @@ class FreeBlockQueue:
         entry = _Entry(block)
         self._entries[block.block_number] = entry
         self._seq += 1
-        heapq.heappush(self._heap, (block.last_accessed, self._seq, entry))
+        if self._priority_queue is None:
+            heapq.heappush(self._heap, (block.last_accessed, self._seq, entry))
+        else:
+            self._priority_queue[block.block_number] = entry
+
+    def enable_priority(self, priority, clock):
+        from TokenSim.block.priority_queue import PriorityFreeMap
+
+        self._priority_queue = PriorityFreeMap(
+            priority, clock, order=lambda key, entry: entry.block.last_accessed
+        )
+        for _, _, entry in sorted(self._heap):
+            if entry.valid:
+                self._priority_queue[entry.block.block_number] = entry
+        self._heap.clear()
+
+    def refresh_priority(self, slot):
+        if self._priority_queue is not None:
+            self._priority_queue.refresh(slot)
 
     def popleft(self) -> PhysicalTokenBlock:
         while self._fifo:
@@ -78,6 +97,10 @@ class FreeBlockQueue:
             _, _, entry = heapq.heappop(self._heap)
             if entry.valid:
                 return self._finalize_pop(entry)
+        while self._priority_queue:
+            _, entry = self._priority_queue.popitem(last=False)
+            if entry.valid:
+                return self._finalize_pop(entry)
         raise IndexError("pop from an empty FreeBlockQueue")
 
     def remove(self, block: PhysicalTokenBlock) -> None:
@@ -85,6 +108,8 @@ class FreeBlockQueue:
         self._invalidate(block)
 
     def _invalidate(self, block: PhysicalTokenBlock) -> None:
+        if self._priority_queue is not None:
+            self._priority_queue.pop(block.block_number, None)
         entry = self._entries.pop(block.block_number, None)
         if entry is not None:
             entry.valid = False

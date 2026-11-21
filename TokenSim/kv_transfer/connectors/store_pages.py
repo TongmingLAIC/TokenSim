@@ -57,6 +57,10 @@ class _StoreView:
     def capacity_bytes(self):
         return self.backing.capacity_bytes
 
+    @property
+    def validation_owner(self):
+        return self.backing
+
     def validate(self):
         return self.backing.validate()
 
@@ -95,6 +99,7 @@ class _SharedService:
         self.config = config
         self.connectors = []
         self.contributors = {}
+        self.namespace_tokens = {}
         world_size = len(worker.engine.workers)
         self.staging_bytes = config.local_buffer_size * world_size
         contributions = world_size if config.mode == "embedded" else 1
@@ -129,6 +134,11 @@ class _SharedService:
         }
         self.read = QueuedKVLink(worker.env, bandwidth, **args)
         self.write = QueuedKVLink(worker.env, bandwidth, **args)
+
+    def namespace_token(self, namespace):
+        # Preserve exact scope equality while hashing the full model/layout
+        # descriptor once at bind time instead of for every page operation.
+        return self.namespace_tokens.setdefault(namespace, object())
 
     def register(self, worker, config=None):
         config = config or self.config
@@ -255,7 +265,7 @@ class PageStore(AsyncOffloadConnector):
             self.store_config.pcp_rank,
             self.store_config.dcp_rank,
         )
-        self.store = _StoreView(service.store, namespace)
+        self.store = _StoreView(service.store, service.namespace_token(namespace))
         host_link = worker.hardware_context.link(worker.device.host_link)
         host_args = {
             "utilization": self.store_config.transfer_utilization,
@@ -281,7 +291,7 @@ class PageStore(AsyncOffloadConnector):
         self.changed = self.env.event()
 
     def probe(self, req, local_plan):
-        if self.config.kv_role == "kv_producer":
+        if self.config.kv_role == "kv_producer" or not self.store_config.enable_lookup:
             return local_plan.hit_tokens, ()
         boundary, hits = super().probe(req, local_plan)
         self.mooncake_stats.get_count += 1

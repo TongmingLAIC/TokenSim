@@ -145,9 +145,28 @@ class ParallelCommunicator:
             return cached
         me = self.rank_info
         config = self.parallel_config
+        if kind == "tp" and config.tensor_parallel_size == 1:
+            return (self.worker_id,)
+        local = next(
+            (worker for worker in self.workers if worker.id == self.worker_id), None
+        )
+        domains = {
+            binding.domain for binding in getattr(local, "af_runtime_bindings", ())
+        }
         my_ep_group = config.expert_parallel_group(me.dp_rank, me.tp_rank)
         ids: list[int] = []
         for worker in self.workers:
+            if getattr(local, "execution_domain", None) != getattr(
+                worker, "execution_domain", None
+            ):
+                continue
+            remote_domains = {
+                binding.domain for binding in getattr(worker, "af_runtime_bindings", ())
+            }
+            if bool(domains) != bool(remote_domains) or (
+                domains and not domains.intersection(remote_domains)
+            ):
+                continue
             dp = getattr(worker, "dp_rank", None)
             tp = getattr(worker, "tp_rank", None)
             pp = getattr(worker, "pp_rank", None)

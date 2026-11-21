@@ -100,6 +100,9 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
                 f"request {req.id} already has KV shards in AF replica "
                 f"{self.replica_key}"
             )
+        transferred = getattr(self, "transfer_reservations", {}).pop(req.id, 0)
+        if transferred:
+            self.release_reserved_blocks(transferred)
         views = {
             rank_key: self._view(rank_key, req, create=True)
             for rank_key in self.rank_keys
@@ -127,6 +130,8 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
         self._validate_request_owner(req, set_if_missing=True)
         self._rebuild_request_mappings(req.id)
         self.validate_invariants(req)
+        if transferred:
+            self.pd_handoff.admitted(req)
 
     def can_append_slot(self, req: Request, reserved_blocks: int = 0) -> bool:
         views = self._require_views(req)
@@ -276,6 +281,17 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
         )
         total = self.num_total_gpu_blocks
         return free, total - free, total
+
+    def get_num_free_blocks(self) -> int:
+        return min(
+            manager.get_num_free_blocks() for manager in self.rank_managers.values()
+        )
+
+    def get_num_allocated_blocks(self) -> int:
+        return max(
+            manager.get_num_allocated_blocks()
+            for manager in self.rank_managers.values()
+        )
 
     def get_cpu_status(self) -> tuple[int, int, int]:
         free = min(

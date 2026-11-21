@@ -7,6 +7,7 @@ from collections import deque
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.llm.llm_request import Request, RequestStatus
+from TokenSim.llm.async_admission import resume_uniform
 
 
 @dataclass
@@ -119,6 +120,10 @@ class PagedSchedulingMixin:
             if self.max_num_seqs is not None and len(self.running) >= self.max_num_seqs:
                 self.stats["max_num_seqs_gate"] += 1
                 break
+            controller = getattr(self, "cache_controller", None)
+            reorder = getattr(controller, "reorder_waiting", None)
+            if not resuming and reorder is not None:
+                reorder(self)
             admitted = (
                 self._resume_loaded(self.loaded_waiting[0], step)
                 if resuming
@@ -148,6 +153,8 @@ class PagedSchedulingMixin:
         )
         if query_tokens == 0:
             return False
+        if not self.block_manager.grouped_cache:
+            return resume_uniform(self, req, tokens, query_tokens, step)
         manager = self.block_manager
         lookahead = self._decode_lookahead(req)
         watermark = manager.watermark_blocks if self.running else 0
@@ -161,6 +168,9 @@ class PagedSchedulingMixin:
         manager.ensure_slots(req, query_tokens, lookahead=lookahead)
         self.loaded_waiting.pop(0)
         self.loading.pop(req.id, None)
+        handoff = getattr(manager, "pd_handoff", None)
+        if handoff is not None:
+            handoff.admitted(req)
         req.status = RequestStatus.RUNNING
         self._assign_waiting(req, tokens, query_tokens, step)
         self.stats["loaded_kv_resumptions"] += 1
@@ -168,10 +178,14 @@ class PagedSchedulingMixin:
 
     def _admit_waiting(self, req, step):
         """Admit the head of the waiting queue; False stops admission this step."""
+        if getattr(
+            self, "cache_controller", None
+        ) is not None and self.cache_controller.defer_admission(self, req):
+            return False
         grouped = self.block_manager.grouped_cache
         external = local_plan = None
         if self.connector.async_offload:
-            local_plan = self.block_manager.plan_reuse(req)
+            local_plan = self.block_manager.kv_cache_manager.plan_reuse(req)
             external = self.connector.probe(req, local_plan)
         if self.defer_prefills:
             plan = self.block_manager.kv_cache_manager.plan_reuse(req)
@@ -219,6 +233,8 @@ class PagedSchedulingMixin:
         state = req.admission_state()
         self._admit(req, external=external)
         if req.status == RequestStatus.WAITING_FOR_KV:
+            if getattr(self, "cache_controller", None) is not None:
+                self.cache_controller.resumed(req)
             self.stats.setdefault("async_load_admissions", 0)
             self.stats["async_load_admissions"] += 1
             return True
@@ -253,9 +269,15 @@ class PagedSchedulingMixin:
                 self.inflight_prefills[req.id] = req
         self._assign_waiting(req, tokens, query_tokens, step)
         self.last_admitted.append(req)
+        if getattr(self, "cache_controller", None) is not None:
+            self.cache_controller.resumed(req)
         return True
 
     def _assign_waiting(self, req, tokens, query_tokens, step):
+        controller = getattr(self, "cache_controller", None)
+        admitted = getattr(controller, "admitted", None)
+        if admitted is not None:
+            admitted(self, req)
         req.scheduled_tokens = tokens
         req.scheduled_query_tokens = query_tokens
         req.scheduled_placeholder_tokens = (

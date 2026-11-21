@@ -27,8 +27,10 @@ class PhysicalTokenBlock:
         self.is_full = False
         self.cached = False
         self.last_accessed = 0
+        self.content_epoch = 0
 
     def clear_cache_metadata(self) -> None:
+        self.content_epoch += 1
         self.block_hash = None
         self.is_full = False
         self.cached = False

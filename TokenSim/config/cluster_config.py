@@ -44,12 +44,16 @@ class WorkerConfig:
     # (e.g. vllm, trtllm, analytical) whose tables price this worker's kernels.
     device_index: int | None = None
     operator_backend: str | None = None
+    parallel_config: ParallelConfig | None = None
+    execution_domain: str | None = None
+    kv_transfer: KVTransferConfig | None = None
+    simulation_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclass(config=ConfigDict(extra="forbid"))
 class WorkerGroupConfig:
     role: str | None = None
-    hardware: str = ""
+    hardware: str | list[str] = ""
     num_workers: int = 0
     network: str = "net1"
     name: str | None = None
@@ -58,6 +62,21 @@ class WorkerGroupConfig:
     device_indices: list[int] | None = None
     # Which operator-data backend (e.g. trtllm, vllm, analytical) to use.
     operator_backend: str | None = None
+    parallel_config: ParallelConfig | None = None
+    kv_transfer: KVTransferConfig | None = None
+    simulation_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("hardware", mode="before")
+    @classmethod
+    def _validate_hardware_type(cls, value: Any) -> str | list[str]:
+        identifiers = value if isinstance(value, list) else [value]
+        if not identifiers or any(
+            not isinstance(item, str) or not item.strip() for item in identifiers
+        ):
+            raise ConfigurationError(
+                "worker group hardware requires a non-empty device id or a list of device ids"
+            )
+        return value
 
     @field_validator("num_workers", mode="before")
     @classmethod
@@ -79,8 +98,12 @@ class WorkerGroupConfig:
             raise ConfigurationError(
                 f"{context} num_workers must be a positive integer"
             )
-        if not isinstance(self.hardware, str) or not self.hardware.strip():
+        if isinstance(self.hardware, str) and not self.hardware.strip():
             raise ConfigurationError(f"{context} hardware must be a non-empty string")
+        if isinstance(self.hardware, list) and len(self.hardware) != self.num_workers:
+            raise ConfigurationError(
+                f"{context} hardware list must have num_workers entries"
+            )
         if not isinstance(self.network, str) or not self.network.strip():
             raise ConfigurationError(f"{context} network must be a non-empty string")
         if (
@@ -137,7 +160,11 @@ class WorkerGroupConfig:
         return [
             WorkerConfig(
                 role=self.role,
-                hardware=self.hardware,
+                hardware=(
+                    self.hardware[worker_index]
+                    if isinstance(self.hardware, list)
+                    else self.hardware
+                ),
                 network=self.network,
                 nettype=networks[self.network],
                 name=self.name,
@@ -152,6 +179,12 @@ class WorkerGroupConfig:
                     else None
                 ),
                 operator_backend=self.operator_backend,
+                parallel_config=self.parallel_config,
+                execution_domain=(
+                    self.name if self.parallel_config is not None else None
+                ),
+                kv_transfer=self.kv_transfer,
+                simulation_overrides=self.simulation_overrides,
             )
             for worker_index in range(self.num_workers)
         ]
@@ -291,6 +324,10 @@ class ClusterConfig(ClusterTopologyMixin, ClusterDomainValidationMixin):
         effective_config = (
             parallel_config or self.parallel_config or ParallelConfig.default()
         )
+        if any(w.parallel_config is not None for w in workers):
+            from TokenSim.config.serving_domains import assign_domain_ranks
+
+            return assign_domain_ranks(self, workers, effective_config)
         if not self.af.enabled:
             validate_worker_count(len(workers), effective_config)
             for global_rank, worker in enumerate(workers):
@@ -310,10 +347,23 @@ class ClusterConfig(ClusterTopologyMixin, ClusterDomainValidationMixin):
                         mapping.physical_worker.identity,
                         (domain, mapping),
                     )
+        unbound = [
+            worker
+            for worker in workers
+            if worker.physical_worker_ref.identity not in mappings
+        ]
+        if unbound:
+            validate_worker_count(len(unbound), effective_config)
+        unbound_ranks = {
+            worker.physical_worker_ref.identity: index
+            for index, worker in enumerate(unbound)
+        }
         for worker in workers:
             resolved = mappings.get(worker.physical_worker_ref.identity)
             if resolved is None:
-                worker.rank_info = ParallelRankInfo()
+                worker.rank_info = ParallelRankInfo.from_global_rank(
+                    unbound_ranks[worker.physical_worker_ref.identity], effective_config
+                )
                 continue
             domain, mapping = resolved
             worker.rank_info = ParallelRankInfo(

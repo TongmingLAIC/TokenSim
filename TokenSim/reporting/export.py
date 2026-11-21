@@ -138,6 +138,8 @@ def export_result(
     result_dict["request_time"] = asdict(result.request_time)
     result_dict["prefill_time"] = asdict(result.prefill_time)
     result_dict["decode_time"] = asdict(result.decode_time)
+    if getattr(engine, "pd_handoff", None) is not None:
+        result_dict["pd_transport"] = engine.pd_handoff.report()
 
     if getattr(engine, "af_executor", None) is None:
         for name in (

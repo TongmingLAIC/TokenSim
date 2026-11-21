@@ -279,6 +279,7 @@ def parse_trace_graph(raw: dict) -> TraceGraph:
             "AgentX graph parser requires per-trace local hash scope"
         )
     normals, markers, original_sources = [], [], set()
+    one_shot_agents = set()
     raw_count = 0
     for outer, entry in enumerate(raw["requests"]):
         if entry["type"] in ("n", "s"):
@@ -286,6 +287,11 @@ def parse_trace_graph(raw: dict) -> TraceGraph:
             original_sources.add(SourceKey(trace_id, outer))
             raw_count += 1
         elif entry["type"] == "subagent":
+            hint = entry.get("cache_one_shot", False)
+            if not isinstance(hint, bool):
+                raise WorkloadValidationError("cache_one_shot must be boolean")
+            if hint:
+                one_shot_agents.add(entry["agent_id"])
             spawn = _number(entry["t"], "subagent timestamp", nonnegative=True)
             inner = []
             for index, row in enumerate(entry["requests"]):
@@ -364,6 +370,12 @@ def parse_trace_graph(raw: dict) -> TraceGraph:
                     auxiliary=auxiliary,
                 )
             )
+            if agent_id in one_shot_agents:
+                if len(conversations[-1].turns) != 1:
+                    raise WorkloadValidationError(
+                        "one-shot hint requires a single-turn child"
+                    )
+                conversations[-1].cache_one_shot = True
             child_ids.append(sid)
         preceding, join = group_key(outer, end, flat=False)
         branch_groups[("spawn", preceding, join)].append(

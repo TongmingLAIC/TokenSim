@@ -65,6 +65,9 @@ class OffloadTier:
     def pin(self, key: str, until: float) -> None:
         self._protected_until[key] = max(self._protected_until.get(key, 0), until)
 
+    def release_pin(self, key: str) -> None:
+        self._protected_until.pop(key, None)
+
     def write(self, key: str, blocks: int, *, now: float = 0) -> OffloadOperation:
         if self.capacity_blocks <= 0:
             raise ConfigurationError(

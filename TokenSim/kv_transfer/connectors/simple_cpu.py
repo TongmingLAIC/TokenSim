@@ -24,13 +24,14 @@ class AsyncOffloadConnector(BaseKVConnector):
         self.loads = {}
         self.pending_writes = []
         self.write_jobs = 0
+        self.profile_baseline = None
 
     def notify(self):
         if not self.changed.triggered:
             self.changed.succeed()
         self.changed = self.env.event()
         coordinator = getattr(self.worker.engine, "dp_coordinator", None)
-        if coordinator is not None:
+        if coordinator is not None and self.worker.id in coordinator.worker_ids:
             coordinator.notify()
         elif (
             self.scheduler.running
@@ -80,7 +81,7 @@ class AsyncOffloadConnector(BaseKVConnector):
     def _load(self, req, targets, boundary):
         issued = self.env.now
         bytes_ = self._transfer_bytes(page for _, _, page, _ in targets)
-        yield self.env.process(self.read_link.transfer(bytes_))
+        yield self.env.process(self.transfer_load(targets))
         # Cancellation releases request references immediately. DMA pins keep
         # targets private and resident until this point, then release them.
         if not req.cancel_requested and req.id in self.manager.tables:
@@ -92,7 +93,14 @@ class AsyncOffloadConnector(BaseKVConnector):
             # scheduler._handle_blocked_waiting_request returns to WAITING;
             # the next waiting admission must allocate its actual query slots.
             req.status = RequestStatus.WAITING
-            self.scheduler.loaded_waiting.append(req)
+            if not getattr(req, "control_prefetch", False):
+                self.scheduler.loaded_waiting.append(req)
+            else:
+                req.control_prefetch_callback(self.scheduler, req)
+        if getattr(req, "control_prefetch", False):
+            self.manager.release_request_blocks(req)
+            self.scheduler.loading.pop(req.id, None)
+            req.release_logical_blocks()
         for _, _, page, block in targets:
             self.store.release(page)
             self.manager.unpin_transfer(block)
@@ -107,8 +115,15 @@ class AsyncOffloadConnector(BaseKVConnector):
         )
         self.notify()
 
+    def transfer_load(self, targets):
+        size = self._transfer_bytes(page for _, _, page, _ in targets)
+        yield self.env.process(self.read_link.transfer(size))
+
     def _queue_write(self, group, index, block, req):
         if self.config.kv_role == "kv_consumer":
+            return
+        controller = getattr(self.scheduler, "cache_controller", None)
+        if controller is not None and controller.skip_write(self.manager, block, req):
             return
         page = self.store.reserve_write(block.block_hash, group.group_bytes)
         if page is None:
@@ -150,9 +165,17 @@ class AsyncOffloadConnector(BaseKVConnector):
         self.scheduler.loading.pop(req.id, None)
         return False, None
 
+    def capture_profile_baseline(self):
+        self.profile_baseline = dict(
+            at=self.env.now,
+            read=self.read_link.describe(),
+            write=self.write_link.describe(),
+        )
+
     def describe(self):
         return {
             "backend": self.name,
+            "profile_baseline": self.profile_baseline,
             "runtime_budget_per_rank_bytes": self.budget_bytes,
             "storage": self.store.describe(),
             "read": self.read_link.describe(),

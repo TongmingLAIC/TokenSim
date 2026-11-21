@@ -78,6 +78,11 @@ class RequestLifecycle:
             inner_index=turn.source.inner_index,
             recorded_model=turn.request.model,
         )
+        # Only explicit application metadata permits one-shot reclamation.
+        conversation = play.streams[turn.key.conversation_id].conversation
+        req.cache_one_shot = (
+            req.parent_chat_id is not None and conversation.cache_one_shot
+        )
         req.trace_hash_ids = turn.request.hash_ids
         req.trace_block_size = play.graph.block_size
         return req
@@ -105,6 +110,9 @@ class RequestLifecycle:
             lambda event, rid=req.id: self._completed(rid, event)
         )
         submit = getattr(self.engine, "add_requests_burst", self.engine.add_requests)
+        controller = getattr(self.engine, "cache_controller", None)
+        if controller is not None:
+            controller.client_resuming(req)
         submit([req])
         (self.warmup_requests if phase == "warmup" else self.requests).append(req)
         self._event(
@@ -130,6 +138,8 @@ class RequestLifecycle:
         )
         self.phase_counts[phase][outcome] += 1
         self._record_terminal(req, play, outcome)
+        if outcome != "successful":
+            play.bad_outcome = True
         if not primer:
             cursor = play.streams[cid]
             play.in_flight -= 1
@@ -154,6 +164,14 @@ class RequestLifecycle:
                 self._set_due(cursor, due)
                 if cursor.conversation is play.graph.root:
                     self._open_branches(play, old_turn)
+                    controller = getattr(self.engine, "cache_controller", None)
+                    if (
+                        controller is not None
+                        and not cursor.terminal
+                        and self.phase == "profiling"
+                        and not self._ready(play, cursor)
+                    ):
+                        controller.tool_wait(req)
             else:
                 play.set_terminal(cursor)
                 cursor.due = None
@@ -161,6 +179,22 @@ class RequestLifecycle:
                 play.idle_started_at = self.env.now
         if not self._in_flight:
             self._global_idle_started = self.env.now
+        if not primer and play.finished() and not play.terminal_recorded:
+            play.terminal_recorded = True
+            self._event(
+                "tree_terminal",
+                trace_id=play.graph.trace_id,
+                lane=play.lane,
+                pass_index=play.pass_index,
+                started_at=play.started_at,
+                from_root=play.started_from_root,
+                outcome="failed_or_cancelled" if play.bad_outcome else "successful",
+            )
+            controller = getattr(self.engine, "cache_controller", None)
+            if controller is not None:
+                controller.play_finished(
+                    (play.graph.trace_id, play.pass_index, play.lane)
+                )
         req.release_logical_blocks()
         req.hash_ids = None
         self._notify()

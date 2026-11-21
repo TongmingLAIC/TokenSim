@@ -43,12 +43,19 @@ class BlockStore(BlockTransferPlans, BaseKVConnector):
             self.model_name = cache_config.model
             self.rank_info = getattr(cache_config, "rank_info", None)
         self.options = parse_mooncake_config(config.kv_connector_extra_config)
+        if self.options.aggregate_tensor_parallel:
+            parallel = getattr(cache_config, "parallel_config", None)
+            if parallel is None or parallel.pipeline_parallel_size != 1:
+                raise ConfigurationError(
+                    "Aggregate TP store objects require explicit PP1 replica geometry"
+                )
+            self.block_bytes *= parallel.tensor_parallel_size
         self.transfer_engine = TransferEngineSimulator(self.options)
         if self.options.replica_num != 1:
             raise ConfigurationError(
                 "uniform Mooncake storage supports a single replica"
             )
-        if self.options.transfer_overlap:
+        if self.options.transfer_overlap and not self.async_offload:
             raise ConfigurationError(
                 "uniform metadata timing does not support transfer_overlap; it waits for I/O completion"
             )
@@ -83,6 +90,13 @@ class BlockStore(BlockTransferPlans, BaseKVConnector):
 
     def bind_runtime(self, worker):
         self._bind_service(len(worker.engine.workers), worker.env, worker.engine)
+        mode = "queued" if self.async_offload else "metadata"
+        existing = getattr(self.service, "uniform_io_mode", mode)
+        if existing != mode:
+            raise ConfigurationError(
+                "A shared store cannot mix queued and metadata-only uniform clients"
+            )
+        self.service.uniform_io_mode = mode
         self.host_link = worker.hardware_context.link(worker.device.host_link)
         self.network_link = worker.hardware_context.link(worker.nettype)
 
@@ -108,7 +122,7 @@ class BlockStore(BlockTransferPlans, BaseKVConnector):
         req: Request,
         num_computed_tokens: int,
     ) -> int:
-        if self.config.kv_role == "kv_producer":
+        if self.config.kv_role == "kv_producer" or not self.options.enable_lookup:
             return 0
         keys = self._keys_for_request(req)
         self._request_keys[req.id] = keys

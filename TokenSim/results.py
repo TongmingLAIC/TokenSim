@@ -84,6 +84,7 @@ class LLMResult:
     parallel_per_rank_utilization: list[dict] | None = None
     parallel_dp_placement_counts: dict[int, int] | None = None
     parallel_groups: dict[str, Any] | None = None
+    parallel_serving_domains: dict[str, Any] | None = None
     parallel_latency_total: float = 0
     parallel_tp_collective_latency: float = 0
     parallel_pp_transfer_latency: float = 0
@@ -108,6 +109,7 @@ class LLMResult:
     effective_moe_config: dict | None = None
     moe_ep_rank_count: int = 1
     moe_expert_placement: dict | None = None
+    moe_serving_domains: dict[str, Any] | None = None
     moe_per_expert_load: dict[str, int] | None = None
     moe_per_rank_expert_load: dict[str, int] | None = None
     moe_max_expert_load: int = 0

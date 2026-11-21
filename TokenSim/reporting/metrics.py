@@ -179,6 +179,20 @@ def get_agentx_metrics(
         "e2e_normalized_interactivity_tps": interactivity_summary(normalized_latency),
         "interactivity_percentile_semantics": "inverse_of_matching_latency_percentile",
     }
+    if metadata.get("load_model") == "open_root_arrivals":
+        result.update(
+            methodology="agentx-open-root-arrival-simulation",
+            concurrency=None,
+            load_model="open_root_arrivals",
+            scheduled_roots=metadata["scheduled_roots"],
+            issued_roots=metadata["issued_roots"],
+            maximum_active_plays=metadata["maximum_active_plays"],
+            completed_plays=metadata["completed_plays"],
+            censored_plays=metadata["censored_plays"],
+            failed_plays=metadata["failed_plays"],
+            terminal_plays=metadata["terminal_plays"],
+            grace_continues_existing_trees=metadata["grace_continues_existing_trees"],
+        )
     # Native replay records the input-token decomposition per request. Older
     # Mooncake paths expose their own counters; absent native observations
     # must not silently become a zero CPU hit rate.

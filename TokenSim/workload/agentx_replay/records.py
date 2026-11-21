@@ -79,6 +79,10 @@ class TreePlay:
     idle_cap_expired: bool = False
     active_streams: dict[str, StreamCursor] = field(default_factory=dict)
     unfinished_streams: int = 0
+    started_at: float = 0.0
+    started_from_root: bool = True
+    terminal_recorded: bool = False
+    bad_outcome: bool = False
 
     def __post_init__(self):
         self.active_streams = {

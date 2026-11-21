@@ -388,3 +388,18 @@ python -m unittest discover \
 
 The test suite verifies request timing, trace replacement, cancellation accounting, first-in-first-out scheduling, prefill-to-decode transfer accounting, grouped KV cache restoration, reference integrity, time limits and diagnostic exports.
 Regression coverage also checks complete anchor coordinates, ragged invocation costs, committed speculative rounds, latency/interactivity populations, external capacity validation, and queue result equivalence.
+
+## Scheduled root arrivals
+
+Use `--agentx_root_arrivals schedule.jsonl` with `--no-agentx_warmup` to start complete agent trees at explicit simulation times.
+Each JSON Lines record contains a nonnegative `time_s` and a zero-based `trace_index` in the loaded corpus.
+Provide the rows in nondecreasing time order.
+
+```jsonl
+{"time_s": 0.0, "trace_index": 0}
+{"time_s": 0.25, "trace_index": 0}
+```
+
+The profiling window accepts new roots.
+During grace, existing trees can issue ready turns without accepting new roots.
+See [programmable KV cache policies](agent-cache-policies.md) for cache behavior during tool pauses.

@@ -16,6 +16,17 @@ from TokenSim.config.validation import integer, number, boolean
 
 @dataclass(frozen=True)
 class SimulationConfig:
+    kv_cache_memory_bytes: int | None = None
+    cache_policy: str = "apc"
+    cache_queue_window_enabled: bool = True
+    cache_child_write_admission: bool = True
+    cache_child_reclamation: bool = True
+    cache_retention_priority: int = 50
+    cache_retention_seconds: float = 30.0
+    cache_quota_fraction: float = 0.5
+    cache_quota_max_wait_seconds: float = 5.0
+    cache_prefetch_lead_seconds: float = 0.1
+    cache_prefetch_budget_bytes: int = 17179869184
     block_size: int = 16
     batching: str = "dynamic"
     max_num_seqs: int = 64
@@ -50,6 +61,28 @@ class SimulationConfig:
     trace: TraceConfig = DEFAULT_TRACE_CONFIG
 
     def __post_init__(self):
+        if self.kv_cache_memory_bytes is not None:
+            integer(self.kv_cache_memory_bytes, "physical KV byte budget", minimum=1)
+        integer(self.cache_retention_priority, "cache retention priority", minimum=0)
+        number(self.cache_retention_seconds, "cache retention TTL", positive=True)
+        number(
+            self.cache_quota_fraction, "cache quota fraction", positive=True, maximum=1
+        )
+        number(self.cache_quota_max_wait_seconds, "quota maximum wait", positive=True)
+        number(self.cache_prefetch_lead_seconds, "prefetch lead seconds", positive=True)
+        integer(self.cache_prefetch_budget_bytes, "prefetch byte budget", minimum=1)
+        if self.cache_retention_priority > 100 or self.cache_policy not in (
+            "apc",
+            "noop",
+            "retain",
+            "quota",
+            "movement",
+            "retain_movement",
+            "all",
+            "forced_movement",
+            "enhanced_coop",
+        ):
+            raise ConfigurationError("Invalid cache policy or retention priority")
         object.__setattr__(
             self,
             "runtime_memory_profile",
@@ -85,6 +118,9 @@ class SimulationConfig:
             self.max_num_batched_tokens, self.mtp_num_speculative_tokens or 0
         )
         for name in (
+            "cache_queue_window_enabled",
+            "cache_child_write_admission",
+            "cache_child_reclamation",
             "debug_print",
             "sticky_sessions",
             "dp_lockstep",

@@ -253,6 +253,15 @@ class AgentXReplay(ReplayClock, RequestLifecycle):
             cache_scope(self.benchmark_id, pass_index, lane, graph.trace_id),
             clock_origin_s=self.env.now,
             idle_started_at=self.env.now,
+            started_at=self.env.now,
+            started_from_root=snapshot is None,
+        )
+        self._event(
+            "tree_started",
+            trace_id=graph.trace_id,
+            lane=lane,
+            pass_index=pass_index,
+            from_root=play.started_from_root,
         )
         self.play_count += 1
         self._register_play_timers(play)

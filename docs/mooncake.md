@@ -151,6 +151,11 @@ An object evicted from memory stays readable from SSD, with any missing SSD copy
 With the SSD tier disabled, eviction removes the object from the store.
 With `eviction_policy: "none"`, a write that does not fit in memory is rejected, or goes directly to SSD when the tier is enabled.
 `enable_offload: false` disables the SSD tier and keeps CPU memory storage and prefix reuse enabled.
+`enable_lookup: false` skips store lookup for that client while retaining its embedded DRAM contribution.
+Compatible grouped clients intern their complete model/layout/shard namespace at bind time, preserving scope equality with a shared token for page operations.
+The drain validates each shared backing store once and retains independent checks for rank-local stores.
+These host maintenance steps preserve simulated timing and cache identity.
+A `kv_consumer` with lookup disabled contributes capacity without loading or publishing KV pages.
 
 For uniform storage, enable the SSD tier with the following configuration.
 
@@ -225,6 +230,7 @@ The following table describes the fields of `kv_connector_extra_config`.
 | `preferred_segment` | unset | Segment label stored with admitted objects (uniform only) |
 | `group_id`, `pcp_rank`, `dcp_rank` | 0 | Additional pool-key namespaces |
 | `offload` | unset | Optional backend reference, instance name and plugin-owned configuration |
+| `enable_lookup` | `true` | Enable prefix lookup for this client; independent of its DRAM contribution |
 | `enable_offload`, `offload_tier` | `false`, `ssd` | Legacy SSD offload switch and tier |
 | `ssd_capacity_blocks`, `ssd_capacity_bytes` | unset, 0 | SSD capacity; blocks take precedence |
 | `ssd_read_bandwidth_bytes_per_s`, `ssd_write_bandwidth_bytes_per_s` | 7 GiB/s, 3 GiB/s | SSD bandwidth |

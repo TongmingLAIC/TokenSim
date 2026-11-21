@@ -133,24 +133,26 @@ class LLMEngine(AFEngineMixin, Worker):
                 f"unsupported router policy: {config.router_policy}"
             )
         self.dp_coordinator = None
-        if config.dp_lockstep and self.parallel_config.data_parallel_size > 1:
-            if self.parallel_config.pipeline_parallel_size != 1:
-                raise ConfigurationError(
-                    "DP lockstep pipeline stages are not yet supported"
-                )
-            from TokenSim.llm.dp_coordinator import DPStepCoordinator
+        if config.dp_lockstep:
+            from .serving_domains import build_dp_coordinator
 
-            self.dp_coordinator = DPStepCoordinator(
-                env,
-                self,
-                self.prefill_workers.workers,
-                sync_interval=config.dp_sync_interval,
-            )
+            self.dp_coordinator = build_dp_coordinator(self)
         self.trace_session = None
+        from TokenSim.kv_transfer.pd_handoff import build_pd_handoff
+
+        self.pd_handoff = build_pd_handoff(self, kv_transfer_config)
         if config.trace.enabled:
             from TokenSim.trace.session import TraceSession
 
             self.trace_session = TraceSession(self)
+        self.cache_controller = None
+        if config.cache_policy != "apc":
+            from TokenSim.kv_transfer.cache_control import NativeCacheController
+
+            self.cache_controller = NativeCacheController(self)
+        from TokenSim.kv_transfer.uniform_control import attach_uniform_controller
+
+        attach_uniform_controller(self)
         self.action = self.env.process(self.run())
 
     def record_worker_failure(self, worker_id: int, error: Exception) -> None:
@@ -204,6 +206,9 @@ class LLMEngine(AFEngineMixin, Worker):
                     effective_moe_config=previous.effective_moe_config,
                 )
             for connector in flatten_connectors(worker.connector):
+                capture = getattr(connector, "capture_profile_baseline", None)
+                if capture is not None:
+                    capture()
                 old_stats = getattr(connector, "stats", None)
                 if old_stats is not None:
                     connector.stats = ConnectorStats(
@@ -303,7 +308,7 @@ class LLMEngine(AFEngineMixin, Worker):
             return any(
                 binding.is_scheduler_leader for binding in worker.af_runtime_bindings
             )
-        if self.parallel_config.world_size == 1:
+        if worker.parallel_config.world_size == 1:
             return True
         return worker.tp_rank == 0 and worker.pp_rank == 0
 
@@ -351,6 +356,8 @@ class LLMEngine(AFEngineMixin, Worker):
             events.append(event)
             if req.is_done or already_requested:
                 continue
+            if self.pd_handoff is not None and self.pd_handoff.cancel(req):
+                continue
             if not req.cancel_pending_worker_ids:
                 req.acknowledge_cancel(self.env)
             for worker_id in sorted(req.cancel_pending_worker_ids):
@@ -367,6 +374,9 @@ class LLMEngine(AFEngineMixin, Worker):
         requests: list[Request],
     ) -> None:
         if not requests:
+            return
+        if self.pd_handoff is not None:
+            self.pd_handoff.dispatch(sender, requests)
             return
         num_requests = len(requests)
         num_per_worker = math.ceil(num_requests / len(self.decode_workers))
@@ -412,6 +422,7 @@ class LLMEngine(AFEngineMixin, Worker):
             sender.connector.wait_for_save()
             for req in batch:
                 if manager is not None:
+                    manager.commit_finished_cache(req)
                     manager.release_request_blocks(req)
                 sender.connector.on_request_released(req)
                 req.status = RequestStatus.WAITING_FOR_KV

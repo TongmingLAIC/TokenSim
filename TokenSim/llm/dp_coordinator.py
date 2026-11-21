@@ -42,9 +42,9 @@ class DPStepStats:
 
 class DPStepCoordinator:
     def __init__(self, env, engine, workers, *, sync_interval=16):
-        if sync_interval < 1 or any(w.role != "hybrid" for w in workers):
+        if sync_interval < 1 or len({w.role for w in workers}) != 1:
             raise ConfigurationError(
-                "DP lockstep needs hybrid leaders and a positive finished-state interval"
+                "DP lockstep needs one execution role and a positive finished-state interval"
             )
         self.env, self.engine, self.workers = env, engine, workers
         self.sync_interval = sync_interval
@@ -235,6 +235,11 @@ class DPStepCoordinator:
                         save_latency = worker.complete_step(batch, duration)
                         save_latencies.append(save_latency)
                         worker.finalize_connector_step()
+                        from TokenSim.llm.engine.serving_domains import (
+                            dispatch_finished_prefills,
+                        )
+
+                        dispatch_finished_prefills(worker)
                     for request in self.pending_cancels.pop(worker.id, {}).values():
                         self.cancel_at_boundary(worker, request)
                     worker.status = (
