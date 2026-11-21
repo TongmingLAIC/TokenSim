@@ -8,12 +8,12 @@ it does not run the Mooncake C++ service or a model server.
 from dataclasses import dataclass
 
 from TokenSim.errors import ConfigurationError
-from TokenSim.kv_transfer.native_storage import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
 from TokenSim.mooncake.config import parse_mooncake_config
 from TokenSim.mooncake.metrics import MooncakeStats
-from TokenSim.mooncake.service import shared_store
+from TokenSim.mooncake.service import CapacityLedger, shared_store
 
-from .simple_cpu import AsyncOffloadConnector
+from .grouped_offload import AsyncOffloadConnector
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,9 @@ class _StoreView:
 
     def finish_write(self, view):
         self.backing.finish_write(view.page)
+
+    def abort_write(self, view):
+        self.backing.abort_write(view.page)
 
     def acquire(self, view):
         self.backing.acquire(view.page)
@@ -98,23 +101,14 @@ class _SharedService:
     def __init__(self, worker, config):
         self.config = config
         self.connectors = []
-        self.contributors = {}
         self.namespace_tokens = {}
-        world_size = len(worker.engine.workers)
-        self.staging_bytes = config.local_buffer_size * world_size
-        contributions = world_size if config.mode == "embedded" else 1
-        self.capacity_bytes = config.global_segment_size * contributions
-        self.budget_bytes = self.capacity_bytes + self.staging_bytes
-        if (
-            config.host_available_bytes is not None
-            and self.budget_bytes > config.host_available_bytes
-        ):
-            raise ConfigurationError(
-                "Mooncake shared budget exceeds available host DRAM"
-            )
-        if self.capacity_bytes <= 0:
+        self.capacity = CapacityLedger(config)
+        self.capacity.register(worker, config)
+        if self.capacity.capacity_bytes <= 0:
             raise ConfigurationError("Mooncake store capacity must be positive")
-        self.store = NativePageStore(self.capacity_bytes, scope="mooncake:shared-dram")
+        self.store = NativePageStore(
+            self.capacity.capacity_bytes, scope="mooncake:shared-dram"
+        )
         if config.mode == "embedded":
             return
         # Cap the aggregate by the configured node network injection
@@ -141,33 +135,20 @@ class _SharedService:
         return self.namespace_tokens.setdefault(namespace, object())
 
     def register(self, worker, config=None):
-        config = config or self.config
-        proposed = {
-            **self.contributors,
-            id(worker.engine): (worker.engine, len(worker.engine.workers), config),
-        }
-        capacity = (
-            sum(
-                count * options.global_segment_size
-                for _, count, options in proposed.values()
-            )
-            if self.config.mode == "embedded"
-            else self.config.global_segment_size
-        )
-        staging = sum(
-            count * options.local_buffer_size for _, count, options in proposed.values()
-        )
-        if (
-            self.config.host_available_bytes is not None
-            and capacity + staging > self.config.host_available_bytes
-        ):
-            raise ConfigurationError(
-                "shared Mooncake pool and staging exceed available host DRAM"
-            )
-        self.contributors = proposed
-        self.capacity_bytes, self.staging_bytes = capacity, staging
-        self.budget_bytes = capacity + staging
-        self.store.capacity_bytes = capacity
+        self.capacity.register(worker, config or self.config)
+        self.store.capacity_bytes = self.capacity.capacity_bytes
+
+    @property
+    def capacity_bytes(self):
+        return self.capacity.capacity_bytes
+
+    @property
+    def staging_bytes(self):
+        return self.capacity.staging_bytes
+
+    @property
+    def budget_bytes(self):
+        return self.capacity_bytes + self.staging_bytes
 
 
 class PageStore(AsyncOffloadConnector):
@@ -286,9 +267,12 @@ class PageStore(AsyncOffloadConnector):
             self.write_link = _TransferPath(
                 self.env, self.host_write, service.write, read=False
             )
-        self.budget_bytes = service.budget_bytes
         self.manager.publish_callbacks.append(self._queue_write)
         self.changed = self.env.event()
+
+    @property
+    def budget_bytes(self):
+        return self.service.budget_bytes
 
     def probe(self, req, local_plan):
         if self.config.kv_role == "kv_producer" or not self.store_config.enable_lookup:

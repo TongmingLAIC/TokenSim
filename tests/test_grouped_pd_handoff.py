@@ -178,6 +178,30 @@ class GroupedPDHandoffTest(unittest.TestCase):
         self.assertEqual(req.prefill_chunks, chunks)
         destination.validate_conservation()
 
+    def test_failed_dma_releases_private_destinations_before_reporting_failure(self):
+        env, engine, handoff, req, failures = setup()
+        source, target = engine.workers
+
+        def failed(*args):
+            yield env.timeout(0.01)
+            raise ValueError("injected DMA failure")
+
+        handoff.fabric.transfer = failed
+        handoff.dispatch(source, [req])
+        source.scheduler.running.clear()
+        env.run()
+        self.assertEqual([str(error) for error in failures], ["injected DMA failure"])
+        self.assertEqual(handoff.jobs, {})
+        self.assertEqual(handoff.events[-1]["kind"], "transfer_failed")
+        self.assertFalse(req.owner_worker_ids)
+        self.assertFalse(target.scheduler.loaded_waiting)
+        self.assertFalse(target.scheduler.block_manager.cache)
+        for worker in engine.workers:
+            manager = worker.scheduler.block_manager
+            self.assertFalse(manager.transfer_references)
+            self.assertEqual(manager.get_num_allocated_blocks(), 1)
+            manager.validate_conservation()
+
     def test_cancellation_waits_for_dma_and_publishes_no_target_prefix(self):
         env, engine, handoff, req, failures = setup()
         source, target = engine.workers

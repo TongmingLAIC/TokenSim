@@ -153,7 +153,7 @@ class UniformPrefetch:
             req.control_prefetch_callback = self.completed
             state["request"] = req
             manager = connector.manager
-            plan = manager.kv_cache_manager.plan_reuse(req)
+            plan = manager.plan_reuse(req)
             boundary, keys = connector.probe(req, plan)
             while (
                 not keys
@@ -165,7 +165,7 @@ class UniformPrefetch:
                 )
             ):
                 yield connector.changed
-                plan = manager.kv_cache_manager.plan_reuse(req)
+                plan = manager.plan_reuse(req)
                 boundary, keys = connector.probe(req, plan)
             if not keys:
                 req.release_logical_blocks()
@@ -251,10 +251,13 @@ class UniformPrefetch:
         ):
             self.release(owner)
 
-    def blocks(self, req):
+    def blocks(self, scheduler, req):
         state = self.jobs.get(self.controller.owner(req))
         return bool(
-            state and state["phase"] == "loading" and state["snapshot"].compatible(req)
+            state
+            and state["phase"] == "loading"
+            and state["snapshot"].connector.scheduler is scheduler
+            and state["snapshot"].compatible(req)
         )
 
     def release(self, owner):

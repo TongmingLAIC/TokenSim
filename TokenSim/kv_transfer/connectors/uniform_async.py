@@ -3,20 +3,18 @@
 from dataclasses import replace, asdict
 
 from TokenSim.errors import ConfigurationError
-from TokenSim.kv_transfer.online_storage_config import OnlineStoragePolicy
-from TokenSim.kv_transfer.uniform_store_state import UniformStoreState, UniformStoreView
-from TokenSim.kv_transfer.connectors.block_store.core import BlockStore
-from TokenSim.kv_transfer.connectors.metadata import (
-    KVConnectorMetadata,
-    KVConnectorWorkerMetadata,
+from TokenSim.kv_transfer.storage.online_config import OnlineStoragePolicy
+from TokenSim.kv_transfer.storage.uniform_state import (
+    UniformStoreState,
+    UniformStoreView,
 )
-from TokenSim.mooncake import MooncakeStats
+from .block_store.client import UniformStoreClient
 from TokenSim.kv_transfer.io_observation import IOObservation
 from .uniform_async_load import UniformLoadMixin
 from .uniform_async_save import UniformSaveMixin
 
 
-class UniformAsyncStore(UniformLoadMixin, UniformSaveMixin, BlockStore):
+class UniformAsyncStore(UniformLoadMixin, UniformSaveMixin, UniformStoreClient):
     name = "UniformAsyncStore"
     async_offload = True
     supports_grouped_cache = False
@@ -51,8 +49,8 @@ class UniformAsyncStore(UniformLoadMixin, UniformSaveMixin, BlockStore):
         self.loads = {}
         self.write_jobs = 0
         self.pending_writes = []
+        self._saved_request_ids = set()
         self.policy_stats = dict(reuse_rejected_bytes=0)
-        self._probe_stats = MooncakeStats()
 
     def bind_runtime(self, worker):
         super().bind_runtime(worker)
@@ -130,17 +128,13 @@ class UniformAsyncStore(UniformLoadMixin, UniformSaveMixin, BlockStore):
                 self.worker.status = WorkerStatus.RUNNING
                 self.worker.send_task(self.worker, Task.STEP)
 
+    def on_request_released(self, req):
+        super().on_request_released(req)
+        self._saved_request_ids.discard(req.id)
+
     def request_finished(self, req, block_ids):
+        self.on_request_released(req)
         return False, None
-
-    def build_connector_meta(self, output):
-        return KVConnectorMetadata(connector_name=self.name)
-
-    def start_load_kv(self):
-        return 0.0
-
-    def build_connector_worker_meta(self):
-        return KVConnectorWorkerMetadata()
 
     def describe(self):
         return dict(

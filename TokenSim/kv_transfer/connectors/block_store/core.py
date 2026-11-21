@@ -6,21 +6,17 @@ from typing import Any
 from TokenSim.config.config import CacheConfig, KVTransferConfig
 from TokenSim.llm.llm_request import Request
 from TokenSim.mooncake import PoolKey
-from TokenSim.mooncake.service import get_mooncake_service
-from TokenSim.mooncake.config import parse_mooncake_config
-from TokenSim.mooncake.metrics import MooncakeStats
 from TokenSim.mooncake.transfer_engine import TransferEngineSimulator
-from TokenSim.errors import ConfigurationError
-from ..base import BaseKVConnector
 from ..metadata import (
     ConnectorTransferPlan,
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from .client import UniformStoreClient
 from .plans import BlockTransferPlans
 
 
-class BlockStore(BlockTransferPlans, BaseKVConnector):
+class BlockStore(BlockTransferPlans, UniformStoreClient):
     """Uniform Mooncake block-store runtime and connector lifecycle."""
 
     name = "MooncakeStoreConnector"
@@ -31,72 +27,18 @@ class BlockStore(BlockTransferPlans, BaseKVConnector):
         cache_config: CacheConfig | None = None,
     ) -> None:
         super().__init__(config, cache_config)
-        self.block_bytes = 1
-        self.block_size = 1
-        self.model_name = "unknown"
-        self.rank_info = None
-        if cache_config is not None:
-            self.block_size = int(cache_config.block_size)
-            self.block_bytes = int(
-                cache_config.block_size * cache_config.size_per_token
-            )
-            self.model_name = cache_config.model
-            self.rank_info = getattr(cache_config, "rank_info", None)
-        self.options = parse_mooncake_config(config.kv_connector_extra_config)
-        if self.options.aggregate_tensor_parallel:
-            parallel = getattr(cache_config, "parallel_config", None)
-            if parallel is None or parallel.pipeline_parallel_size != 1:
-                raise ConfigurationError(
-                    "Aggregate TP store objects require explicit PP1 replica geometry"
-                )
-            self.block_bytes *= parallel.tensor_parallel_size
         self.transfer_engine = TransferEngineSimulator(self.options)
-        if self.options.replica_num != 1:
-            raise ConfigurationError(
-                "uniform Mooncake storage supports a single replica"
-            )
-        if self.options.transfer_overlap and not self.async_offload:
-            raise ConfigurationError(
-                "uniform metadata timing does not support transfer_overlap; it waits for I/O completion"
-            )
         self.host_link = self.network_link = None
-        parallel = getattr(cache_config, "parallel_config", None)
-        world_size = parallel.world_size if parallel is not None else 1
-        self._bind_service(world_size)
-        # "mooncake" mirrors the reference vLLM MooncakeStoreConnector
-        # (ref/vllm .../kv_connector/v1/mooncake/store/); "every_step" keeps
-        # the historical TokenSim behavior.
-        self._aligned = self.options.save_policy == "mooncake"
         self._pending_loads: dict[int, dict[str, Any]] = {}
         self._request_keys: dict[int, list[PoolKey]] = {}
-        # Per-request key chain and its string form, both computed exactly once.
-        self._keys_cache: dict[int, tuple[list[PoolKey], list[str]]] = {}
         self._saved_request_ids: set[int] = set()
         self._pending_async_loads: set[int] = set()
         self._pending_async_puts: set[int] = set()
         self._delayed_releases: dict[int, tuple[Request, list[int]]] = {}
         self._block_releaser: Any | None = None
 
-    def _bind_service(self, world_size, owner=None, contributor=None):
-        self.service = get_mooncake_service(
-            self.config,
-            block_bytes=self.block_bytes,
-            owner=owner,
-            contributor=contributor,
-            ranks=world_size,
-        )
-        self.mooncake_stats = MooncakeStats()
-        self.service.store.register_storage_stats(self.mooncake_stats)
-
     def bind_runtime(self, worker):
-        self._bind_service(len(worker.engine.workers), worker.env, worker.engine)
-        mode = "queued" if self.async_offload else "metadata"
-        existing = getattr(self.service, "uniform_io_mode", mode)
-        if existing != mode:
-            raise ConfigurationError(
-                "A shared store cannot mix queued and metadata-only uniform clients"
-            )
-        self.service.uniform_io_mode = mode
+        super().bind_runtime(worker)
         self.host_link = worker.hardware_context.link(worker.device.host_link)
         self.network_link = worker.hardware_context.link(worker.nettype)
 

@@ -15,7 +15,7 @@ from tests.support.hardware import make_hardware
 from tests.test_kv_transfer_integration import _MODEL, _DEVICE, _DeterministicBackend
 
 
-def setup(policy=None, annotated=False):
+def setup(policy=None, annotated=False, **options):
     env = simpy.Environment()
     cluster = ClusterConfig(
         num_workers=2,
@@ -26,17 +26,20 @@ def setup(policy=None, annotated=False):
     )
     transfer = KVTransferConfig(
         kv_connector="UniformAsyncStore",
-        kv_connector_extra_config=dict(
-            mode="standalone-store",
-            memory_capacity_blocks=0,
-            enable_offload=True,
-            ssd_capacity_blocks=64,
-            ssd_read_bandwidth_bytes_per_s=64,
-            ssd_write_bandwidth_bytes_per_s=64,
-            ssd_read_latency_us=0,
-            ssd_write_latency_us=0,
-            online_policy=policy or {},
-        ),
+        kv_connector_extra_config={
+            **dict(
+                mode="standalone-store",
+                memory_capacity_blocks=0,
+                enable_offload=True,
+                ssd_capacity_blocks=64,
+                ssd_read_bandwidth_bytes_per_s=64,
+                ssd_write_bandwidth_bytes_per_s=64,
+                ssd_read_latency_us=0,
+                ssd_write_latency_us=0,
+                online_policy=policy or {},
+            ),
+            **options,
+        },
     )
     with patch(
         "TokenSim.llm.engine.worker.build_latency_backend",
@@ -79,6 +82,28 @@ def prepare(budget=128):
 
 
 class UniformAsyncStoreTest(unittest.TestCase):
+    def test_dram_restore_records_its_source_and_respects_lookup_option(self):
+        for enabled in (True, False):
+            with self.subTest(enable_lookup=enabled):
+                env, engine, _ = setup(
+                    mode="embedded",
+                    memory_capacity_blocks=64,
+                    enable_offload=False,
+                    enable_lookup=enabled,
+                )
+                env.run()
+                req = Request(1, 32, 2, 16, hash_ids=[1, 2])
+                req.arrive(env)
+                engine.add_requests([req])
+                env.run()
+                engine.raise_if_failed()
+                expected = 16 if enabled else 0
+                stats = engine.workers[1].connector.mooncake_stats
+                self.assertTrue(req.is_done)
+                self.assertEqual(req.first_prefill_source.cpu_hit_tokens, expected)
+                self.assertEqual(stats.mooncake_memory_hit_tokens, expected)
+                self.assertEqual(stats.mooncake_disk_hit_tokens, 0)
+
     def test_publication_occurs_after_io_and_other_replica_restores_prefix(self):
         env, engine, first = setup()
         env.run(until=0.01)
@@ -133,6 +158,20 @@ class UniformAsyncStoreTest(unittest.TestCase):
 
 
 class UniformPrefetchTest(unittest.TestCase):
+    def test_active_copy_does_not_block_another_replica(self):
+        env, engine, controller, _ = prepare()
+        env.run(until=env.now + 0.1)
+        self.assertTrue(engine.workers[0].connector.loads)
+        req = Request(2, 32, 2, 16, hash_ids=[1, 2], chat_id="parent")
+        req.arrive(env)
+        controller.client_resuming(req)
+        target = engine.workers[1]
+        engine.send_task(target, Task.ADD, [req])
+        env.run(until=env.now + 0.01)
+        engine.raise_if_failed()
+        self.assertIn(req.id, target.connector.loads)
+        self.assertFalse(target.scheduler.waiting)
+
     def test_observed_tool_wait_can_admit_a_known_parent_prefix(self):
         env, engine, parent = setup(dict(reuse_threshold=2), annotated=True)
         env.run()

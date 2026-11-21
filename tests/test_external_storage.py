@@ -12,7 +12,7 @@ from TokenSim.config.kv_transfer_config import KVTransferConfig
 from TokenSim.kv_transfer.connectors.factory import KVConnectorFactory
 from TokenSim.llm.llm_request import Request
 from TokenSim.kv_transfer.connectors.store_pages import _SharedService
-from TokenSim.kv_transfer.native_storage import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
 from tests.support.hardware import make_hardware
 
 
@@ -238,35 +238,29 @@ class ExternalStorageTest(unittest.TestCase):
             hardware_context=make_hardware(),
             nettype="ethernet-test",
         )
-        for mode, capacity in (("embedded", 2000), ("standalone-store", 1000)):
+        for mode, capacity in (("embedded", 1500), ("standalone-store", 1000)):
             config = MooncakeConfig(
                 mode=mode,
                 global_segment_size=1000,
                 local_buffer_size=20,
-                host_available_bytes=capacity + 40,
+                host_available_bytes=capacity + 30,
             )
             service = _SharedService(worker, config)
-            self.assertEqual(service.store.capacity_bytes, capacity)
-            self.assertEqual(service.staging_bytes, 40)
-            other = SimpleNamespace(
-                **{**vars(worker), "engine": SimpleNamespace(workers=[None])}
-            )
+            self.assertEqual(service.store.capacity_bytes, 1000)
+            self.assertEqual(service.staging_bytes, 20)
+            other = SimpleNamespace(**vars(worker))
             variant = MooncakeConfig(
                 mode=mode,
                 global_segment_size=500 if mode == "embedded" else 1000,
                 local_buffer_size=10,
                 host_available_bytes=10000,
             )
-            config.host_available_bytes = 10000
             service.register(worker, config)
             service.register(other, variant)
             service.register(other, variant)
-            self.assertEqual(
-                service.capacity_bytes, capacity + (500 if mode == "embedded" else 0)
-            )
-            self.assertEqual(service.staging_bytes, 50)
-            config.host_available_bytes = capacity + 40
-            config.host_available_bytes -= 1
+            self.assertEqual(service.capacity_bytes, capacity)
+            self.assertEqual(service.staging_bytes, 30)
+            config.host_available_bytes = 1019
             with self.assertRaisesRegex(ConfigurationError, "available host"):
                 _SharedService(worker, config)
 

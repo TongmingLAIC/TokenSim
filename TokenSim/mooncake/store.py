@@ -64,8 +64,7 @@ class MooncakeStore:
         self.register_storage_stats(self.stats)
         self._access_counter = 0
 
-    def lookup(self, keys: list[PoolKey], *, now: float = 0.0, stats=None) -> StoreHit:
-        stats = self.stats if stats is None else stats
+    def probe(self, keys: list[PoolKey], *, now: float = 0.0) -> StoreHit:
         if not keys:
             return StoreHit(keys=[], hit_blocks=0, tier=None)
         hit_keys: list[PoolKey] = []
@@ -85,16 +84,28 @@ class MooncakeStore:
                 slowest_tier = obj.tier
             elif slowest_tier is None:
                 slowest_tier = "memory"
-        if hit_keys:
+        return StoreHit(keys=hit_keys, hit_blocks=len(hit_keys), tier=slowest_tier)
+
+    def lookup(self, keys: list[PoolKey], *, now: float = 0.0, stats=None) -> StoreHit:
+        hit = self.probe(keys, now=now)
+        if keys:
+            self.record_lookup(hit.tier, stats=stats)
+        return hit
+
+    def record_lookup(self, tier: str | None, *, stats=None) -> None:
+        stats = self.stats if stats is None else stats
+        if tier is not None:
             stats.store_hit_count += 1
-            if self._is_offload_tier(slowest_tier):
+            if self._is_offload_tier(tier):
                 stats.disk_tier_hit_count += 1
                 self._backend_stats(stats).hit_count += 1
             else:
                 stats.memory_tier_hit_count += 1
         else:
             stats.store_miss_count += 1
-        return StoreHit(keys=hit_keys, hit_blocks=len(hit_keys), tier=slowest_tier)
+
+    def object_tier(self, key: PoolKey) -> str:
+        return self.objects[key.to_string()].tier
 
     def missing_indices(self, keys: list[PoolKey]) -> list[int]:
         """Indices of keys absent from the store.

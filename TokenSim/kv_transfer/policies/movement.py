@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import simpy
 
 from TokenSim.errors import OutOfBlocksError
+from TokenSim.config.cache_policy import PRESETS
 from TokenSim.llm.llm_request import Request
 
 
@@ -55,6 +56,7 @@ class PrefixSnapshot:
 class MovementRuntime:
     def __init__(self, controller):
         self.controller, self.env = controller, controller.env
+        self.preset = PRESETS[getattr(controller, "mode", "movement")]
         self.snapshots = {}
         self.snapshot_revision = 0
         self.parent_content_cache = {}
@@ -95,10 +97,9 @@ class MovementRuntime:
             return
         self.waiting[owner] = self.env.now
         estimate = self.estimates.get(owner)
-        mode = getattr(self.controller, "mode", "movement")
-        if mode == "forced_movement":
-            estimate = 30.0
-        elif mode == "enhanced_coop" and getattr(
+        if self.preset.forced_wait is not None:
+            estimate = self.preset.forced_wait
+        elif self.preset.cooperative and getattr(
             self.controller, "queue_window_enabled", True
         ):
             queue = self.controller.queue_estimate(snapshot.connector.scheduler)
@@ -121,15 +122,11 @@ class MovementRuntime:
         snapshot = state["snapshot"]
         try:
             yield self.env.timeout(0)
-            if estimate is None or estimate < 0.5:
+            if estimate is None or estimate < self.preset.minimum_wait:
                 state["phase"] = "idle"
                 return
-            mode = getattr(self.controller, "mode", "movement")
-            if mode in ("all", "enhanced_coop"):
-                manager = snapshot.manager
-                # Cached-but-evictable pages occupy physical HBM too.
-                occupied = manager.num_total_gpu_blocks - len(manager._free_uncached)
-                if occupied / manager.num_total_gpu_blocks < 0.8:
+            if self.preset.minimum_occupancy:
+                if snapshot.manager.occupied_fraction() < self.preset.minimum_occupancy:
                     self.stats["occupancy_skipped"] = (
                         self.stats.get("occupancy_skipped", 0) + 1
                     )
@@ -163,13 +160,7 @@ class MovementRuntime:
             if connector.store.lookup(tag) is None or block.ref_count:
                 busy += 1
                 continue
-            slot = block.block_number
-            if slot not in manager._free_cached:
-                continue
-            del manager._free_cached[slot]
-            manager._evict(block)
-            manager._free_uncached.append(block)
-            moved += 1
+            moved += manager.reclaim_cached_slot(block.block_number, tag)
         self.stats["move_pages"] += moved
         self.stats["move_busy_pages"] += busy
         self.controller.record(
@@ -248,7 +239,7 @@ class MovementRuntime:
         enhanced = getattr(
             self.controller,
             "queue_window_enabled",
-            getattr(self.controller, "mode", "movement") == "enhanced_coop",
+            self.preset.cooperative,
         )
         started = self.waiting.get(owner)
         if started is not None:

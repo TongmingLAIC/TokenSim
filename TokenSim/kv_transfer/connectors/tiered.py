@@ -3,11 +3,11 @@
 import simpy
 
 from TokenSim.errors import ConfigurationError
-from TokenSim.kv_transfer.native_storage import QueuedKVLink
-from TokenSim.kv_transfer.tiered_config import TieredConfig
-from TokenSim.kv_transfer.tiered_service import TierPage, shared_service
-from TokenSim.kv_transfer.tiered_store import TieredStore
-from .simple_cpu import AsyncOffloadConnector
+from TokenSim.kv_transfer.storage.native import QueuedKVLink
+from TokenSim.kv_transfer.storage.tiered_config import TieredConfig
+from TokenSim.kv_transfer.storage.tiered_service import TierPage, shared_service
+from TokenSim.kv_transfer.storage.tiered_store import TieredStore
+from .grouped_offload import AsyncOffloadConnector
 
 
 class TieredKVConnector(AsyncOffloadConnector):
@@ -103,29 +103,40 @@ class TieredKVConnector(AsyncOffloadConnector):
                 self.store.pressure_flush()
             return
         issued = self.env.now
-        for chunk in self.chunks(batch):
-            with self.staging_lock.request() as lock:
-                yield lock
-                yield self.env.process(
-                    self.write_link.transfer(self._transfer_bytes(p for p, _ in chunk))
-                )
-                for _, block in chunk:
-                    self.manager.unpin_transfer(block)
-                self.notify()
-                yield self.env.process(
-                    self.service.transfer("write", sum(p.bytes for p, _ in chunk))
-                )
-                for page, _ in chunk:
-                    self.store.finish_write(page)
-        self.write_jobs -= 1
-        self._record_transfer(
-            kind="save",
-            blocks=len(batch),
-            bytes_=self._transfer_bytes(p for p, _ in batch),
-            latency=self.env.now - issued,
-            blocking_latency=0,
-        )
-        self.notify()
+        unpinned = published = 0
+        try:
+            for chunk in self.chunks(batch):
+                with self.staging_lock.request() as lock:
+                    yield lock
+                    yield self.env.process(
+                        self.write_link.transfer(
+                            self._transfer_bytes(p for p, _ in chunk)
+                        )
+                    )
+                    for _, block in chunk:
+                        self.manager.unpin_transfer(block)
+                        unpinned += 1
+                    self.notify()
+                    yield self.env.process(
+                        self.service.transfer("write", sum(p.bytes for p, _ in chunk))
+                    )
+                    for page, _ in chunk:
+                        self.store.finish_write(page)
+                        published += 1
+            self._record_transfer(
+                kind="save",
+                blocks=len(batch),
+                bytes_=self._transfer_bytes(p for p, _ in batch),
+                latency=self.env.now - issued,
+                blocking_latency=0,
+            )
+        finally:
+            for page, _ in batch[published:]:
+                self.store.abort_write(page)
+            for _, block in batch[unpinned:]:
+                self.manager.unpin_transfer(block)
+            self.write_jobs -= 1
+            self.notify()
 
     def enqueue_flush(self, page, *, evict=False):
         if not page.ready:
@@ -154,19 +165,30 @@ class TieredKVConnector(AsyncOffloadConnector):
         yield self.env.timeout(0)
         batch, self.flush_batch = self.flush_batch, []
         self.flush_scheduled = False
-        for chunk in self.chunks(batch):
-            yield self.env.process(
-                self.service.transfer("write", sum(row[1].bytes for row in chunk))
-            )
-            for local, remote, evict, touched in chunk:
-                self.service.store.finish_write(remote)
+        published = 0
+        try:
+            for chunk in self.chunks(batch):
+                yield self.env.process(
+                    self.service.transfer("write", sum(row[1].bytes for row in chunk))
+                )
+                for local, remote, evict, touched in chunk:
+                    self.service.store.finish_write(remote)
+                    self.store.local.release(local)
+                    published += 1
+                    if evict:
+                        self.pending_eviction_bytes -= local.bytes
+                        if local.last_touch == touched and self.store.has_remote(
+                            local.key
+                        ):
+                            self.store.drop_local(local)
+        finally:
+            for local, remote, evict, _ in batch[published:]:
+                self.service.store.abort_write(remote)
                 self.store.local.release(local)
                 if evict:
                     self.pending_eviction_bytes -= local.bytes
-                    if local.last_touch == touched and self.store.has_remote(local.key):
-                        self.store.drop_local(local)
-        self.write_jobs -= 1
-        self.notify()
+            self.write_jobs -= 1
+            self.notify()
 
     def transfer_load(self, targets):
         local = [row for row in targets if row[2].tier == 2]

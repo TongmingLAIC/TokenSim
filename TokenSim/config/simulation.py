@@ -12,6 +12,7 @@ from TokenSim.config.speculative_execution import (
 )
 from TokenSim.errors import ConfigurationError
 from TokenSim.config.validation import integer, number, boolean
+from TokenSim.config.cache_policy import PRESETS
 
 
 @dataclass(frozen=True)
@@ -71,17 +72,7 @@ class SimulationConfig:
         number(self.cache_quota_max_wait_seconds, "quota maximum wait", positive=True)
         number(self.cache_prefetch_lead_seconds, "prefetch lead seconds", positive=True)
         integer(self.cache_prefetch_budget_bytes, "prefetch byte budget", minimum=1)
-        if self.cache_retention_priority > 100 or self.cache_policy not in (
-            "apc",
-            "noop",
-            "retain",
-            "quota",
-            "movement",
-            "retain_movement",
-            "all",
-            "forced_movement",
-            "enhanced_coop",
-        ):
+        if self.cache_retention_priority > 100 or self.cache_policy not in PRESETS:
             raise ConfigurationError("Invalid cache policy or retention priority")
         object.__setattr__(
             self,

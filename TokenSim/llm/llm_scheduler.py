@@ -288,7 +288,7 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
 
     def _admit(self, req: Request, *, external=None) -> None:
         """Allocate KV blocks for the whole context and record what is already cached."""
-        local_plan = self.block_manager.kv_cache_manager.plan_reuse(req)
+        local_plan = self.block_manager.plan_reuse(req)
         if self.connector.async_offload:
             return admit_async(self, req, local_plan, external)
         # Reuse the already-built prefix chain in external-cache connectors.

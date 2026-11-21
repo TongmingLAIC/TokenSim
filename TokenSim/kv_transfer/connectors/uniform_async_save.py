@@ -3,10 +3,10 @@
 
 class UniformSaveMixin:
     def on_new_request(self, req):
-        self.state.observe(self._keys_for_request(req))
-        self.mooncake_stats.cache_query_tokens += (
-            len(self._keys_for_request(req)) * self.block_size
-        )
+        keys = self._keys_for_request(req)
+        self.state.observe(keys)
+        if self.config.kv_role != "kv_producer" and self.options.enable_lookup:
+            self.mooncake_stats.cache_query_tokens += len(keys) * self.block_size
 
     def on_tokens_computed(self, req):
         if self.config.kv_role == "kv_consumer" or req.cancel_requested:
@@ -24,7 +24,10 @@ class UniformSaveMixin:
         self.queue_save(keys, blocks, request_id=req.id)
 
     def queue_save(self, keys, blocks, *, declared_wait=False, request_id=None):
-        if self.options.admission_policy == "never":
+        if (
+            self.config.kv_role == "kv_consumer"
+            or self.options.admission_policy == "never"
+        ):
             return
         selected = []
         missing = set(self.service.store.missing_indices(list(keys)))

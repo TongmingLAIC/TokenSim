@@ -97,13 +97,16 @@ Use `MooncakeStoreConnector` to share prefixes through an external store, as des
 
 ## Reusing Generated Output
 
-`output_hash_ids` lets completed decode blocks become part of a later prompt.
-Output blocks are registered when the request finishes, provided all of the following conditions hold.
+With uniform KV caches, `output_hash_ids` lets computed decode blocks become part of a later prompt.
+The KV cache registers those blocks when the request finishes, provided all of the following conditions hold.
 
 - The input length is a multiple of the block size.
 - All full input blocks have `hash_ids`.
-- Token generation produces at least one full block.
-- `output_hash_ids` supplies identifiers for those full output blocks.
+- Model steps have computed KV for every token in the output block.
+- `output_hash_ids` supplies the identifier for each reusable output block.
+
+The final sampled token has no computed KV.
+For a block size of 16, generating 17 tokens makes the first 16 eligible as one complete output block.
 
 Run the included example with the following command.
 

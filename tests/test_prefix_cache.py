@@ -1,8 +1,12 @@
+from types import SimpleNamespace
 import unittest
+
+import simpy
 
 from TokenSim.block.block_manager import BlockManager
 from TokenSim.block.prefix_cache import build_prefix_keys
 from TokenSim.llm.llm_request import Request
+from TokenSim.llm.llm_scheduler import LLMPagedAttnScheduler
 
 
 BLOCK_SIZE = 16
@@ -249,33 +253,71 @@ class AdaptedVllmPrefixCacheTest(unittest.TestCase):
             manager.kv_cache_manager.plan_reuse(old_prefix).hit_block_count, 0
         )
 
-    def test_output_hash_ids_register_full_decode_blocks(self):
-        manager = BlockManager(
-            block_size=BLOCK_SIZE,
-            num_gpu_blocks=8,
-            num_cpu_blocks=8,
-            model="llama",
-            watermark=0,
-        )
-        req0 = make_request(
-            0,
-            prefill_len=16,
-            decode_len=16,
-            hash_ids=["p"],
-            output_hash_ids=["o"],
-        )
-        allocate_and_commit(manager, req0)
-        req0.generation_idx = 15
-        req0._append_tokens(15)
-        manager.append_slot(req0)
-        req0.generation_idx = 16
-        req0._append_tokens(1)
-        manager.free(req0)
+    def test_eviction_preserves_other_copies_of_the_same_prefix(self):
+        for evicted_index in (0, 1):
+            with self.subTest(evicted_index=evicted_index):
+                manager = BlockManager(BLOCK_SIZE, 2, 0)
+                reqs = [make_request(i, BLOCK_SIZE, hash_ids=["p"]) for i in (0, 1)]
+                for req in reqs:
+                    manager.allocate(req)
+                blocks = [manager.block_table.get_blocks(req.id)[0] for req in reqs]
+                self.assertIsNot(blocks[0], blocks[1])
+                env = simpy.Environment()
+                for req in reqs:
+                    req.arrive(env)
+                    req.advance(env, 0, 1)
+                    manager.commit_input_cache(req)
 
-        req1 = make_request(1, prefill_len=32, hash_ids=["p", "o"])
-        manager.allocate(req1)
-        self.assertEqual(req1.reuse_hit_blocks, 2)
-        self.assertEqual(req1.effective_prefill_tokens, 0)
+                probe = make_request(2, BLOCK_SIZE, hash_ids=["p"])
+                manager.release_request_blocks(reqs[evicted_index])
+                allocated = manager.gpu_allocator.allocate()
+                self.assertIs(allocated, blocks[evicted_index])
+                surviving_index = 1 - evicted_index
+                plan = manager.kv_cache_manager.plan_reuse(probe)
+                self.assertEqual(plan.hit_blocks, (blocks[surviving_index],))
+
+                manager.release_request_blocks(reqs[surviving_index])
+                self.assertIs(manager.gpu_allocator.allocate(), blocks[surviving_index])
+                self.assertEqual(
+                    manager.kv_cache_manager.plan_reuse(probe).hit_blocks, ()
+                )
+
+    def test_output_hash_ids_publish_only_blocks_with_computed_kv(self):
+        for decode_len, expected_hits in ((BLOCK_SIZE, 1), (BLOCK_SIZE + 1, 2)):
+            with self.subTest(decode_len=decode_len):
+                scheduler = LLMPagedAttnScheduler(
+                    id=0,
+                    cache_config=SimpleNamespace(
+                        block_size=BLOCK_SIZE,
+                        num_gpu_blocks=8,
+                        num_cpu_blocks=0,
+                        model="llama",
+                    ),
+                )
+                original = make_request(
+                    0,
+                    prefill_len=BLOCK_SIZE,
+                    decode_len=decode_len,
+                    hash_ids=["p"],
+                    output_hash_ids=["o"],
+                )
+                env = simpy.Environment()
+                original.arrive(env)
+                scheduler.add_requests([original])
+                for _ in range(decode_len):
+                    running, _ = scheduler.schedule()
+                    self.assertEqual(running, [original])
+                    env.run(until=env.now + 0.1)
+                    original.advance(env, 0.1, 1)
+                    scheduler.update(running)
+                self.assertTrue(original.is_done)
+                self.assertEqual(
+                    original.num_computed_tokens, BLOCK_SIZE + decode_len - 1
+                )
+
+                probe = make_request(1, prefill_len=2 * BLOCK_SIZE, hash_ids=["p", "o"])
+                plan = scheduler.block_manager.kv_cache_manager.plan_reuse(probe)
+                self.assertEqual(plan.hit_block_count, expected_hits)
 
 
 class StrongTreePrefixCacheTest(unittest.TestCase):

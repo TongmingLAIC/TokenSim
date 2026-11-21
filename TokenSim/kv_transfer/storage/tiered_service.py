@@ -3,9 +3,8 @@
 from dataclasses import dataclass
 
 from TokenSim.errors import ConfigurationError
-from TokenSim.kv_transfer.native_storage import NativePageStore, QueuedKVLink
-from TokenSim.kv_transfer.online_storage_config import OnlineStoragePolicy
-from TokenSim.kv_transfer.storage_queue import StorageQueue
+from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.storage.queue import QueueLimits, StorageQueue
 
 
 @dataclass(frozen=True)
@@ -36,9 +35,7 @@ class TieredService:
             utilization=options.transfer_utilization,
             latency_us=options.network_latency_us,
         )
-        self.queue = StorageQueue(
-            env, OnlineStoragePolicy(read_priority=options.read_priority)
-        )
+        self.queue = StorageQueue(env, QueueLimits(read_priority=options.read_priority))
         self.namespaces = {}
         self.completed = {"read": 0, "write": 0}
         self.pending = {"read": 0, "write": 0}
@@ -59,10 +56,7 @@ class TieredService:
             # The backend is a shared half-duplex service; network directions
             # have separate queues. No measured SSD/DRAM accuracy is implied.
             if kind == "write":
-                self.queue.backlog_bytes += size
-                self.queue.peak_backlog_bytes = max(
-                    self.queue.peak_backlog_bytes, self.queue.backlog_bytes
-                )
+                self.queue.reserve_write(size)
             yield self.env.process(self.queue.execute(kind, size, lambda: duration))
             if kind == "read":
                 yield self.env.process(self.read.transfer(size))

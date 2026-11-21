@@ -1,8 +1,18 @@
 """Nonpreemptive shared I/O transactions with foreground priority and write credit."""
 
+from dataclasses import dataclass
+
 import simpy
 
 from TokenSim.config.validation import integer
+
+
+@dataclass(frozen=True)
+class QueueLimits:
+    read_priority: bool = False
+    write_bytes_per_second: float | None = None
+    write_burst_bytes: int = 0
+    max_backlog_bytes: int | None = None
 
 
 class WriteCredit:
@@ -49,7 +59,8 @@ class StorageQueue:
 
     def reserve_write(self, nbytes):
         integer(nbytes, "queued write bytes")
-        if self.backlog_bytes + nbytes > self.policy.max_backlog_bytes:
+        limit = self.policy.max_backlog_bytes
+        if limit is not None and self.backlog_bytes + nbytes > limit:
             self.dropped_write_bytes += nbytes
             return False
         self.backlog_bytes += nbytes
@@ -62,15 +73,17 @@ class StorageQueue:
         integer(nbytes, "I/O transaction bytes")
         write = kind == "write"
         queued = self.env.now
-        if write:
-            yield self.env.process(self.credit.acquire(nbytes))
-        eligible = self.env.now
-        priority = (
-            (2 if write else 1 if prefetch else 0) if self.policy.read_priority else 0
-        )
-        serial = self.sequence
-        self.sequence += 1
         try:
+            if write:
+                yield self.env.process(self.credit.acquire(nbytes))
+            eligible = self.env.now
+            priority = (
+                (2 if write else 1 if prefetch else 0)
+                if self.policy.read_priority
+                else 0
+            )
+            serial = self.sequence
+            self.sequence += 1
             with self.resource.request(priority=priority) as request:
                 yield request
                 started = self.env.now

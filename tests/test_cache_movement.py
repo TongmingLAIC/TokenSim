@@ -9,9 +9,9 @@ from TokenSim.block.hybrid.kv_layout import CacheLayerPage, CacheGroup, HybridKV
 from TokenSim.block.hybrid.manager import HybridKVBlockManager
 from TokenSim.config.kv_transfer_config import KVTransferConfig
 from TokenSim.kv_transfer.connectors.simple_cpu import AsyncOffloadConnector
-from TokenSim.kv_transfer.native_storage import NativePageStore, QueuedKVLink
-from TokenSim.kv_transfer.movement import MovementRuntime, PrefixSnapshot
-from TokenSim.kv_transfer.child_policy import reclaim_child, skip_write
+from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.policies.movement import MovementRuntime, PrefixSnapshot
+from TokenSim.kv_transfer.policies.child import reclaim_child, skip_write
 from TokenSim.llm.llm_request import Request
 
 
@@ -78,6 +78,29 @@ class CacheMovementTest(unittest.TestCase):
             cache_salt="scope",
             reuse_group="tenant",
         )
+
+    def test_failed_write_releases_gpu_and_discards_unpublished_store_page(self):
+        def fail(_):
+            yield self.env.timeout(0)
+            raise RuntimeError("copy failed")
+
+        occupied = self.connector.store.used_bytes
+        req = Request(2, 16, 1, 16, hash_ids=[99])
+        self.manager.allocate(req)
+        self.manager.ensure_slots(req, 16)
+        req.num_computed_tokens = 16
+        self.manager.cache_computed(req)
+        self.manager.release_request_blocks(req)
+        self.connector.write_link.transfer = fail
+        self.connector.wait_for_save()
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            self.env.run()
+
+        self.assertEqual(self.connector.write_jobs, 0)
+        self.assertEqual(self.connector.store.used_bytes, occupied)
+        self.assertFalse(self.manager.transfer_references)
+        self.manager.validate_conservation()
+        self.connector.store.validate()
 
     def start(self):
         state = dict(request=None, phase="prefetch", done=self.env.event())
@@ -166,9 +189,7 @@ class CooperationTest(unittest.TestCase):
 
         runtime.copy = copy
         snapshot = NS(
-            manager=NS(
-                num_total_gpu_blocks=100, _free_uncached=[None] * (100 - occupied)
-            ),
+            manager=NS(occupied_fraction=lambda: occupied / 100),
             connector=NS(notify=lambda: None),
         )
         state = dict(
@@ -205,33 +226,41 @@ class CooperationTest(unittest.TestCase):
         self.assertNotIn("p", runtime.waiting)
 
     def test_child_reclamation_preserves_parent_and_live_blocks(self):
-        blocks = {i: NS(block_hash=f"h{i}", ref_count=int(i == 2)) for i in range(3)}
-        evicted = []
-        manager = NS(
-            grouped_cache=True,
-            blocks=blocks,
-            _free_cached={0: blocks[0], 1: blocks[1]},
-            _free_uncached=[],
-            _evict=lambda block: evicted.append(block),
-        )
+        page = CacheLayerPage("layer.0", "full", 16, 8)
+        layout = HybridKVLayout((CacheGroup(0, (page,)),), 16, 512, 32, 0, 32, 128)
+        manager = HybridKVBlockManager(layout, 8, "toy")
+        requests = [Request(i, 16, 1, 16, hash_ids=[i]) for i in range(3)]
+        blocks = []
+        for req in requests:
+            manager.allocate(req)
+            manager.ensure_slots(req, 16)
+            req.num_computed_tokens = 16
+            manager.cache_computed(req)
+            blocks.extend(manager.block_table.get_blocks(req.id))
+        for req in requests[:2]:
+            manager.release_request_blocks(req)
+        keys = [block.block_hash for block in blocks]
+        slots = [block.block_number for block in blocks]
         controller = NS(
-            mode="enhanced_coop",
+            child_write_admission=True,
             stats={},
             record=lambda *a, **k: None,
             movement=NS(
-                snapshots={"p": NS(manager=manager, blocks=((blocks[0], "h0"),))}
+                snapshots={"p": NS(manager=manager, blocks=((blocks[0], keys[0]),))}
             ),
         )
         req = NS(id=9, cache_one_shot=True)
         self.assertFalse(skip_write(controller, manager, blocks[0], req))
         self.assertTrue(skip_write(controller, manager, blocks[1], req))
         controller.child_reclamation = False
-        reclaim_child(controller, NS(block_manager=manager), req, [0, 1, 2])
-        self.assertEqual(evicted, [])
+        reclaim_child(controller, NS(block_manager=manager), req, slots)
+        self.assertEqual([block.block_hash for block in blocks], keys)
         controller.child_reclamation = True
-        reclaim_child(controller, NS(block_manager=manager), req, [0, 1, 2])
-        self.assertEqual(evicted, [blocks[1]])
-        self.assertIn(0, manager._free_cached)
+        reclaim_child(controller, NS(block_manager=manager), req, slots)
+        self.assertEqual(
+            [block.block_hash for block in blocks], [keys[0], None, keys[2]]
+        )
+        manager.validate_conservation()
         req.cache_one_shot = False
         self.assertFalse(skip_write(controller, manager, blocks[1], req))
 
@@ -256,7 +285,7 @@ class CooperationTest(unittest.TestCase):
         )
 
     def test_parent_content_cache_expires_when_a_session_releases(self):
-        from TokenSim.kv_transfer.child_policy import parent_content
+        from TokenSim.kv_transfer.policies.child import parent_content
 
         runtime = self.runtime("enhanced_coop")
         manager = object()

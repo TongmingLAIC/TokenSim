@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from TokenSim.config.kv_transfer_config import KVTransferConfig
@@ -11,39 +11,72 @@ from TokenSim.errors import ConfigurationError
 from TokenSim.storage import StorageBackendFactory
 
 
-class MooncakeService:
-    def __init__(self, config: MooncakeConfig, block_bytes: int):
-        self.config = config
-        self.block_bytes = block_bytes
-        self.store = MooncakeStore(config, block_bytes)
-        self.contributors = {}
+@dataclass(frozen=True)
+class _Contribution:
+    worker: object
+    pool_bytes: int
+    staging_bytes: int
 
-    def register(self, contributor, ranks, config):
-        proposed = {**self.contributors, id(contributor): (contributor, ranks, config)}
-        capacity = (
-            self.config.memory_capacity_blocks * self.block_bytes
-            if self.config.memory_capacity_blocks is not None
-            else (
-                sum(
-                    count * options.global_segment_size
-                    for _, count, options in proposed.values()
+
+class CapacityLedger:
+    """Count the capacity and staging of the ranks attached to one master."""
+
+    def __init__(self, config: MooncakeConfig, *, fixed_capacity=None):
+        self.config = config
+        self.fixed_capacity = (
+            config.global_segment_size
+            if fixed_capacity is None and config.mode == "standalone-store"
+            else fixed_capacity
+        )
+        self.contributors: dict[int, _Contribution] = {}
+        self.capacity_bytes = 0
+        self.staging_bytes = 0
+
+    def register(self, worker, config, *, ranks=1):
+        contribution = _Contribution(
+            worker, ranks * config.global_segment_size, ranks * config.local_buffer_size
+        )
+        previous = self.contributors.get(id(worker))
+        if previous is not None:
+            if (
+                contribution.staging_bytes != previous.staging_bytes
+                or self.fixed_capacity is None
+                and contribution.pool_bytes != previous.pool_bytes
+            ):
+                raise ConfigurationError(
+                    "one rank cannot contribute different capacities to a Mooncake master"
                 )
-                if self.config.mode == "embedded"
-                else self.config.global_segment_size
-            )
+            return
+        capacity = (
+            self.capacity_bytes + contribution.pool_bytes
+            if self.fixed_capacity is None
+            else self.fixed_capacity
         )
-        reserved = capacity + sum(
-            count * options.local_buffer_size for _, count, options in proposed.values()
-        )
+        staging = self.staging_bytes + contribution.staging_bytes
         if (
             self.config.host_available_bytes is not None
-            and reserved > self.config.host_available_bytes
+            and capacity + staging > self.config.host_available_bytes
         ):
             raise ConfigurationError(
                 "shared Mooncake pool and staging exceed available host DRAM"
             )
-        self.contributors = proposed
-        self.store.memory_capacity_bytes = capacity
+        self.contributors[id(worker)] = contribution
+        self.capacity_bytes, self.staging_bytes = capacity, staging
+
+
+class MooncakeService:
+    def __init__(self, config: MooncakeConfig, block_bytes: int):
+        self.store = MooncakeStore(config, block_bytes)
+        fixed_capacity = (
+            config.memory_capacity_blocks * block_bytes
+            if config.memory_capacity_blocks is not None
+            else None
+        )
+        self.capacity = CapacityLedger(config, fixed_capacity=fixed_capacity)
+
+    def register(self, contributor, ranks, config):
+        self.capacity.register(contributor, config, ranks=ranks)
+        self.store.memory_capacity_bytes = self.capacity.capacity_bytes
 
 
 def shared_store(owner, config, payload_format, create):
@@ -66,7 +99,7 @@ def shared_store(owner, config, payload_format, create):
 
 
 def get_mooncake_service(
-    kv_config: KVTransferConfig,
+    kv_config: KVTransferConfig | MooncakeConfig,
     *,
     block_bytes: int,
     extra_config: dict[str, Any] | None = None,
@@ -74,10 +107,14 @@ def get_mooncake_service(
     contributor=None,
     ranks=1,
 ) -> MooncakeService:
-    mooncake_config = parse_mooncake_config(
-        extra_config
-        if extra_config is not None
-        else kv_config.kv_connector_extra_config
+    mooncake_config = (
+        kv_config
+        if isinstance(kv_config, MooncakeConfig)
+        else parse_mooncake_config(
+            extra_config
+            if extra_config is not None
+            else kv_config.kv_connector_extra_config
+        )
     )
 
     def create():

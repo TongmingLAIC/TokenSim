@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from TokenSim.block.block import Device, PhysicalTokenBlock
-from TokenSim.block.free_queue import FreeBlockQueue
+from TokenSim.block.pool.free_queue import FreeBlockQueue
 from TokenSim.block.prefix_cache import PrefixCacheKey, build_prefix_keys
 from TokenSim.errors import SimulationStateError
 from TokenSim.llm.llm_request import Request
@@ -46,6 +46,7 @@ class KVCacheManager:
         self.block_size = block_size
         self.model = model
         self._cache: dict[PrefixCacheKey, PhysicalTokenBlock] = {}
+        self._duplicates: dict[PrefixCacheKey, dict[int, PhysicalTokenBlock]] = {}
         self._access_counter = 0
         # plan_reuse() runs for the waiting-queue head on every scheduling
         # attempt; cache the sha256 key chain per live request.
@@ -93,11 +94,18 @@ class KVCacheManager:
         keys: list[PrefixCacheKey],
     ) -> None:
         for block, key in zip(blocks, keys):
+            if block.device != Device.GPU:
+                continue
             if block.block_hash is not None and block.block_hash != key:
                 self.evict(block)
             block.block_hash = key
             block.is_full = True
             block.cached = True
+            previous = self._cache.get(key)
+            if previous is not None and previous is not block:
+                copies = self._duplicates.setdefault(key, {})
+                copies.pop(block.block_number, None)
+                copies[previous.block_number] = previous
             self._cache[key] = block
             self.touch(block)
 
@@ -113,10 +121,11 @@ class KVCacheManager:
         if len(req.hash_ids or []) < full_input_blocks:
             return
 
-        output_full_blocks = req.decode_len // self.block_size
-        if output_full_blocks <= 0:
-            return
-
+        # Sampling a token extends the output without computing its KV.
+        computed_output = min(
+            req.generation_idx, req.num_computed_tokens - req.prefill_len
+        )
+        output_full_blocks = max(0, computed_output) // self.block_size
         output_hash_ids = req.output_hash_ids[:output_full_blocks]
         if not output_hash_ids:
             return
@@ -158,8 +167,18 @@ class KVCacheManager:
             free_queue.append_lru(block)
 
     def evict(self, block: PhysicalTokenBlock) -> None:
-        if block.block_hash is not None and self._cache.get(block.block_hash) is block:
-            self._cache.pop(block.block_hash, None)
+        key = block.block_hash
+        if key is not None:
+            copies = self._duplicates.get(key)
+            if self._cache.get(key) is block:
+                if copies:
+                    _, self._cache[key] = copies.popitem()
+                else:
+                    del self._cache[key]
+            elif copies is not None:
+                copies.pop(block.block_number, None)
+            if copies is not None and not copies:
+                del self._duplicates[key]
         block.clear_cache_metadata()
 
     def touch(self, block: PhysicalTokenBlock) -> None:

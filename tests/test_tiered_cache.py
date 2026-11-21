@@ -7,8 +7,8 @@ import simpy
 from TokenSim.config.kv_transfer_config import KVTransferConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.kv_transfer.connectors.tiered import TieredKVConnector
-from TokenSim.kv_transfer.tiered_config import TieredConfig
-from TokenSim.kv_transfer.native_storage import NativePageStore
+from TokenSim.kv_transfer.storage.tiered_config import TieredConfig
+from TokenSim.kv_transfer.storage.native import NativePageStore
 
 
 def connector(policy="write_through", env=None, **options):

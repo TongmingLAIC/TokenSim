@@ -13,8 +13,9 @@ from TokenSim.block.free_queue import FreeBlockQueue
 from TokenSim.block.priority_queue import PriorityFreeMap
 from TokenSim.cli import build_parser
 from TokenSim.cli.run import main
-from TokenSim.kv_transfer.retention import RetentionRegistry
+from TokenSim.kv_transfer.policies.retention import RetentionRegistry
 from TokenSim.llm.paged_scheduling import PagedSchedulingMixin
+from TokenSim.llm.llm_request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -111,7 +112,9 @@ class CacheControlRuntimeTest(unittest.TestCase):
                 defer_admission=lambda scheduler, req: False,
             ),
         )
-        self.assertFalse(PagedSchedulingMixin._admit_waiting(scheduler, object(), None))
+        self.assertFalse(
+            PagedSchedulingMixin._admit_waiting(scheduler, Request(1, 16, 1, 16), None)
+        )
         self.assertFalse(released)
 
     def simulate(self, directory, mode):

@@ -23,8 +23,7 @@ def parent_content(controller, manager):
 
 def skip_write(controller, manager, block, req):
     return (
-        controller.mode == "enhanced_coop"
-        and getattr(controller, "child_write_admission", True)
+        controller.child_write_admission
         and getattr(req, "cache_one_shot", False)
         and block.block_hash not in parent_content(controller, manager)
     )
@@ -33,8 +32,7 @@ def skip_write(controller, manager, block, req):
 def reclaim_child(controller, scheduler, req, block_ids):
     manager = scheduler.block_manager
     if (
-        controller.mode != "enhanced_coop"
-        or not getattr(controller, "child_reclamation", True)
+        not controller.child_reclamation
         or not manager.grouped_cache
         or not getattr(req, "cache_one_shot", False)
     ):
@@ -43,16 +41,8 @@ def reclaim_child(controller, scheduler, req, block_ids):
     reclaimed = 0
     for slot in block_ids:
         block = manager.blocks[slot]
-        if (
-            block.ref_count
-            or slot not in manager._free_cached
-            or block.block_hash in protected
-        ):
-            continue
-        del manager._free_cached[slot]
-        manager._evict(block)
-        manager._free_uncached.append(block)
-        reclaimed += 1
+        if block.block_hash not in protected:
+            reclaimed += manager.reclaim_cached_slot(slot, block.block_hash)
     controller.stats["child_reclaimed_pages"] = (
         controller.stats.get("child_reclaimed_pages", 0) + reclaimed
     )

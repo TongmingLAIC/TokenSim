@@ -1,95 +1,10 @@
 from TokenSim.llm.llm_request import Request
 from TokenSim.block.block import Device, PhysicalTokenBlock
-from TokenSim.block.block_pool import BlockPool
+from TokenSim.block.pool.allocator import BlockAllocator as BlockAllocator
 from TokenSim.block.block_table import BlockTable
 from TokenSim.block.kv_cache_manager import KVCacheManager, PrefixReusePlan
 from TokenSim.errors import OutOfBlocksError, SimulationStateError
 from typing import Tuple
-
-
-class BlockAllocator:
-    """Manages free physical token blocks for a device.
-
-    The allocator maintains a list of free blocks and allocates a block when
-    requested. When a block is freed, its reference count is decremented. If
-    the reference count becomes zero, the block is added back to the free list.
-    """
-
-    def __init__(
-        self,
-        device: Device,
-        block_size: int,
-        num_blocks: int,
-        kv_cache_manager: KVCacheManager | None = None,
-    ) -> None:
-        self.device = device
-        self.block_size: int = block_size
-        self.num_blocks: int = int(num_blocks)
-        self.kv_cache_manager = kv_cache_manager
-        self.pool = BlockPool(device, block_size, num_blocks)
-        self.free_blocks = self.pool.free_blocks
-
-    def allocate(self) -> PhysicalTokenBlock:
-        if not self.get_num_free_blocks():
-            raise OutOfBlocksError(
-                f"out of {self.device.name} memory; no free blocks are available"
-            )
-        block = self.pool.pop_free_block()
-        if block.cached:
-            if self.kv_cache_manager is None:
-                block.clear_cache_metadata()
-            else:
-                self.kv_cache_manager.evict(block)
-        if block.ref_count != 0:
-            raise SimulationStateError(
-                f"{self.device.name} block {block.block_number} is free but "
-                + f"has ref_count {block.ref_count}"
-            )
-        block.ref_count += 1
-        return block
-
-    def acquire(self, block: PhysicalTokenBlock) -> None:
-        self.pool.validate_owned(block)
-        if block.ref_count == 0:
-            self.pool.remove_from_free_queue(block)
-        block.ref_count += 1
-        if self.kv_cache_manager is not None:
-            self.kv_cache_manager.touch(block)
-
-    def free(self, block: PhysicalTokenBlock | None = None) -> None:
-        if block is None:
-            raise SimulationStateError(
-                "BlockAllocator.free() requires a physical block"
-            )
-        self.pool.validate_owned(block)
-        if block.ref_count <= 0:
-            raise SimulationStateError(
-                f"block {block.block_number} ref_count is already {block.ref_count}"
-            )
-        if self.kv_cache_manager is not None:
-            self.kv_cache_manager.release_block(block, self.free_blocks)
-        else:
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                block.clear_cache_metadata()
-                self.pool.append_free_block(block)
-
-    def get_num_free_blocks(self) -> int:
-        return self.pool.get_num_free_blocks()
-
-    def get_num_allocated_blocks(self) -> int:
-        return self.num_blocks - self.get_num_free_blocks()
-
-    def set_num_free_blocks(self, block_num):
-        self.pool.set_num_free_blocks(block_num)
-        self.free_blocks = self.pool.free_blocks
-
-    def get_status(self) -> Tuple[int, int, int]:
-        return (
-            self.get_num_free_blocks(),
-            self.get_num_allocated_blocks(),
-            self.num_blocks,
-        )
 
 
 class BlockManager:
@@ -123,8 +38,14 @@ class BlockManager:
         )
         self.cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
 
-    def can_allocate(self, req: Request) -> bool:
-        plan = self.kv_cache_manager.plan_reuse(req)
+    def plan_reuse(self, req: Request) -> PrefixReusePlan:
+        return self.kv_cache_manager.plan_reuse(req)
+
+    def can_allocate(
+        self, req: Request, *, plan: PrefixReusePlan | None = None
+    ) -> bool:
+        if plan is None:
+            plan = self.plan_reuse(req)
         num_required_blocks = plan.miss_block_count
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
         num_free_gpu_blocks += getattr(self, "transfer_reservations", {}).get(req.id, 0)
@@ -133,7 +54,7 @@ class BlockManager:
         num_free_gpu_blocks -= plan.zero_ref_hit_blocks
         return num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks
 
-    def allocate(self, req: Request):
+    def allocate(self, req: Request, *, plan: PrefixReusePlan | None = None):
         # Allocate new physical token blocks that will store the prompt&generated tokens.
         if self.block_table.get_num_blocks(req.id):
             raise SimulationStateError(
@@ -143,7 +64,8 @@ class BlockManager:
         transferred = reservations.pop(req.id, 0)
         if transferred:
             self.release_reserved_blocks(transferred)
-        plan = self.kv_cache_manager.plan_reuse(req)
+        if plan is None:
+            plan = self.plan_reuse(req)
         blocks: list[PhysicalTokenBlock] = []
         try:
             for block in plan.hit_blocks:
@@ -164,6 +86,9 @@ class BlockManager:
 
     def get_num_free_blocks(self):
         return self.gpu_allocator.get_num_free_blocks()
+
+    def enable_retention(self, priority, clock):
+        return self.gpu_allocator.pool.enable_retention(priority, clock)
 
     def get_num_allocated_blocks(self):
         return self.gpu_allocator.get_num_allocated_blocks()

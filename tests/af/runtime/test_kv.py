@@ -57,7 +57,7 @@ class ReplicaKVBlockManagerTest(unittest.TestCase):
         req = _request(2)
         failing_rank = manager.rank_keys[1]
 
-        def fail(_request):
+        def fail(_request, *, plan=None):
             raise OutOfBlocksError("injected follower exhaustion")
 
         manager.rank_managers[failing_rank].allocate = fail
@@ -197,30 +197,71 @@ class ReplicaKVBlockManagerTest(unittest.TestCase):
         original = Request(
             10,
             8,
-            1,
+            5,
             block_size=4,
             hash_ids=["a", "b"],
+            output_hash_ids=["c"],
         )
         original.arrive(SimpleNamespace(now=0.0))
         manager.allocate(original)
-        manager.commit_input_cache(original)
-        manager.release_request_blocks(original)
+        for i in range(original.decode_len):
+            manager.append_slot(original)
+            original.advance(SimpleNamespace(now=i + 1), 1, 1)
+        self.assertTrue(original.is_done)
+        manager.free(original)
 
         reused = Request(
             11,
-            8,
+            12,
             1,
             block_size=4,
-            hash_ids=["a", "b"],
+            hash_ids=["a", "b", "c"],
         )
-        reused.arrive(SimpleNamespace(now=1.0))
+        reused.arrive(SimpleNamespace(now=6.0))
         manager.allocate(reused)
 
-        self.assertEqual(reused.reuse_hit_blocks, 2)
-        self.assertEqual(len(manager.mappings_for_request(reused.id)), 2)
+        self.assertEqual(reused.reuse_hit_blocks, 3)
+        self.assertEqual(len(manager.mappings_for_request(reused.id)), 3)
         for rank_key in manager.rank_keys:
-            blocks = manager.rank_managers[rank_key].block_table.get_blocks(reused.id)
+            rank = manager.rank_managers[rank_key]
+            self.assertEqual(
+                rank.kv_cache_manager.plan_reuse(reused).hit_block_count, 3
+            )
+            blocks = rank.block_table.get_blocks(reused.id)
             self.assertTrue(all(block.ref_count == 1 for block in blocks))
+
+    def test_replica_recomputes_suffix_missing_from_one_tp_rank(self):
+        manager = self._manager(gpu=(8, 5))
+        for index, hashes in enumerate((["a", "b"], ["c"], ["d"], ["e"], ["a"], ["f"])):
+            req = Request(index, 4 * len(hashes), 1, 4, hash_ids=hashes)
+            manager.allocate(req)
+            req.num_computed_tokens = req.prefill_len
+            manager.commit_input_cache(req)
+            manager.release_request_blocks(req)
+
+        scheduler = LLMPagedAttnScheduler(
+            id=0,
+            cache_config=SimpleNamespace(block_size=4),
+            block_manager=manager,
+        )
+        requests = [Request(i, 8, 1, 4, hash_ids=["a", "b"]) for i in (7, 8)]
+        self.assertEqual(
+            [
+                rank.kv_cache_manager.plan_reuse(requests[0]).hit_tokens
+                for rank in manager.rank_managers.values()
+            ],
+            [8, 4],
+        )
+        scheduler.add_requests(requests)
+        self.assertEqual(scheduler.schedule_output().running, requests)
+        for req in requests:
+            self.assertEqual(req.num_computed_tokens, 4)
+            self.assertEqual(req.scheduled_tokens, 4)
+        for rank in manager.rank_managers.values():
+            left, right = (rank.block_table.get_blocks(req.id) for req in requests)
+            self.assertIs(left[0], right[0])
+            self.assertIsNot(left[1], right[1])
+        manager.validate_invariants()
 
     def test_connector_counts_logical_blocks_once_and_release_clears_all_shards(self):
         cluster = _cluster(a_tp=2, a_dp=1, f_tp=1, f_dp=1, f_ep=1)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
+from TokenSim.block.pool.priority_queue import PriorityFreeMap
 from TokenSim.errors import OutOfBlocksError, SimulationStateError
 from .kv_layout import cdiv
 
@@ -292,6 +293,30 @@ class SlotAllocatorMixin:
 
     def get_num_free_blocks(self):
         return len(self._free_uncached) + len(self._free_cached)
+
+    def enable_retention(self, priority, clock):
+        queue = PriorityFreeMap(lambda slot: priority(self.blocks[slot]), clock)
+        queue.update(self._free_cached)
+        self._free_cached = queue
+        return queue.refresh
+
+    def occupied_fraction(self):
+        return (
+            self.num_total_gpu_blocks - len(self._free_uncached)
+        ) / self.num_total_gpu_blocks
+
+    def reclaim_cached_slot(self, slot, content):
+        block = self.blocks[slot]
+        if (
+            block.ref_count
+            or slot not in self._free_cached
+            or block.block_hash != content
+        ):
+            return False
+        del self._free_cached[slot]
+        self._evict(block)
+        self._free_uncached.append(block)
+        return True
 
     def get_num_allocated_blocks(self):
         return self.num_total_gpu_blocks - self.get_num_free_blocks()

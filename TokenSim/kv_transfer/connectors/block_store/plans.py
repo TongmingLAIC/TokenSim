@@ -1,17 +1,15 @@
-"""Uniform block-store transfer plans, cache namespaces and serialized keys."""
+"""Uniform block-store transfer plans."""
 
 from __future__ import annotations
 
 from typing import Any
-from functools import cached_property
-import json
 from TokenSim.llm.llm_request import Request
-from TokenSim.mooncake import PoolKey, Segment, pool_keys_for_request
+from TokenSim.mooncake import PoolKey, Segment
 from ..metadata import ConnectorTransferPlan
 
 
 class BlockTransferPlans:
-    """Uniform block-store transfer plans, cache namespaces and serialized keys."""
+    """Uniform block-store transfer plans."""
 
     def _build_load_plan(
         self,
@@ -101,46 +99,6 @@ class BlockTransferPlans:
                 "request": req,
             },
         )
-
-    def _keys_for_request(self, req: Request) -> list[PoolKey]:
-        return self._request_key_bundle(req)[0]
-
-    def _key_strings_for_request(self, req: Request) -> list[str]:
-        return self._request_key_bundle(req)[1]
-
-    @cached_property
-    def store_namespace(self):
-        cache = self.cache_config
-        model = getattr(cache, "model_spec", None)
-        parallel = getattr(cache, "parallel_config", None)
-        shape = [
-            self.block_size,
-            self.block_bytes,
-            getattr(parallel, "tensor_parallel_size", 1),
-            getattr(parallel, "pipeline_parallel_size", 1),
-            getattr(model, "kv_cache_dtype", None),
-            getattr(model, "dtype", None),
-            model.cache_signature() if model is not None else None,
-        ]
-        return "@layout:" + json.dumps(shape, separators=(",", ":"))
-
-    def _request_key_bundle(self, req: Request) -> tuple[list[PoolKey], list[str]]:
-        bundle = self._keys_cache.get(req.id)
-        if bundle is None:
-            keys = pool_keys_for_request(
-                req,
-                model_name=self.model_name,
-                rank_info=self.rank_info,
-                store_namespace=self.store_namespace,
-                cache_prefix=self.options.cache_prefix,
-                tenant_id=self.options.tenant_id,
-                group_id=int(self.options.group_id),
-                pcp_rank=int(self.options.pcp_rank),
-                dcp_rank=int(self.options.dcp_rank),
-            )
-            bundle = (keys, [key.to_string() for key in keys])
-            self._keys_cache[req.id] = bundle
-        return bundle
 
     def _pool_keys_from_plan(self, plan: ConnectorTransferPlan) -> list[PoolKey]:
         pool_keys = plan.extra.get("pool_keys")

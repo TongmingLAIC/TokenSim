@@ -1,6 +1,7 @@
 """Arguments for implemented cache-control mechanisms."""
 
 import argparse
+from TokenSim.config.cache_policy import PRESETS
 
 
 def add_cache_policy_arguments(parser):
@@ -12,17 +13,7 @@ def add_cache_policy_arguments(parser):
     )
     parser.add_argument(
         "--cache_policy",
-        choices=[
-            "apc",
-            "noop",
-            "retain",
-            "quota",
-            "movement",
-            "retain_movement",
-            "all",
-            "forced_movement",
-            "enhanced_coop",
-        ],
+        choices=tuple(PRESETS),
         default="apc",
     )
     for name in (

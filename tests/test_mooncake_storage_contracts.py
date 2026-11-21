@@ -3,10 +3,17 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import simpy
 
-from TokenSim.config.config import KVTransferConfig, ParallelConfig
+from TokenSim.config.config import (
+    ClusterConfig,
+    KVTransferConfig,
+    ParallelConfig,
+    WorkerGroupConfig,
+)
+from TokenSim.config.simulation import SimulationConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.kv_transfer.connectors.factory import KVConnectorFactory
 from TokenSim.kv_transfer.connectors.mooncake_store import MooncakeStoreConnector
@@ -15,17 +22,60 @@ from TokenSim.kv_transfer.connectors.store_pages import (
     _StoreView,
     _SharedService,
 )
-from TokenSim.kv_transfer.native_storage import (
+from TokenSim.kv_transfer.storage.native import (
     NativePageStore,
     validate_external_stores,
 )
 from TokenSim.llm.llm_request import Request
+from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.mooncake.config import MooncakeConfig, parse_mooncake_config
 from TokenSim.mooncake.pool_key import PoolKey, KeyMetadata
 from TokenSim.mooncake.service import get_mooncake_service, shared_store
+from tests.support.hardware import make_hardware
+from tests.test_kv_transfer_integration import _DEVICE, _MODEL, _DeterministicBackend
 
 
 class MooncakeCapacityOnlyTest(unittest.TestCase):
+    def test_only_ranks_using_the_master_contribute_their_own_bytes(self):
+        def group(capacity=None):
+            extra = dict(global_segment_size=capacity, local_buffer_size=10)
+            return WorkerGroupConfig(
+                role="hybrid",
+                hardware="TestGPU",
+                num_workers=1,
+                kv_transfer=(
+                    KVTransferConfig(
+                        kv_connector="MooncakeStoreConnector",
+                        kv_connector_extra_config=extra,
+                    )
+                    if capacity is not None
+                    else None
+                ),
+            )
+
+        cluster = ClusterConfig(
+            num_workers=3,
+            networks={"net1": "ethernet-test"},
+            worker_groups=[group(1000), group(), group(500)],
+        )
+        with patch(
+            "TokenSim.llm.engine.worker.build_latency_backend",
+            return_value=_DeterministicBackend(),
+        ):
+            engine = LLMEngine(
+                simpy.Environment(),
+                KVTransferConfig.default(),
+                _MODEL,
+                cluster,
+                make_hardware(_DEVICE, models=[_MODEL]),
+                config=SimulationConfig(block_size=16, batching="paged-attn"),
+            )
+        left, _, right = engine.workers
+        service = left.connector.service
+        self.assertIs(service, right.connector.service)
+        self.assertEqual(service.store.memory_capacity_bytes, 1500)
+        self.assertEqual(service.capacity.staging_bytes, 20)
+
     def test_disabled_lookup_is_client_local_and_preserves_shared_capacity(self):
         env = simpy.Environment()
         options = MooncakeConfig(global_segment_size=1000, local_buffer_size=10)

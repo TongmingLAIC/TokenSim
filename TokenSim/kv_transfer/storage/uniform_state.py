@@ -4,7 +4,7 @@ from collections import Counter, OrderedDict
 import hashlib
 
 from TokenSim.errors import SimulationStateError
-from TokenSim.kv_transfer.storage_queue import StorageQueue
+from TokenSim.kv_transfer.storage.queue import StorageQueue
 
 
 class UniformStoreState:
@@ -23,25 +23,13 @@ class UniformStoreState:
         self.media_context = None
         media = service.store.offload
         if media is not None:
-            original_write = media.write
-            original_read = media.read
+            media.io_observers.append(self._observe_media)
 
-            def write(key, blocks, **kwargs):
-                operation = original_write(key, blocks, **kwargs)
-                if self.media_context is not None:
-                    self.media_context["writes"].append((key, operation.bytes))
-                for victim in operation.evicted_keys:
-                    self.latest_program.pop(victim, None)
-                return operation
-
-            def read(key):
-                operation = original_read(key)
-                if self.media_context is not None:
-                    self.media_context["reads"].append((key, operation.bytes))
-                return operation
-
-            media.write = write
-            media.read = read
+    def _observe_media(self, kind, key, operation):
+        if self.media_context is not None:
+            self.media_context[kind].append((key, operation.bytes))
+        for victim in operation.evicted_keys:
+            self.latest_program.pop(victim, None)
 
     def observe(self, keys):
         for key in keys:
@@ -82,7 +70,7 @@ class UniformStoreState:
                     store.offload.release_pin(name)
 
     def transaction(self, kind, nbytes, operation, *, prefetch=False, tags=None):
-        context = dict(writes=[], reads=[])
+        context = dict(write=[], read=[])
 
         def execute():
             self.media_context = context
@@ -92,11 +80,11 @@ class UniformStoreState:
                 self.media_context = None
 
         def completed():
-            for key, size in context["writes"]:
+            for key, size in context["write"]:
                 self.program_bytes += size
                 self.unread_program_bytes += size
                 self.latest_program[key] = size
-            for key, size in context["reads"]:
+            for key, size in context["read"]:
                 self.read_bytes += size
                 self.unread_program_bytes -= self.latest_program.pop(key, 0)
 

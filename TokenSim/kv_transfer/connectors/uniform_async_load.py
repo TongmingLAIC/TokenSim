@@ -5,13 +5,11 @@ from TokenSim.llm.llm_request import RequestStatus
 
 class UniformLoadMixin:
     def probe(self, req, local_plan):
-        if self.config.kv_role == "kv_producer":
+        if self.config.kv_role == "kv_producer" or not self.options.enable_lookup:
             return local_plan.hit_tokens, ()
         keys = self._keys_for_request(req)
         start = min(len(keys), local_plan.hit_tokens // self.block_size)
-        hit = self.service.store.lookup(
-            keys[start:], now=self.env.now, stats=self._probe_stats
-        )
+        hit = self.service.store.probe(keys[start:], now=self.env.now)
         selected = list(hit.keys)
         if self._aligned:
             limit = max(0, (req.prefill_len - 1) // self.block_size - start)
@@ -44,8 +42,10 @@ class UniformLoadMixin:
         nbytes = len(keys) * self.block_bytes
         control = getattr(req, "control_prefetch", False)
         store = self.service.store
+        ready = False
         try:
             wire = self.wire_latency(nbytes)
+            tiers = tuple(store.object_tier(key) for key in keys)
 
             def read():
                 return wire + store.get(
@@ -65,7 +65,10 @@ class UniformLoadMixin:
                     tags=dict(request_id=req.id, worker_id=self.worker.id),
                 )
             )
-            if not req.cancel_requested and self.manager.block_table.get_blocks(req.id):
+            restored = not req.cancel_requested and self.manager.block_table.get_blocks(
+                req.id
+            )
+            if restored:
                 target_keys = req.input_cache_keys[offset : offset + len(keys)]
                 self.manager.kv_cache_manager.register_blocks(blocks, target_keys)
                 if req.needs_recompute:
@@ -76,23 +79,40 @@ class UniformLoadMixin:
                     req.control_prefetch_callback(self.scheduler, req, blocks)
                 else:
                     self.scheduler.loaded_waiting.append(req)
-            if not control:
-                self.mooncake_stats.store_hit_count += 1
-                self.mooncake_stats.mooncake_disk_hit_tokens += (
-                    req.external_cached_context_tokens
-                )
+                    ready = True
+                if not control:
+                    from_disk = sum(
+                        min(
+                            self.block_size,
+                            max(
+                                0,
+                                req.external_cached_context_tokens
+                                - i * self.block_size,
+                            ),
+                        )
+                        for i, tier in enumerate(tiers)
+                        if tier != "memory"
+                    )
+                    store.record_lookup(
+                        store.offload.tier if from_disk else "memory",
+                        stats=self.mooncake_stats,
+                    )
+                    self.mooncake_stats.mooncake_disk_hit_tokens += from_disk
+                    self.mooncake_stats.mooncake_memory_hit_tokens += (
+                        req.external_cached_context_tokens - from_disk
+                    )
             self.record_transfer(
                 "load", len(keys), nbytes, self.env.now - issued, blocking=not control
             )
             self.observation.read(req, issued, self.env.now, prefetch=control)
         finally:
-            if control:
+            if not ready:
                 self.manager.release_request_blocks(req)
-                req.release_logical_blocks()
                 self.scheduler.loading.pop(req.id, None)
+                self.on_request_released(req)
+                if control:
+                    req.release_logical_blocks()
             self.state.unpin(keys)
             self.unpin_gpu(blocks)
             self.loads.pop(req.id, None)
-            if req.cancel_requested:
-                self.scheduler.loading.pop(req.id, None)
             self.notify()

@@ -1,8 +1,8 @@
 """Two finite stores with visibility and reference ownership per physical copy."""
 
-from TokenSim.kv_transfer.native_storage import NativePageStore
+from TokenSim.kv_transfer.storage.native import NativePageStore
 from TokenSim.config.validation import integer
-from TokenSim.kv_transfer.tiered_service import TierPage
+from TokenSim.kv_transfer.storage.tiered_service import TierPage
 
 
 class TieredStore:
@@ -74,6 +74,12 @@ class TieredStore:
 
     def finish_write(self, view):
         view.backing.finish_write(view.page)
+
+    def abort_write(self, view):
+        view.backing.abort_write(view.page)
+        if view.tier == 2:
+            self.payload_bytes.pop(view.key, None)
+            self.one_shot.discard(view.key)
 
     def acquire(self, view):
         view.backing.acquire(view.page)

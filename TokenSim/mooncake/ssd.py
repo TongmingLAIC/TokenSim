@@ -46,6 +46,12 @@ class OffloadTier:
         self._lru: OrderedDict[str, None] = OrderedDict()
         self._used_blocks = 0
         self._protected_until = {}
+        self.io_observers = []
+
+    def _observe(self, kind, key, operation):
+        for observer in self.io_observers:
+            observer(kind, key, operation)
+        return operation
 
     def contains(self, key: str) -> bool:
         return key in self._blocks
@@ -55,12 +61,13 @@ class OffloadTier:
         bytes_ = blocks * self.block_bytes
         if key in self._lru:
             self._lru.move_to_end(key)
-        return OffloadOperation(
+        operation = OffloadOperation(
             tier=self.tier,
             blocks=blocks,
             bytes=bytes_,
             latency=self._read_latency(bytes_),
         )
+        return self._observe("read", key, operation)
 
     def pin(self, key: str, until: float) -> None:
         self._protected_until[key] = max(self._protected_until.get(key, 0), until)
@@ -109,13 +116,14 @@ class OffloadTier:
         self._blocks[key] = blocks
         self._used_blocks += blocks
         self._lru[key] = None
-        return OffloadOperation(
+        operation = OffloadOperation(
             tier=self.tier,
             blocks=blocks,
             bytes=bytes_,
             latency=latency,
             evicted_keys=evicted,
         )
+        return self._observe("write", key, operation)
 
     @property
     def used_blocks(self) -> int:

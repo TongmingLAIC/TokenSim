@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Mapping
 
 from TokenSim.af.runtime.records import AFReplicaRuntime
 from TokenSim.af.runtime.plan import AFRuntimePlan
 from TokenSim.af.runtime.records import RankKey
 from TokenSim.block.block_manager import BlockManager
+from TokenSim.block.kv_cache_manager import PrefixReusePlan
 from TokenSim.block.replica_mapping import (
     LocalKVShard,
     LogicalKVBlockMapping,
@@ -86,10 +88,36 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
     ) -> "ReplicaKVBlockManager":
         return cls(block_size=plan.block_size, model=plan.model, replica=replica)
 
+    def _rank_reuse_plans(self, req: Request) -> dict[RankKey, PrefixReusePlan]:
+        plans = {
+            rank_key: manager.plan_reuse(req)
+            for rank_key, manager in self.rank_managers.items()
+        }
+        shared = 0
+        for shards in zip(*(plan.hit_blocks for plan in plans.values())):
+            # All shards of a logical hit must have matching reference counts.
+            if len({block.ref_count for block in shards}) != 1:
+                break
+            shared += 1
+        hit_tokens = shared * self.block_size
+        return {
+            rank_key: replace(
+                plan,
+                hit_blocks=plan.hit_blocks[:shared],
+                hit_tokens=hit_tokens,
+                effective_prefill_tokens=req.prefill_len - hit_tokens,
+            )
+            for rank_key, plan in plans.items()
+        }
+
+    def plan_reuse(self, req: Request) -> PrefixReusePlan:
+        return self._rank_reuse_plans(req)[self.leader_rank_key]
+
     def can_allocate(self, req: Request) -> bool:
         self._validate_request_owner(req, set_if_missing=False)
+        plans = self._rank_reuse_plans(req)
         return all(
-            manager.can_allocate(self._view(rank_key, req, create=False))
+            manager.can_allocate(req, plan=plans[rank_key])
             for rank_key, manager in self.rank_managers.items()
         )
 
@@ -107,8 +135,11 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
             rank_key: self._view(rank_key, req, create=True)
             for rank_key in self.rank_keys
         }
+        plans = self._rank_reuse_plans(req)
         if not all(
-            self.rank_managers[rank_key].can_allocate(views[rank_key])
+            self.rank_managers[rank_key].can_allocate(
+                views[rank_key], plan=plans[rank_key]
+            )
             for rank_key in self.rank_keys
         ):
             raise OutOfBlocksError(
@@ -119,7 +150,9 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
         completed: list[RankKey] = []
         try:
             for rank_key in self.rank_keys:
-                self.rank_managers[rank_key].allocate(views[rank_key])
+                self.rank_managers[rank_key].allocate(
+                    views[rank_key], plan=plans[rank_key]
+                )
                 completed.append(rank_key)
         except Exception:
             for rank_key in reversed(completed):
@@ -236,8 +269,10 @@ class ReplicaKVBlockManager(ReplicaMappingMixin):
 
     def commit_finished_cache(self, req: Request) -> None:
         views = self._require_views(req)
-        for rank_key in self.rank_keys:
-            self.rank_managers[rank_key].commit_finished_cache(views[rank_key])
+        for rank_key, view in views.items():
+            view.generation_idx = req.generation_idx
+            view.num_computed_tokens = req.num_computed_tokens
+            self.rank_managers[rank_key].commit_finished_cache(view)
 
     def free(self, req: Request) -> None:
         self.commit_finished_cache(req)

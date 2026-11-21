@@ -5,12 +5,11 @@ from __future__ import annotations
 from TokenSim.kv_transfer.connectors.base import flatten_connectors
 from TokenSim.config.simulation import SimulationConfig
 import logging
-import math
 import simpy
 from TokenSim.config.config import ClusterConfig, KVTransferConfig, ParallelConfig
 from TokenSim.config.workload_config import WorkloadConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
-from TokenSim.kv_transfer import ConnectorStats, KVConnectorMetadata, P2PConnector
+from TokenSim.kv_transfer import ConnectorStats
 from TokenSim.hardware import HardwareContext
 from TokenSim.hardware.placement import build_topology_placement
 from TokenSim.llm.llm_request import Request, RequestStatus
@@ -378,52 +377,6 @@ class LLMEngine(AFEngineMixin, Worker):
         if self.pd_handoff is not None:
             self.pd_handoff.dispatch(sender, requests)
             return
-        num_requests = len(requests)
-        num_per_worker = math.ceil(num_requests / len(self.decode_workers))
-        for i in range(0, num_requests, num_per_worker):
-            batch = requests[i : i + num_per_worker]
-            worker = self.decode_workers.select_transfer_target(batch)
-            manager = getattr(sender.scheduler, "block_manager", None)
-            request_block_counts = (
-                manager.get_request_block_counts(batch)
-                if manager is not None
-                else {
-                    req.id: math.ceil(req.num_computed_tokens / sender.block_size)
-                    for req in batch
-                }
-            )
-            num_blocks = sum(request_block_counts.values())
-            connector = sender.connector
-            uses_default_p2p = not hasattr(connector, "build_transfer_plan")
-            if uses_default_p2p:
-                connector = P2PConnector(sender.kv_transfer_config, sender.cache_config)
-            latency = (
-                sender.estimate_transfer_latency(worker.id, num_blocks)
-                if uses_default_p2p or connector.name == "P2PConnector"
-                else None
-            )
-            plan = connector.build_transfer_plan(
-                requests=batch,
-                source_worker_id=sender.id,
-                target_worker_id=worker.id,
-                kind="local" if sender is worker else "load",
-                latency=latency,
-                request_block_counts=request_block_counts,
-            )
-            sender_metadata = KVConnectorMetadata(
-                connector_name=connector.name,
-                saves=[plan],
-            )
-            receiver_metadata = KVConnectorMetadata(
-                connector_name=connector.name,
-                loads=[] if sender is worker else [plan],
-            )
-            sender.connector.bind_connector_metadata(sender_metadata)
-            sender.connector.wait_for_save()
-            for req in batch:
-                if manager is not None:
-                    manager.commit_finished_cache(req)
-                    manager.release_request_blocks(req)
-                sender.connector.on_request_released(req)
-                req.status = RequestStatus.WAITING_FOR_KV
-            self.send_task(worker, Task.ADD, batch, receiver_metadata)
+        from TokenSim.kv_transfer.transport.legacy import dispatch_legacy_handoff
+
+        dispatch_legacy_handoff(self, sender, requests)

@@ -7,6 +7,8 @@ import simpy
 
 from TokenSim.config.config import KVTransferConfig
 from TokenSim.config.simulation import SimulationConfig
+from TokenSim.errors import SimulationStateError
+from TokenSim.reporting.stats import get_connector_stats
 from TokenSim.kv_transfer.endpoint_fabric import EndpointFabric, fair_rates
 from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.llm.llm_request import Request
@@ -18,6 +20,7 @@ from tests.test_kv_transfer_integration import (
     _MODEL,
     _DEVICE,
     _workload_config,
+    _expected_transfer_latency,
 )
 
 
@@ -61,11 +64,11 @@ class EndpointFabricTest(unittest.TestCase):
         )
 
 
-def setup_transport(capacity=None, requests=None):
+def setup_transport(capacity=None, requests=None, *, transfer=None):
     env = simpy.Environment()
     cluster = _pd_cluster()
     cluster.kv_cache_capacity_tokens_per_dp_rank = capacity
-    transfer = KVTransferConfig(
+    transfer = transfer or KVTransferConfig(
         kv_connector="P2PConnector",
         kv_connector_extra_config={
             "pd_endpoint_limits": {
@@ -154,6 +157,78 @@ class PDTransportIntegrationTest(unittest.TestCase):
         for worker in engine.request_workers:
             manager = worker.scheduler.block_manager
             self.assertEqual(manager.get_num_allocated_blocks(), 0)
+
+    def test_failed_dma_releases_source_and_receiver_ownership(self):
+        env, engine, req = setup_transport()
+        handoff = engine.pd_handoff
+        original = handoff.fabric.transfer
+
+        def interrupted_peer(source, target, bytes_):
+            if target == 100:
+                yield env.timeout(0.02)
+                raise ValueError("injected DMA failure")
+            yield from original(source, target, bytes_)
+
+        handoff.fabric.transfer = interrupted_peer
+        payloads = handoff._payloads
+        handoff._payloads = lambda job: [*payloads(job), (100, 1)]
+        env.run()
+        with self.assertRaisesRegex(SimulationStateError, "injected DMA failure"):
+            engine.raise_if_failed()
+        self.assertFalse(req.owner_worker_ids)
+        self.assertEqual(handoff.events[-1]["kind"], "transfer_failed")
+        report = handoff.report()
+        self.assertEqual(report["network"]["active_flows"], 0)
+        self.assertEqual(report["network"]["completed"], [])
+        self.assertEqual(report["receiver_reserved_pages"], 0)
+        self.assertEqual(report["pinned_source_pages"], 0)
+        self.assertEqual(report["pending_requests"], 0)
+        for worker in engine.request_workers:
+            self.assertEqual(
+                worker.scheduler.block_manager.get_num_allocated_blocks(), 0
+            )
+
+    def test_storage_connectors_do_not_absorb_legacy_pd_transfer(self):
+        baseline, _, prior = setup_transport(
+            transfer=KVTransferConfig(kv_connector="P2PConnector")
+        )
+        baseline.run()
+        store = {
+            "kv_connector": "MooncakeStoreConnector",
+            "kv_connector_extra_config": {
+                "mode": "embedded",
+                "memory_capacity_blocks": 8,
+                "local_buffer_size": 4096,
+            },
+        }
+        for settings in (
+            store,
+            {
+                **store,
+                "kv_connector": "UniformAsyncStore",
+            },
+            {
+                "kv_connector": "MultiConnector",
+                "kv_connector_extra_config": {"connectors": [store]},
+            },
+        ):
+            with self.subTest(connector=settings["kv_connector"]):
+                env, engine, req = setup_transport(
+                    transfer=KVTransferConfig.from_mapping(settings)
+                )
+                env.run()
+                engine.raise_if_failed()
+                self.assertTrue(req.is_done)
+                self.assertAlmostEqual(req.total_time, prior.total_time)
+                stats = get_connector_stats(engine)
+                byte_count = (
+                    32 * engine.decode_workers.workers[0].cache_config.size_per_token
+                )
+                self.assertEqual(stats["connector_transfer_bytes"], byte_count * 2)
+                self.assertAlmostEqual(
+                    stats["connector_load_wait_time"],
+                    _expected_transfer_latency(byte_count),
+                )
 
     def test_cancel_waits_for_dma_and_never_admits_decode(self):
         env, engine, req = setup_transport()

@@ -3,7 +3,16 @@
 from TokenSim.llm.llm_request import RequestStatus
 
 
+def has_handoff_prefix(req):
+    return (
+        req.status is RequestStatus.WAITING_FOR_KV
+        and not req.is_prefill
+        and not req.needs_recompute
+    )
+
+
 def admit_async(scheduler, req, local_plan, external):
+    transferred = req.num_computed_tokens if has_handoff_prefix(req) else None
     manager = scheduler.block_manager
     manager.allocate(req)
     local = local_plan.hit_tokens
@@ -20,7 +29,7 @@ def admit_async(scheduler, req, local_plan, external):
         return
     if req.needs_recompute:
         req.recompute_tokens = max(0, req.context_len - local)
-    req.start_context_build(local)
+    req.start_context_build(local if transferred is None else transferred)
     req.record_context_admission(local, 0)
     req.status = RequestStatus.RUNNING
 

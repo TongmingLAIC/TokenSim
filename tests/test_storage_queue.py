@@ -3,8 +3,8 @@
 import unittest
 import simpy
 
-from TokenSim.kv_transfer.online_storage_config import OnlineStoragePolicy
-from TokenSim.kv_transfer.storage_queue import StorageQueue
+from TokenSim.kv_transfer.storage.online_config import OnlineStoragePolicy
+from TokenSim.kv_transfer.storage.queue import StorageQueue
 
 
 class StorageQueueTest(unittest.TestCase):

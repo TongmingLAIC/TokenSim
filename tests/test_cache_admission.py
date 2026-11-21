@@ -8,8 +8,9 @@ from TokenSim.config.cache_config import CacheConfig
 from TokenSim.config.parallel_config import ParallelConfig
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import HardwareContext
-from TokenSim.kv_transfer.cache_control import NativeCacheController
-from TokenSim.kv_transfer.quota import should_defer
+from TokenSim.config.cache_policy import PRESETS
+from TokenSim.kv_transfer.policies.native import NativeCacheController
+from TokenSim.kv_transfer.policies.quota import should_defer
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,7 +44,7 @@ class ByteBudgetTest(unittest.TestCase):
 
     def test_decode_growth_does_not_reserve_the_global_prefill_envelope(self):
         from types import SimpleNamespace as NS
-        from TokenSim.kv_transfer.quota import maximum_slots
+        from TokenSim.kv_transfer.policies.quota import maximum_slots
 
         cache = self.cache(kv_cache_memory_bytes=10 * (1 << 30))
         layout = cache.hybrid_layout
@@ -123,7 +124,7 @@ class CacheQuotaTest(unittest.TestCase):
         )
 
     def test_play_identity_groups_parent_and_child_without_salt(self):
-        from TokenSim.kv_transfer.quota import session_id
+        from TokenSim.kv_transfer.policies.quota import session_id
 
         parent, child = self.request(0), self.request(1)
         for req in (parent, child):
@@ -181,7 +182,7 @@ class CacheQuotaTest(unittest.TestCase):
             hit_tokens=64 if req is hot else 0, hit_blocks=[]
         )
         controller = NS(
-            quota_enabled=True,
+            preset=PRESETS["quota"],
             env=NS(now=0),
             engine=NS(
                 config=NS(cache_quota_fraction=0.45, cache_quota_max_wait_seconds=15)
@@ -202,7 +203,7 @@ class CacheQuotaTest(unittest.TestCase):
             hit_tokens=0, hit_blocks=[]
         )
         controller = NS(
-            quota_enabled=True,
+            preset=PRESETS["quota"],
             env=NS(now=1),
             engine=NS(
                 config=NS(cache_quota_fraction=1, cache_quota_max_wait_seconds=15)

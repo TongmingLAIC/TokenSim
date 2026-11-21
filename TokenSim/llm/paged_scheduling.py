@@ -7,7 +7,7 @@ from collections import deque
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.llm.llm_request import Request, RequestStatus
-from TokenSim.llm.async_admission import resume_uniform
+from TokenSim.llm.async_admission import has_handoff_prefix, resume_uniform
 
 
 @dataclass
@@ -184,14 +184,18 @@ class PagedSchedulingMixin:
             return False
         grouped = self.block_manager.grouped_cache
         external = local_plan = None
-        if self.connector.async_offload:
-            local_plan = self.block_manager.kv_cache_manager.plan_reuse(req)
+        transferred = has_handoff_prefix(req)
+        if self.connector.async_offload and not transferred:
+            local_plan = self.block_manager.plan_reuse(req)
             external = self.connector.probe(req, local_plan)
         if self.defer_prefills:
-            plan = self.block_manager.kv_cache_manager.plan_reuse(req)
+            plan = self.block_manager.plan_reuse(req)
             # A full hit that needs only its last token may still run
             # on a deferred step (scheduler.py waiting gate).
-            hit_tokens = external[0] if external else plan.hit_tokens
+            if transferred:
+                hit_tokens = req.num_computed_tokens
+            else:
+                hit_tokens = external[0] if external else plan.hit_tokens
             if req.context_len - hit_tokens > 1:
                 self.stats["deferred_waiting_prefills"] += 1
                 return False
