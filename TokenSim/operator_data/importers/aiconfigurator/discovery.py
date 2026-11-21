@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+
+from packaging.version import InvalidVersion, Version
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware.device import normalize_dtype
 
@@ -93,10 +95,10 @@ def _has_table(directory: Path, filename: str) -> bool:
 
 
 def _version_key(path: Path) -> tuple:
-    parts = []
-    for piece in path.name.replace("rc", ".").replace("post", ".").split("."):
-        parts.append((0, int(piece)) if piece.isdigit() else (1, piece))
-    return tuple(parts)
+    try:
+        return True, Version(path.name), path.name
+    except InvalidVersion:
+        return False, path.name, ""
 
 
 def _latest_version(

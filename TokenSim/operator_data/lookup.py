@@ -8,13 +8,11 @@ from typing import Callable
 
 from TokenSim.config.validation import boolean, number
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware.device import normalize_dtype
 from TokenSim.operator_data.package import OperatorDataPackage
 from TokenSim.operator_data.schema import (
     TABLE_SPECS,
     AxisSpec,
     TableSpec,
-    normalize_table_key_value,
 )
 
 MATCH_TYPES = ("exact", "interpolated", "extrapolated")
@@ -55,6 +53,20 @@ class MissingOperatorDataError(LookupError):
         self.reason = reason
         self.kind = kind
         super().__init__(f"{table_name} lookup failed for key={self.key}: {reason}")
+
+
+def normalize_query_key(table: str, key: Mapping[str, Any]) -> dict[str, Any]:
+    if table not in TABLE_SPECS:
+        raise MissingOperatorDataError(
+            table, key, "unknown table", kind="unknown_table"
+        )
+    spec = TABLE_SPECS[table]
+    try:
+        return spec.normalize_key(key)
+    except ValueError as exc:
+        raise MissingOperatorDataError(
+            spec.name, key, str(exc), kind="malformed_key"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -166,12 +178,8 @@ class OperatorLookup:
         scaler: AnalyticalScaler | None = None,
     ) -> LookupResult:
         """Resolve ``key``; ``scaler`` overrides the instance-level analytical scaler."""
-        if table_name not in TABLE_SPECS:
-            raise MissingOperatorDataError(
-                table_name, key, "unknown table", kind="unknown_table"
-            )
+        normalized = normalize_query_key(table_name, key)
         spec = TABLE_SPECS[table_name]
-        normalized = self._normalize_key(spec, key)
         exact = self._exact.get(table_name)
         if not exact:
             raise MissingOperatorDataError(
@@ -233,7 +241,7 @@ class OperatorLookup:
     ) -> list[Any]:
         """Measured values of ``axis`` for the discrete part of ``key`` (diagnostics)."""
         spec = TABLE_SPECS[table_name]
-        normalized = self._normalize_key(spec, {**key, axis: key.get(axis, 0)})
+        normalized = normalize_query_key(table_name, {**key, axis: key.get(axis, 0)})
         discrete = tuple(normalized[f] for f in spec.discrete_fields)
         values: set[Any] = set()
         for row in self.package.tables.get(table_name, ()):
@@ -242,29 +250,6 @@ class OperatorLookup:
         return sorted(values)
 
     # -- internals ---------------------------------------------------------
-
-    @staticmethod
-    def _normalize_key(spec: TableSpec, key: Mapping[str, Any]) -> dict[str, Any]:
-        missing = [f for f in spec.key_fields if f not in key]
-        if missing:
-            raise MissingOperatorDataError(
-                spec.name, key, f"key is missing fields {missing}", kind="malformed_key"
-            )
-        normalized: dict[str, Any] = {}
-        for f in spec.key_fields:
-            value = key[f]
-            if f in spec.dtype_fields:
-                value = normalize_dtype(str(value))
-            elif isinstance(value, str):
-                value = value.strip().lower()
-            elif isinstance(value, float) and value.is_integer():
-                value = int(value)
-            try:
-                value = normalize_table_key_value(spec.name, f, value)
-            except ValueError as exc:
-                raise MissingOperatorDataError(spec.name, key, str(exc)) from exc
-            normalized[f] = value
-        return normalized
 
     def _describe_discrete(
         self, table_name: str, spec: TableSpec

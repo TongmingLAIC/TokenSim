@@ -4,7 +4,7 @@
 # multi-node groups and NIC fabrics.
 #
 #   DEVICE=a100_sxm_80g NCCL_TESTS=/opt/nccl-tests/build ./scripts/collect/run_nccl_tests.sh 8 1
-#   DEVICE=a100_sxm_80g NODES=2 LAUNCHER="mpirun -np 16 -H nodeA:8,nodeB:8" ./scripts/collect/run_nccl_tests.sh 8 2
+#   DEVICE=a100_sxm_80g LAUNCHER="mpirun -np 16 -H nodeA:8,nodeB:8" ./scripts/collect/run_nccl_tests.sh 8 2
 #
 # Arguments: <gpus per node> <nodes>. For a single node the binaries are run
 # with -g <gpus>; for several nodes set LAUNCHER to the mpirun/srun command that
@@ -20,6 +20,14 @@ OUT=${OUT:-./tmp/nccl/${DEVICE}}
 PACKAGE=${PACKAGE:-./data/operator_data/${DEVICE}/${BACKEND}}
 DTYPE=${DTYPE:-half}
 LAUNCHER=${LAUNCHER:-}
+if [[ ! $GPUS =~ ^[1-9][0-9]*$ || ! $NODES =~ ^[1-9][0-9]*$ ]]; then
+  echo "GPU count and node count must be positive integers." >&2
+  exit 2
+fi
+if (( NODES > 1 )) && [[ -z ${LAUNCHER//[[:space:]]/} ]]; then
+  echo "Multi-node nccl-tests collection requires LAUNCHER (one process per GPU)." >&2
+  exit 2
+fi
 mkdir -p "$OUT"
 GROUP=$((GPUS * NODES))
 for pair in all_reduce_perf:all_reduce all_gather_perf:all_gather reduce_scatter_perf:reduce_scatter alltoall_perf:all_to_all; do

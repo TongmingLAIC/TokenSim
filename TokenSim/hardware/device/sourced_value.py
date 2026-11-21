@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware._yaml import positive_number, require
+from TokenSim.hardware._yaml import finite_number, require
 
 # Evidence grades — see hardware/README.md for definitions.
 #   A = official spec or first-party measurement
@@ -27,7 +27,7 @@ class SourcedValue:
     @classmethod
     def parse(cls, raw: Any, field_name: str, context: str) -> "SourcedValue":
         if isinstance(raw, Mapping):
-            value = positive_number(require(raw, "value", context), field_name, context)
+            value = finite_number(require(raw, "value", context), field_name, context)
             source_id = str(require(raw, "source_id", context))
             grade = str(raw.get("grade", "A")).upper()
         else:
@@ -48,16 +48,9 @@ class SourcedValue:
         if raw is None:
             return cls(value=0.0, source_id=default_source, grade="D")
         if isinstance(raw, Mapping):
-            try:
-                value = float(require(raw, "value", context))
-            except (TypeError, ValueError) as exc:
-                raise ConfigurationError(
-                    f"{context}: {field_name} must be numeric"
-                ) from exc
-            if value < 0:
-                raise ConfigurationError(
-                    f"{context}: {field_name} must be non-negative"
-                )
+            value = finite_number(
+                require(raw, "value", context), field_name, context, allow_zero=True
+            )
             grade = str(raw.get("grade", "D")).upper()
             if grade not in EVIDENCE_GRADES:
                 raise ConfigurationError(

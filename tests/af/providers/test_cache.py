@@ -256,13 +256,13 @@ class CacheFastPathTest(unittest.TestCase):
         provider = OperatorTableAFComputeProvider(hardware, hardware.model("TestModel"))
         query = _compute_query()
         initial = provider.estimate(self.prepared(provider, query))
-        first.tables["gemm"][0]["latency_us"] = 999.0
+        with self.assertRaises(TypeError):
+            first.tables["gemm"][0]["latency_us"] = 999.0
         hardware.register_package(package("v2", 456.0))
         provider._estimate_cache.clear()
         self.assertEqual(provider.estimate(self.prepared(provider, query)), initial)
         pinned = provider.resolver_for("a-device").package
-        with self.assertRaises(TypeError):
-            pinned.tables["gemm"][0]["latency_us"] = 999.0
+        self.assertIs(pinned.lookup_index, first.lookup_index)
         updated = OperatorTableAFComputeProvider(hardware, hardware.model("TestModel"))
         estimate = updated.estimate(self.prepared(updated, query))
         self.assertEqual(estimate.dataset_version, "v2")

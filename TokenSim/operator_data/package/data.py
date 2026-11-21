@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from TokenSim.utils import BoundedCache
 from TokenSim.hardware._yaml import load_yaml_mapping
-from TokenSim.hardware.device import normalize_dtype
-from TokenSim.operator_data.schema import INTEGER_FIELDS, TABLE_SPECS, TableSpec
+from TokenSim.operator_data.schema import TABLE_SPECS, TableSpec
+from .immutable import FrozenMapping, freeze
 from .metadata import META_FILENAME, PackageMeta, OperatorDataValidationError
 from .tables import validate_rows, _read_table, _write_table
 
@@ -40,7 +40,7 @@ class TableIndex:
             for axis in spec.axes[:-1]:
                 node = node.setdefault(row[axis.name], {})
             node[row[spec.axes[-1].name]] = row
-        return cls(exact=exact, grids=grids)
+        return cls(exact=FrozenMapping(exact), grids=freeze(grids))
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,10 @@ class OperatorDataPackage:
     tables: Mapping[str, tuple[Mapping[str, Any], ...]]
     analysis: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
 
+    def __post_init__(self):
+        object.__setattr__(self, "tables", freeze(self.tables))
+        object.__setattr__(self, "analysis", freeze(self.analysis))
+
     @cached_property
     def lookup_index(self) -> Mapping[str, TableIndex]:
         """Per-table lookup index, built once and shared by every ``OperatorLookup``.
@@ -58,10 +62,12 @@ class OperatorDataPackage:
         creates two lookups per worker, so the index must not be rebuilt per
         consumer. The package is immutable, so sharing is safe.
         """
-        return {
-            name: TableIndex.build(TABLE_SPECS[name], rows)
-            for name, rows in self.tables.items()
-        }
+        return FrozenMapping(
+            {
+                name: TableIndex.build(TABLE_SPECS[name], rows)
+                for name, rows in self.tables.items()
+            }
+        )
 
     @property
     def dataset_version(self) -> str:
@@ -81,17 +87,16 @@ class OperatorDataPackage:
 
     def describe_sources(self, table: str, key: Mapping[str, Any] | None = None):
         spec = TABLE_SPECS[table]
-        selection = {
-            name: (
-                normalize_dtype(str(value))
-                if name in spec.dtype_fields
-                else value if name in INTEGER_FIELDS else str(value).strip().lower()
-            )
-            for name, value in (key or {}).items()
-        }
+        try:
+            selection = {
+                name: spec.normalize_key_field(name, value)
+                for name, value in (key or {}).items()
+            }
+        except ValueError as exc:
+            raise OperatorDataValidationError(f"{table}: {exc}") from exc
         identity = table, tuple(sorted(selection.items()))
         if identity in self._source_descriptions:
-            return self._source_descriptions[identity]
+            return [dict(record) for record in self._source_descriptions[identity]]
         source_ids = {
             row["source_id"]
             for row in self.tables.get(table, ())
@@ -105,7 +110,7 @@ class OperatorDataPackage:
             )
             for source_id in sorted(source_ids)
         ]
-        self._source_descriptions[identity] = records
+        self._source_descriptions[identity] = freeze(records)
         return records
 
     # -- loading -----------------------------------------------------------

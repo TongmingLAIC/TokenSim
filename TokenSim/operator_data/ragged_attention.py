@@ -2,7 +2,7 @@
 
 import json
 
-from TokenSim.operator_data.schema import canonical_histogram
+from TokenSim.operator_data.key_normalization import canonical_histogram
 from TokenSim.operator_data.workload import OperatorWork, generation_attention_work
 
 

@@ -38,7 +38,7 @@ def _mla_rows():
     )
     return [
         {**base, "batch_size": 1, "latency_us": 10.0, "source_id": SOURCE.source_id},
-        {**base, "batch_size": 2, "latency_us": 18.0, "source_id": SOURCE.source_id},
+        {**base, "batch_size": 3, "latency_us": 18.0, "source_id": SOURCE.source_id},
     ]
 
 
@@ -56,7 +56,7 @@ class OperatorTableAdapterTest(unittest.TestCase):
         )
         self.assertEqual(exact.match_type, "exact")
         self.assertEqual(exact.source_id, SOURCE.source_id)
-        mid = lookup.lookup("mla_attention", {**_mla_rows()[0], "batch_size": 1.5})
+        mid = lookup.lookup("mla_attention", {**_mla_rows()[0], "batch_size": 2})
         self.assertEqual(mid.match_type, "interpolated")
         with self.assertRaises(MissingOperatorDataError):
             lookup.lookup("mla_attention", {**_mla_rows()[0], "batch_size": 4})

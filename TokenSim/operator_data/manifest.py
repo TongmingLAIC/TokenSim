@@ -89,7 +89,10 @@ class ShapeManifest:
         if table not in TABLE_SPECS:
             raise ConfigurationError(f"unknown table {table!r}")
         spec = TABLE_SPECS[table]
-        clean = {f: key[f] for f in spec.key_fields}
+        try:
+            clean = spec.normalize_key(key)
+        except ValueError as exc:
+            raise ConfigurationError(f"{table}: {exc}") from exc
         identity = tuple(clean[f] for f in spec.key_fields)
         table_roles = self.roles.setdefault(table, {})
         if identity not in table_roles:

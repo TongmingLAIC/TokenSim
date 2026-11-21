@@ -132,6 +132,41 @@ class OperatorTableComputeProviderTest(unittest.TestCase):
         )
         self.assertEqual(moe["key"]["inter_size"], 32)
 
+    def test_moe_expert_reports_selected_measured_distribution(self):
+        source = SourceRecord("measured:balanced", "A", "measured")
+        meta = PackageMeta(
+            "test-moe", "f-device", "vllm", sources={source.source_id: source}
+        )
+        package = OperatorDataPackage.from_rows(
+            meta,
+            {
+                "moe": [
+                    dict(
+                        dtype="fp16",
+                        distribution="balanced",
+                        num_tokens=6,
+                        hidden_size=HIDDEN,
+                        inter_size=32,
+                        top_k=2,
+                        num_experts=4,
+                        tp_size=1,
+                        ep_size=2,
+                        latency_us=12.0,
+                        source_id=source.source_id,
+                    )
+                ]
+            },
+        )
+        self.hardware.register_package(package)
+        result = self.provider.estimate(
+            _compute_query(
+                "expert", tokens=6, ep_size=2, expert_workload=((0, 4), (1, 2))
+            )
+        )
+        component = result.details["components"][0]
+        self.assertEqual(component["key"]["distribution"], "balanced")
+        self.assertEqual(component["source_id"], source.source_id)
+
     def test_dense_model_prices_ffn_gemms_on_the_f_rank(self):
         hardware = af_test_hardware()
         provider = OperatorTableAFComputeProvider(hardware, hardware.model("TestModel"))

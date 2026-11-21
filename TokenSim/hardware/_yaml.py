@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,11 +32,15 @@ def require(mapping: Mapping[str, Any], field: str, context: str) -> Any:
     return mapping[field]
 
 
-def positive_number(value: Any, field: str, context: str) -> float:
+def finite_number(value: Any, field: str, context: str, *, allow_zero=False) -> float:
+    minimum = "non-negative" if allow_zero else "positive"
+    error = f"{context}: {field} must be finite and {minimum}, got {value!r}"
+    if isinstance(value, bool):
+        raise ConfigurationError(error)
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"{context}: {field} must be numeric") from exc
-    if not number > 0:
-        raise ConfigurationError(f"{context}: {field} must be positive, got {value!r}")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigurationError(error) from exc
+    if not math.isfinite(number) or number < 0 or (not allow_zero and number == 0):
+        raise ConfigurationError(error)
     return number

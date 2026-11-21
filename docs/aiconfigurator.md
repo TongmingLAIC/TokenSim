@@ -42,6 +42,7 @@ The B200 and B300 vLLM MegaMoE sources above are the only non-default options.
 SGLang's DeepEP measurements for expert-parallel groups spanning multiple nodes record the node count.
 To obtain the expert-parallel group size, the importer multiplies that count by `num_gpus_per_node` from the upstream `systems/<system>.yaml`, using 4 for GB200 and GB300 and 8 elsewhere.
 Pass `--gpus-per-node` for a collector run directory, which has no such file.
+Set `GPUS_PER_NODE` to pass that value through `scripts/collect/run_aiconfigurator.sh`.
 
 The importer handles matrix multiplication (GEMM), attention, mixture-of-experts (MoE) operations, group communication (collectives) and DeepEP token transfers.
 It also imports tables that time complete sparse-attention, residual-mixing and fused expert modules.
@@ -61,7 +62,9 @@ A directory from your own profiling run can also be imported with `--system-dir`
 Its source records identify that local collection.
 
 Writing a package replaces its recognized tables and removes stale table files.
-Use `merge_packages` before writing when updating only a subset.
+Use `merge_packages` before writing when updating only a subset for the same device and backend.
+Assign distinct source IDs to measurements with different provenance.
+When observations share a shape, the preferred package supplies the latency row and its associated analysis.
 Loading rejects undeclared performance tables as well as missing or truncated ones.
 
 ## Consume data and select a cost scope

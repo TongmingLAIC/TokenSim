@@ -9,6 +9,7 @@ Example line (out-of-place columns first)::
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,12 @@ _OPERATION_FROM_BINARY = {
 }
 
 
+_DEVICE_ROW = re.compile(
+    r"^#\s*Rank\s+(\d+)(?:\s+Group\s+(-?\d+))?\s+Pid\s+\d+"
+    r"\s+on\s+(\S+)\s+device\s+\d+\b"
+)
+
+
 def parse_nccl_tests_output(
     text_or_path: str | Path,
     *,
@@ -64,22 +71,56 @@ def parse_nccl_tests_output(
         else str(text_or_path)
     )
     rows: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    groups: dict[str | None, dict[int, str]] = {}
+    selection = 1 if use_in_place else 0
+    mode = "in-place" if use_in_place else "out-of-place"
+    time_columns, wrong_columns = (5, 9), (8, 12)
+    for line_number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
             continue
-        parts = re.split(r"\s+", stripped)
-        if len(parts) < 9 or not parts[0].isdigit():
+        if stripped.startswith("#"):
+            device = _DEVICE_ROW.match(stripped)
+            if device:
+                rank, group, host = device.groups()
+                hosts = groups.setdefault(group, {})
+                if hosts.setdefault(int(rank), host) != host:
+                    raise ConfigurationError(
+                        "nccl-tests rank reported on multiple hosts"
+                    )
+            columns = stripped[1:].lower().split()
+            if columns[:3] == ["size", "count", "type"]:
+                time_columns = tuple(
+                    i for i, name in enumerate(columns) if name == "time"
+                )
+                wrong_columns = tuple(
+                    i for i, name in enumerate(columns) if name == "#wrong"
+                )
+            continue
+        parts = stripped.split()
+        if len(parts) < 3 or not all(value.isdigit() for value in parts[:2]):
             continue
         size_bytes = int(parts[0])
         dtype = _TYPE_MAP.get(parts[2].lower())
         if dtype is None:
             continue
-        # columns: size count type redop root time algbw busbw wrong [time algbw busbw wrong]
+        where = f"nccl-tests line {line_number} ({mode})"
         try:
-            time_us = float(parts[9] if use_in_place and len(parts) >= 13 else parts[5])
-        except ValueError:
-            continue
+            time = parts[time_columns[selection]]
+            wrong = parts[wrong_columns[selection]]
+        except IndexError as exc:
+            raise ConfigurationError(f"{where}: missing time or #wrong column") from exc
+        try:
+            time_us = float(time)
+            wrong_elements = float(wrong)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"{where}: expected numeric time and #wrong, got {time!r} and {wrong!r}"
+            ) from exc
+        if wrong_elements != 0:
+            raise ConfigurationError(f"{where}: expected #wrong=0, got {wrong}")
+        if not math.isfinite(time_us) or time_us < 0:
+            raise ConfigurationError(f"{where}: time must be finite and nonnegative")
         rows.append(
             {
                 "dtype": dtype,
@@ -92,6 +133,14 @@ def parse_nccl_tests_output(
                 "kernel": "nccl-tests",
             }
         )
+    for group, hosts in groups.items():
+        observed_ranks, observed_nodes = len(hosts), len(set(hosts.values()))
+        if (observed_ranks, observed_nodes) != (group_size, nodes):
+            label = f" group {group}" if group is not None else ""
+            raise ConfigurationError(
+                f"nccl-tests{label} reports {observed_ranks} ranks on {observed_nodes} nodes; "
+                f"expected {group_size} ranks on {nodes} nodes"
+            )
     if not rows:
         raise ConfigurationError("no nccl-tests result rows found in input")
     return rows

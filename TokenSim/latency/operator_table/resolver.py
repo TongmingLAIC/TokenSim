@@ -1,4 +1,4 @@
-"""Primitive operator resolution shared by AF compute providers."""
+"""Primitive operator resolution for ordinary and AF serving."""
 
 from typing import Any, Iterable, Mapping
 from TokenSim.errors import ConfigurationError
@@ -10,14 +10,15 @@ from TokenSim.operator_data.lookup import (
     LookupPolicy,
     MissingOperatorDataError,
     OperatorLookup,
+    normalize_query_key,
 )
 from TokenSim.operator_data.package import OperatorDataPackage
-from TokenSim.operator_data.schema import TABLE_SPECS, normalize_table_key_value
+from TokenSim.utils import BoundedCache
 from .stats import OperatorStats, OperatorEstimate
 
 
 class OperatorResolver:
-    """Answer AF primitive queries with operator-table provenance and fallback."""
+    """Resolve an operator shape and record its estimate and provenance."""
 
     _CACHE_LIMIT = 262144
 
@@ -56,7 +57,7 @@ class OperatorResolver:
             else None
         )
         self.stats = OperatorStats(missing=missing_report or MissingShapeReport())
-        self._cache: dict[tuple, OperatorEstimate] = {}
+        self._cache = BoundedCache(self._CACHE_LIMIT)
         self._calibrations = {
             table: Calibration.from_mapping(values)
             for table, values in (
@@ -73,75 +74,60 @@ class OperatorResolver:
         return self.package.backend if self.package else "analytical"
 
     def query(self, table: str, key: Mapping[str, Any]) -> OperatorEstimate:
-        if table not in TABLE_SPECS:
-            raise MissingOperatorDataError(table, key, "unknown table")
-        normalized_key = dict(key)
-        for field in TABLE_SPECS[table].key_fields:
-            if field in normalized_key:
-                normalized_key[field] = normalize_table_key_value(
-                    table, field, normalized_key[field]
-                )
+        normalized_key = {**key, **normalize_query_key(table, key)}
         identity = (table, tuple(sorted(normalized_key.items())))
-        cached = self._cache.get(identity)
-        if cached is not None:
-            self.stats.record(table, cached.match_type)
-            return cached
-        estimate: OperatorEstimate | None = None
-        if self.lookup is not None and self.fallback != "analytical_only":
-            try:
-                result = self.lookup.lookup(table, normalized_key)
-                estimate = OperatorEstimate(
-                    result.latency_us, result.match_type, result.source_id
-                )
-            except MissingOperatorDataError as exc:
-                if self.fallback == "table_only":
-                    raise
-                self.stats.record_missing(exc)
-        if estimate is None and self.fallback == "table_only":
-            raise MissingOperatorDataError(
-                table, normalized_key, "no operator package for strict table lookup"
-            )
-        if estimate is None:
-            estimate = self.analytical_estimate(table, normalized_key, gated=self.gated)
-        self._remember(identity, estimate)
-        self.stats.record(table, estimate.match_type)
-        return estimate
+        return self._resolve(table, (normalized_key,), identity)
 
     def query_moe(
         self, base_key: Mapping[str, Any], distributions: Iterable[str]
     ) -> OperatorEstimate:
-        """Look up a MoE row trying each routing ``distribution`` label in turn."""
-        distributions = tuple(distributions) or ("uniform",)
-        last_error: MissingOperatorDataError | None = None
-        if self.lookup is not None and self.fallback != "analytical_only":
-            for distribution in distributions:
-                key = {**base_key, "distribution": distribution}
-                cached = self._cache.get(("moe", tuple(sorted(key.items()))))
-                if cached is not None:
-                    self.stats.record("moe", cached.match_type)
-                    return cached
-                try:
-                    result = self.lookup.lookup("moe", key)
-                except MissingOperatorDataError as exc:
-                    last_error = exc
-                    continue
-                estimate = OperatorEstimate(
-                    result.latency_us, result.match_type, result.source_id
-                )
-                self._remember(("moe", tuple(sorted(key.items()))), estimate)
-                self.stats.record("moe", estimate.match_type)
-                return estimate
-        key = {**base_key, "distribution": distributions[0]}
-        if last_error is None:
-            last_error = MissingOperatorDataError(
-                "moe", key, "no moe table", kind="table_absent"
-            )
-        if self.fallback == "table_only":
-            raise last_error
-        self.stats.record_missing(last_error)
-        estimate = self.analytical_estimate("moe", key, gated=self.gated)
-        self.stats.record("moe", estimate.match_type)
+        """Try the requested MoE routing distributions in order."""
+        labels = tuple(distributions) or ("uniform",)
+        keys = []
+        for label in labels:
+            key = {**base_key, "distribution": label}
+            keys.append({**key, **normalize_query_key("moe", key)})
+        identity = (
+            "moe-distributions",
+            tuple(tuple(sorted(key.items())) for key in keys),
+        )
+        return self._resolve("moe", keys, identity)
+
+    def _resolve(self, table, keys, identity):
+        estimate = self._cache.get(identity)
+        if estimate is None:
+            if self.fallback != "analytical_only":
+                estimate = self._measured(table, keys)
+            if estimate is None:
+                estimate = self.analytical_estimate(table, keys[0], gated=self.gated)
+            self._cache[identity] = estimate
+        self.stats.record(table, estimate.match_type)
         return estimate
+
+    def _measured(self, table, keys):
+        if self.lookup is None:
+            error = MissingOperatorDataError(
+                table, keys[0], "no operator package for this device", "table_absent"
+            )
+        else:
+            for key in keys:
+                try:
+                    result = self.lookup.lookup(table, key)
+                except MissingOperatorDataError as exc:
+                    error = exc
+                    continue
+                return OperatorEstimate(
+                    result.latency_us,
+                    result.match_type,
+                    result.source_id,
+                    workload_distribution=(
+                        key.get("distribution") if table == "moe" else None
+                    ),
+                )
+        if self.fallback == "table_only":
+            raise error
+        self.stats.record_missing(error)
+        return None
 
     def analytical_estimate(
         self, table: str, key: Mapping[str, Any], **context: Any
@@ -162,8 +148,3 @@ class OperatorResolver:
             ).latency_us
         except Exception:
             return None
-
-    def _remember(self, identity: tuple, estimate: OperatorEstimate) -> None:
-        if len(self._cache) >= self._CACHE_LIMIT:
-            self._cache.clear()
-        self._cache[identity] = estimate

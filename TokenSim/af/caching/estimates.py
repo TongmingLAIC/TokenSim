@@ -448,7 +448,5 @@ class HardwareSnapshot(ConfigurationOwner):
     def operator_package(self, device_id, backend=None):
         key = (device_id, backend)
         if key not in self._packages:
-            self._packages[key] = snapshot(
-                self._source.operator_package(device_id, backend)
-            )
+            self._packages[key] = self._source.operator_package(device_id, backend)
         return self._packages[key]

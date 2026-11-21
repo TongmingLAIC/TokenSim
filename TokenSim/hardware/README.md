@@ -10,7 +10,7 @@ Every numeric field carries a `source_id` and evidence grade so that official sp
 ```
 hardware/
   __init__.py       lazy re-exports; HardwareContext loaded on first access
-  _yaml.py          YAML loading helpers (require, positive_number)
+  _yaml.py          YAML loading helpers (require, finite_number)
   context.py        HardwareContext — bundles all catalogs + lazy operator packages
   links.py          LinkClass / LinkCatalog — interconnect link types
   topology.py       TopologyLevel / TopologySpec / TopologyPlacement / TopologyCatalog

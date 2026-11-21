@@ -39,8 +39,8 @@ class HardwareContext:
     # -- construction -------------------------------------------------------
 
     @classmethod
-    def load(cls, root: str | Path = DEFAULT_DATA_ROOT) -> "HardwareContext":
-        root_path = Path(root)
+    def load(cls, root: str | Path | None = None) -> "HardwareContext":
+        root_path = Path(root) if root is not None else default_data_root()
         devices = DeviceCatalog.load(root_path / "devices")
         links = LinkCatalog.load(root_path / "topologies" / "links.yaml")
         topologies = TopologyCatalog.load(root_path / "topologies")

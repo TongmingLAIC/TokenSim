@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from TokenSim.hardware.context import DEFAULT_DATA_ROOT
+from TokenSim.config.paths import default_data_root
 from .operations import (
     cmd_manifest,
     cmd_generate,
@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-root",
-        default=str(DEFAULT_DATA_ROOT),
+        default=str(default_data_root()),
         dest="data_root",
         help="directory holding devices/, topologies/, models/ and operator_data/",
     )

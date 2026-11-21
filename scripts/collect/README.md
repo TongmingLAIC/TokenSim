@@ -172,6 +172,7 @@ The following environment variables configure the script.
 | `OPS` | `gemm attention_context attention_generation moe` | Collector ops, space-separated (`gemm`, `attention_context`, `attention_generation`, `moe`, module ops such as `mhc_module`; see the collector registries). The MoE grid is the largest |
 | `MODEL_PATH` | unset | Hugging Face model id: collect only the shapes of that model (AIConfigurator's model-centric "healing" run) |
 | `GPU_TYPE` | local SM | AIConfigurator system name (e.g. `a100_sxm`) for hardware capability floors; leave it empty for GPUs without an upstream system, such as the RTX 4090 |
+| `GPUS_PER_NODE` | unset | GPUs per node represented by flat SGLang wide-EP DeepEP rows; required when those tables are present |
 | `SKIP_COMM` | 0 | 1 skips `collect_comm.sh` (no nccl-tests or mpirun) |
 | `AIC_DIR`, `AIC_COMMIT` | see above | AIConfigurator checkout and commit |
 | `RUN_DIR` | `./tmp/collect/<DEVICE>/<BACKEND>` | Collector output directory |
@@ -237,10 +238,13 @@ NCCL_TESTS=/opt/nccl-tests/build \
 The positional arguments are `<gpus per node> <nodes>`.
 The script measures all_reduce, all_gather, reduce_scatter and alltoall for message sizes from 1 KiB to 1 GiB, doubling the size at each point.
 Each point uses 20 warmup iterations and 50 timed iterations.
-A single-node run passes `-g <gpus>` to the binaries, and a run using `LAUNCHER` assigns one GPU per process.
+A single-node run without a launcher passes `-g <gpus>` to the binaries.
+Multi-node runs require a `LAUNCHER` command that starts one process per GPU.
 Logs are saved under `OUT`, default `./tmp/nccl/<DEVICE>`, and imported into `PACKAGE` with `operator_data.cli import-nccl`.
 `PACKAGE` defaults to `./data/operator_data/<DEVICE>/<BACKEND>`, and `BACKEND` defaults to `trtllm`.
 Rows are keyed by `(dtype, operation, group_size, nodes, message_bytes)`.
+Import requires an out-of-place time and a zero `#wrong` value for each imported row.
+When the log lists rank placements, import checks the reported rank and host counts against the requested topology.
 
 TokenSim queries collectives with the model's activation dtype, so set `DTYPE` accordingly (`bfloat16` for bf16 models; the default `half` produces fp16 rows).
 For runs across nodes, record the algorithm and protocol reported by `NCCL_DEBUG=INFO`, such as ring/tree and LL/Simple.

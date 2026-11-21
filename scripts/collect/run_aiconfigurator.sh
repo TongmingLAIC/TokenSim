@@ -16,6 +16,7 @@
 #   OPS           collector ops, space separated                       default "gemm attention moe"
 #   MODEL_PATH    HF model id for a model-centric ("healing") run      default: full base grid
 #   GPU_TYPE      AIConfigurator system name for capability floors     default: local SM detection
+#   GPUS_PER_NODE GPUs per node for flat SGLang wide-EP DeepEP tables    required for those tables
 #   SKIP_COMM     1 = skip network/collect_comm.sh                     default 0
 #   PACKAGE       import target                                        default ./data/operator_data/<DEVICE>/<BACKEND>
 set -euo pipefail
@@ -27,6 +28,7 @@ RUN_DIR=${RUN_DIR:-./tmp/collect/${DEVICE}/${BACKEND}}
 OPS=${OPS:-"gemm attention_context attention_generation moe"}
 MODEL_PATH=${MODEL_PATH:-}
 GPU_TYPE=${GPU_TYPE:-}
+GPUS_PER_NODE=${GPUS_PER_NODE:-}
 SKIP_COMM=${SKIP_COMM:-0}
 PACKAGE=${PACKAGE:-./data/operator_data/${DEVICE}/${BACKEND}}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -79,8 +81,16 @@ fi
 
 # 4. Convert into a TokenSim package (flat collector layout is auto-detected).
 cd "$REPO_ROOT"
-python -m TokenSim.operator_data.cli import-aiconfigurator \
-  --system-dir "$RUN_DIR" --device "$DEVICE" --backend "$BACKEND" \
-  --upstream-commit "$AIC_COMMIT" --out "$PACKAGE"
+IMPORT_ARGS=(
+  --system-dir "$RUN_DIR"
+  --device "$DEVICE"
+  --backend "$BACKEND"
+  --upstream-commit "$AIC_COMMIT"
+  --out "$PACKAGE"
+)
+if [ -n "$GPUS_PER_NODE" ]; then
+  IMPORT_ARGS+=(--gpus-per-node "$GPUS_PER_NODE")
+fi
+python -m TokenSim.operator_data.cli import-aiconfigurator "${IMPORT_ARGS[@]}"
 python -m TokenSim.operator_data.cli validate "$PACKAGE"
 echo "package written to $PACKAGE"

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from TokenSim.config.validation import number
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware._yaml import load_yaml_mapping, positive_number, require
+from TokenSim.hardware._yaml import finite_number, load_yaml_mapping, require
 
 
 @dataclass(frozen=True)
@@ -45,18 +47,20 @@ class LinkClass:
             raise ConfigurationError(
                 f"link {self.link_id!r}: duplex must be full or half"
             )
-        if self.bandwidth_per_direction_bytes_per_s <= 0:
-            raise ConfigurationError(
-                f"link {self.link_id!r}: bandwidth must be positive"
-            )
-        if self.latency_us < 0:
-            raise ConfigurationError(
-                f"link {self.link_id!r}: latency must be non-negative"
-            )
-        if not 0 < self.collective_efficiency <= 1:
-            raise ConfigurationError(
-                f"link {self.link_id!r}: collective_efficiency must be in (0, 1]"
-            )
+        context = f"link {self.link_id!r}"
+        number(
+            self.bandwidth_per_direction_bytes_per_s,
+            f"{context}: bandwidth",
+            positive=True,
+        )
+        number(self.latency_us, f"{context}: latency_us")
+        number(self.half_bandwidth_bytes, f"{context}: half_bandwidth_bytes")
+        number(
+            self.collective_efficiency,
+            f"{context}: collective_efficiency",
+            positive=True,
+            maximum=1,
+        )
 
     def efficiency(self, message_bytes: float) -> float:
         """Fraction of peak bandwidth achievable for a message of this size."""
@@ -78,8 +82,6 @@ class LinkClass:
         self, message_bytes: float, *, oversubscription: float = 1.0
     ) -> float:
         """AF v1 pure alpha-beta service; legacy efficiency consumers stay intact."""
-        import math
-
         if not math.isfinite(oversubscription) or oversubscription < 1:
             raise ConfigurationError("oversubscription must be finite and at least one")
         if message_bytes <= 0:
@@ -98,17 +100,26 @@ class LinkClass:
         return cls(
             link_id=link_id,
             display_name=str(raw.get("display_name", link_id)),
-            bandwidth_per_direction_bytes_per_s=positive_number(
+            bandwidth_per_direction_bytes_per_s=finite_number(
                 require(raw, "bandwidth_per_direction_bytes_per_s", context),
                 "bandwidth_per_direction_bytes_per_s",
                 context,
             ),
-            latency_us=float(raw.get("latency_us", 0.0)),
+            latency_us=finite_number(
+                raw.get("latency_us", 0.0), "latency_us", context, allow_zero=True
+            ),
             duplex=str(raw.get("duplex", "full")),
             source_id=str(raw.get("source_id", "unspecified")),
             grade=str(raw.get("grade", "A")).upper(),
-            half_bandwidth_bytes=float(raw.get("half_bandwidth_bytes", 1 << 20)),
-            collective_efficiency=float(raw.get("collective_efficiency", 0.5)),
+            half_bandwidth_bytes=finite_number(
+                raw.get("half_bandwidth_bytes", 1 << 20),
+                "half_bandwidth_bytes",
+                context,
+                allow_zero=True,
+            ),
+            collective_efficiency=finite_number(
+                raw.get("collective_efficiency", 0.5), "collective_efficiency", context
+            ),
             notes=str(raw.get("notes", "")),
             bandwidth_scope=str(raw.get("bandwidth_scope", "link")),
         )

@@ -126,36 +126,63 @@ def write_package_with_manifest(
 def merge_packages(
     base: OperatorDataPackage, extra: OperatorDataPackage, *, prefer: str = "extra"
 ) -> OperatorDataPackage:
-    """Union of two packages for the same device; on key clashes keep ``prefer``."""
-    if base.device_id != extra.device_id:
+    """Merge one device/backend package and retain provenance for selected rows."""
+    if prefer not in {"base", "extra"}:
+        raise ConfigurationError("package merge preference must be base or extra")
+    if base.device_id != extra.device_id or base.backend != extra.backend:
         raise ConfigurationError(
-            f"cannot merge packages for different devices {base.device_id!r} and {extra.device_id!r}"
+            f"cannot merge packages for different device/backend targets: "
+            f"{base.device_id}/{base.backend} and {extra.device_id}/{extra.backend}"
         )
-    tables: dict[str, dict[tuple, Mapping[str, Any]]] = {}
-    for package, is_extra in ((base, False), (extra, True)):
+    sources = dict(base.meta.sources)
+    for source_id, record in extra.meta.sources.items():
+        if source_id in sources and sources[source_id] != record:
+            raise ConfigurationError(
+                f"conflicting metadata for source_id {source_id!r}; use distinct source IDs"
+            )
+        sources[source_id] = record
+
+    tables: dict[str, dict[tuple, tuple[Mapping[str, Any], str]]] = {}
+    packages = {"base": base, "extra": extra}
+    for label, package in packages.items():
         for table, rows in package.tables.items():
             spec = TABLE_SPECS[table]
             bucket = tables.setdefault(table, {})
             for row in rows:
                 key = tuple(row[f] for f in spec.key_fields)
-                if key in bucket and (prefer == "extra") != is_extra:
-                    continue
-                bucket[key] = row
+                if key not in bucket or label == prefer:
+                    bucket[key] = row, label
+
     analysis: dict[str, list[Mapping[str, Any]]] = {}
-    for package in (base, extra):
+    for label, package in packages.items():
         for table, rows in package.analysis.items():
-            analysis.setdefault(table, []).extend(rows)
-    sources = {**base.meta.sources, **extra.meta.sources}
+            spec = TABLE_SPECS[table]
+            for row in rows:
+                clean = spec.normalize_key(row)
+                key = tuple(clean[f] for f in spec.key_fields)
+                winner = tables.get(table, {}).get(key)
+                if winner is not None and winner[1] == label:
+                    source_id = row.get("source_id")
+                    if source_id is None or source_id == winner[0]["source_id"]:
+                        analysis.setdefault(table, []).append(row)
+
+    preferred = packages[prefer].meta
+    other = (base if prefer == "extra" else extra).meta
     meta = PackageMeta(
         dataset_version=f"{base.dataset_version}+{extra.dataset_version}",
         device_id=base.device_id,
         backend=base.backend,
-        framework_version=base.meta.framework_version or extra.meta.framework_version,
+        framework_version=preferred.framework_version or other.framework_version,
         sources=sources,
-        calibration={**base.meta.calibration, **extra.meta.calibration},
+        calibration={**other.calibration, **preferred.calibration},
         notes=(base.meta.notes + "\n" + extra.meta.notes).strip(),
-        extra={**base.meta.extra, **extra.meta.extra},
+        extra={**other.extra, **preferred.extra},
     )
     return OperatorDataPackage.from_rows(
-        meta, {t: list(rows.values()) for t, rows in tables.items()}, analysis
+        meta,
+        {
+            table: [row for row, _ in bucket.values()]
+            for table, bucket in tables.items()
+        },
+        analysis,
     )

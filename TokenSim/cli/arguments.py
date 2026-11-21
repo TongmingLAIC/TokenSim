@@ -7,17 +7,16 @@ import json
 from TokenSim.cli.cache_policy_arguments import add_cache_policy_arguments
 from TokenSim.cli.open_root_arguments import add_open_root_arguments
 from TokenSim.config.parallel_config import EXPERT_PARALLEL_SCOPES
-from TokenSim.config.paths import default_data_root
+from .data_paths import DATA_ROOT, SimulationArgumentParser
 from TokenSim.latency import FALLBACK_POLICIES
 from TokenSim.llm.llm_scheduler import DEFAULT_MAX_NUM_BATCHED_TOKENS
 
 
-DATA_ROOT = default_data_root()
 LATENCY_BACKEND_KEYWORDS = ("operator_table", "analytical")
 
 
 def build_parser():
-    parser = argparse.ArgumentParser()
+    parser = SimulationArgumentParser()
     parser.add_argument(
         "--trace_mode",
         choices=("off", "validate", "full"),
@@ -102,8 +101,8 @@ def build_parser():
     parser.add_argument(
         "--cluster",
         type=str,
-        default=str(DATA_ROOT / "clusters/1_a100/h1.json"),
-        help="Cluster JSON: workers, hardware, topology, parallelism and storage.",
+        default=None,
+        help="Cluster JSON; defaults to clusters/1_a100/h1.json under the data root.",
     )
     parser.add_argument(
         "--kv_transfer_config",
@@ -399,8 +398,7 @@ def build_parser():
         "--operator_backend",
         type=str,
         default=None,
-        help="Operator-data backend for workers whose cluster group does not name one.",
-        choices=["vllm", "sglang", "trtllm", "analytical"],
+        help="Installed operator-data package name for workers without a group override.",
     )
     parser.add_argument(
         "--moe_backend",
@@ -452,8 +450,8 @@ def build_parser():
     parser.add_argument(
         "--data_root",
         type=str,
-        default=str(DATA_ROOT),
-        help="Directory holding devices/, topologies/, models/ and operator_data/.",
+        default=None,
+        help="Catalog directory; overrides TOKENSIM_DATA_ROOT and the bundled data root.",
     )
     parser.add_argument(
         "--agentx_workload_seed",

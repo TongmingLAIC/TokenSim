@@ -198,7 +198,9 @@ class ComputeComponentsMixin:
                     key={
                         **base_key,
                         **exact_key,
-                        "distribution": self.moe_distributions[0],
+                        "distribution": (
+                            estimate.workload_distribution or self.moe_distributions[0]
+                        ),
                         "routed_assignments": tokens,
                         "per_expert": [list(item) for item in workload],
                     },

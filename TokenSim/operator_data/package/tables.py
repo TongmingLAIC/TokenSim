@@ -5,13 +5,10 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from TokenSim.hardware.device import normalize_dtype
 from TokenSim.operator_data.schema import (
-    INTEGER_FIELDS,
     TABLE_SPECS,
     TableSpec,
     ELEMENTWISE_OPS,
-    normalize_table_key_value,
 )
 from .metadata import PackageMeta, OperatorDataValidationError
 
@@ -30,47 +27,16 @@ def validate_rows(
     seen: set[tuple[Any, ...]] = set()
     required = spec.required_fields
     required_set = frozenset(required)
-    # 0: non-negative integer, 1: dtype name, 2: lowercase string.
-    kinds = tuple(
-        (f, 0 if f in INTEGER_FIELDS else 1 if f in spec.dtype_fields else 2)
-        for f in spec.key_fields
-    )
-    dtypes: dict[str, str] = {}
     for index, row in enumerate(rows):
         if not row.keys() >= required_set:
             missing = [f for f in required if f not in row]
             raise OperatorDataValidationError(
                 f"{where}: row {index} is missing fields {missing}"
             )
-        clean: dict[str, Any] = {}
-        for f, kind in kinds:
-            value = row[f]
-            if kind == 0:
-                try:
-                    number = int(value)
-                except (TypeError, ValueError) as exc:
-                    raise OperatorDataValidationError(
-                        f"{where}: row {index} field {f} must be an integer"
-                    ) from exc
-                if number < 0:
-                    raise OperatorDataValidationError(
-                        f"{where}: row {index} field {f} must be non-negative"
-                    )
-                clean[f] = number
-            elif kind == 1:
-                text = str(value)
-                dtype = dtypes.get(text)
-                if dtype is None:
-                    dtype = dtypes[text] = normalize_dtype(text)
-                clean[f] = dtype
-            else:
-                clean[f] = str(value).strip().lower()
-            try:
-                clean[f] = normalize_table_key_value(table_name, f, clean[f])
-            except ValueError as exc:
-                raise OperatorDataValidationError(
-                    f"{where}: row {index} field {f} is invalid: {exc}"
-                ) from exc
+        try:
+            clean = spec.normalize_key(row)
+        except ValueError as exc:
+            raise OperatorDataValidationError(f"{where}: row {index}: {exc}") from exc
         positive_fields = {
             "groups",
             "m",

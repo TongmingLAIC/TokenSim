@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from TokenSim.errors import ConfigurationError
 from TokenSim.operator_data.schema import LATENCY_UNIT, SCHEMA_VERSION, TABLE_SPECS
+from .immutable import freeze, to_data
 
 
 META_FILENAME = "generation_meta.yaml"
@@ -83,6 +84,10 @@ class PackageMeta:
     latency_unit: str = LATENCY_UNIT
     extra: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        for key in ("sources", "calibration", "table_rows", "extra"):
+            object.__setattr__(self, key, freeze(getattr(self, key)))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -93,9 +98,9 @@ class PackageMeta:
             "framework_version": self.framework_version,
             "notes": self.notes,
             "sources": [source.to_dict() for source in self.sources.values()],
-            "calibration": {k: dict(v) for k, v in self.calibration.items()},
+            "calibration": to_data(self.calibration),
             "tables": {k: {"rows": v} for k, v in self.table_rows.items()},
-            **dict(self.extra),
+            **to_data(self.extra),
         }
 
     @classmethod

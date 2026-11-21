@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
-import json
-import math
 from functools import cached_property
 
 from TokenSim.config.validation import number
 from TokenSim.errors import ConfigurationError
 from TokenSim.dtypes import CAST_OPERATIONS
+from TokenSim.hardware.device.dtypes import normalize_dtype
+from TokenSim.operator_data.key_normalization import (
+    integral_shape,
+    normalize_table_key_value,
+)
 
 SCHEMA_VERSION = 1
 LATENCY_UNIT = "us"
@@ -49,71 +52,6 @@ ELEMENTWISE_OPS = CAST_OPERATIONS + (
     "weighted_combine",
     "post_attention_norm",
 )
-
-
-def canonical_histogram(value: Any, *, field: str) -> str:
-    """Return a stable JSON representation for length/token histograms.
-
-    Tables are often written by parquet/CSV tooling with ``1`` versus ``1.0``
-    or with a different pair order.  Canonicalising at both package ingest and
-    query time keeps those representations equivalent and hashable.
-    """
-    raw = value
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"{field} must be a JSON list of [value,count] pairs"
-            ) from exc
-    if not isinstance(raw, (list, tuple)) or not raw:
-        raise ValueError(f"{field} must be a non-empty list of [value,count] pairs")
-    pairs: list[tuple[int, float]] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise ValueError(f"{field}[{index}] must contain exactly [value,count]")
-        try:
-            value_i = int(item[0])
-            count_f = float(item[1])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{field}[{index}] values must be numeric") from exc
-        if isinstance(item[0], bool) or float(item[0]) != value_i:
-            raise ValueError(f"{field}[{index}] value must be an integer")
-        if value_i <= 0 or not math.isfinite(count_f) or count_f <= 0:
-            raise ValueError(f"{field}[{index}] requires positive value and count")
-        pairs.append((value_i, count_f))
-    pairs.sort(key=lambda pair: pair[0])
-    return json.dumps(pairs, separators=(",", ":"), ensure_ascii=False)
-
-
-def normalize_table_key_value(table: str, field: str, value: Any) -> Any:
-    if (
-        table in {"mla_attention", "ragged_generation_attention"}
-        and field == "context_lengths"
-    ):
-        return canonical_histogram(value, field=field)
-    if table == "routed_experts" and field == "expert_tokens":
-        raw = value
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"{field} must be a JSON list of positive counts"
-                ) from exc
-        if not isinstance(raw, (list, tuple)) or not raw:
-            raise ValueError(f"{field} must be a non-empty list of positive counts")
-        counts: list[int] = []
-        for index, item in enumerate(raw):
-            try:
-                count = int(item)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field}[{index}] must be an integer") from exc
-            if count <= 0:
-                raise ValueError(f"{field}[{index}] must be positive")
-            counts.append(count)
-        return json.dumps(counts, separators=(",", ":"))
-    return value
 
 
 @dataclass(frozen=True)
@@ -163,6 +101,29 @@ class TableSpec:
     @cached_property
     def required_fields(self) -> tuple[str, ...]:
         return self.key_fields + VALUE_FIELDS
+
+    def normalize_key_field(self, field: str, value: Any) -> Any:
+        try:
+            if field in INTEGER_FIELDS:
+                result = integral_shape(value)
+                if result < 0:
+                    raise ValueError("must be non-negative")
+                return result
+            if field in self.dtype_fields:
+                return normalize_dtype(str(value))
+            normalized = normalize_table_key_value(self.name, field, value)
+            return str(normalized).strip().lower()
+        except (ConfigurationError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field}: {exc}") from exc
+
+    def normalize_key(self, key: Mapping[str, Any]) -> dict[str, Any]:
+        missing = [field for field in self.key_fields if field not in key]
+        if missing:
+            raise ValueError(f"key is missing fields {missing}")
+        return {
+            field: self.normalize_key_field(field, key[field])
+            for field in self.key_fields
+        }
 
     @property
     def perf_filename(self) -> str:

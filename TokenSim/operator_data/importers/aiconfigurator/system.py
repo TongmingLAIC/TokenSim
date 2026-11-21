@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, Mapping
+from TokenSim.config.validation import integer
 from TokenSim.errors import ConfigurationError
 from TokenSim.operator_data.package import OperatorDataPackage, PackageMeta
 from .context import ImportContext
@@ -43,6 +44,8 @@ def import_aiconfigurator_system(
         )
     if gpus_per_node is None:
         gpus_per_node = _system_gpus_per_node(system_path)
+    if gpus_per_node is not None:
+        gpus_per_node = integer(gpus_per_node, "gpus_per_node", minimum=1)
     context = ImportContext(
         system_path=system_path,
         device_id=device_id,

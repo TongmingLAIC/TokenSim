@@ -27,25 +27,21 @@ from TokenSim.llm.llm_request import Request
 from TokenSim.moe.placement import ExpertPlacement
 from TokenSim.moe.routing import ExpertRouting
 from TokenSim.moe.stats import MoEStats
-from TokenSim.operator_data.analytical import Calibration, analytical_model_for
 from TokenSim.operator_data.coverage import MissingShapeReport
-from TokenSim.operator_data.lookup import (
-    FALLBACK_POLICIES,
-    LookupPolicy,
-    OperatorLookup,
-)
+from TokenSim.operator_data.lookup import LookupPolicy
 from TokenSim.operator_data.package import OperatorDataPackage
 from TokenSim.operator_data.workload import activation_bytes_for
 from TokenSim.parallel import ParallelCommunicator
 from .stats import OperatorStats, _MOE_DISTRIBUTION_CANDIDATES
 from .composition import StepComposition
 from .queries import OperatorQueries
+from .resolver import OperatorResolver
 
 
-class OperatorTableLatencyBackend(StepComposition, OperatorQueries, LatencyBackend):
+class OperatorTableLatencyBackend(
+    StepComposition, OperatorQueries, OperatorResolver, LatencyBackend
+):
     """Configure the operator backend and estimate scheduler-step latency."""
-
-    _CACHE_LIMIT = 262144
 
     def __init__(
         self,
@@ -69,19 +65,14 @@ class OperatorTableLatencyBackend(StepComposition, OperatorQueries, LatencyBacke
         max_num_seqs: int = 64,
         pipeline_layer_counts: tuple[int, ...] | None = None,
     ) -> None:
-        if fallback not in FALLBACK_POLICIES:
-            raise ConfigurationError(
-                f"fallback must be one of {FALLBACK_POLICIES}, got {fallback!r}"
-            )
-        if (
-            fallback != "analytical_only"
-            and package is None
-            and fallback == "table_only"
-        ):
-            raise ConfigurationError(
-                f"latency backend 'table_only' requires operator data for device {device.device_id!r}"
-            )
-        self.device = device
+        super().__init__(
+            device=device,
+            package=package,
+            fallback=fallback,
+            lookup_policy=lookup_policy,
+            gated=model.gated,
+            missing_report=missing_report,
+        )
         self.model = model
         self.parallel_config = parallel_config or ParallelConfig.default()
         self.rank_info = rank_info or ParallelRankInfo()
@@ -110,22 +101,7 @@ class OperatorTableLatencyBackend(StepComposition, OperatorQueries, LatencyBacke
                 model.moe, self.parallel_config, total_layers=model.num_layers
             )
         self.expert_placement = expert_placement
-        self.package = package if fallback != "analytical_only" else None
-        self.fallback = fallback
-        self.analytical = analytical_model_for(device.family)
-        # Out-of-range table queries keep the boundary row's measured efficiency
-        # and follow the analytical model's growth (see LookupPolicy).
-        self.lookup = (
-            OperatorLookup(
-                self.package,
-                lookup_policy,
-                analytical_scaler=self._analytical_reference_us,
-            )
-            if self.package is not None
-            else None
-        )
         self.decode_context_bucket = max(1, int(decode_context_bucket))
-        self.stats = OperatorStats(missing=missing_report or MissingShapeReport())
         self.target_logits_counts = Counter()
         self.main_forward_counts = Counter()
         self.moe_stats = MoEStats(
@@ -141,13 +117,6 @@ class OperatorTableLatencyBackend(StepComposition, OperatorQueries, LatencyBacke
         )
         self._expert_to_rank: dict[int, int] | None = None
         self._rank_load_cache = BoundedCache(4096)
-        self._cache = BoundedCache(self._CACHE_LIMIT)
-        self._calibrations = {
-            table: Calibration.from_mapping(values)
-            for table, values in (
-                self.package.meta.calibration.items() if self.package else []
-            )
-        }
         self.trace_composition = None
         self._init_dimensions()
         if attention_backend not in ("generic", "module"):
