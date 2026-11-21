@@ -14,7 +14,7 @@ from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.llm.llm_request import Request
 from TokenSim.workload.source import LLMSource
 from tests.support.hardware import make_hardware
-from tests.test_kv_transfer_integration import (
+from tests.support.pd import (
     _pd_cluster,
     _DeterministicBackend,
     _MODEL,

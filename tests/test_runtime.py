@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from TokenSim.cli import build_parser, main
+from tests.support.cli import simulation_args, run_quiet
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.config.workload_config import WorkloadConfig
 from TokenSim.errors import (
@@ -54,74 +54,60 @@ class RuntimeTest(unittest.TestCase):
             cluster = path / "cluster.json"
             cluster.write_text(
                 json.dumps(
-                    {
-                        "num_workers": 1,
-                        "networks": {"node": "ethernet100Gb"},
-                        "worker_groups": [
-                            {
-                                "role": "hybrid",
-                                "hardware": "a100_sxm_80g",
-                                "num_workers": 1,
-                                "network": "node",
-                            }
+                    dict(
+                        num_workers=1,
+                        networks={"node": "ethernet100Gb"},
+                        worker_groups=[
+                            dict(
+                                role="hybrid",
+                                hardware="a100_sxm_80g",
+                                num_workers=1,
+                                network="node",
+                            )
                         ],
-                        "kv_cache_capacity_tokens_total": 80,
-                    }
+                        kv_cache_capacity_tokens_total=80,
+                    )
                 )
             )
             connector = path / "kv.json"
             connector.write_text(
                 json.dumps(
-                    {
-                        "kv_connector": "MooncakeStoreConnector",
-                        "engine_id": "reused-id",
-                        "kv_connector_extra_config": {"memory_capacity_blocks": 128},
-                    }
+                    dict(
+                        kv_connector="MooncakeStoreConnector",
+                        engine_id="reused-id",
+                        kv_connector_extra_config={"memory_capacity_blocks": 128},
+                    )
                 )
             )
             dataset = path / "requests.json"
+            prefixes = ([1, 2, 3, 4], [5, 6, 7, 8], [1, 2, 3, 4])
             dataset.write_text(
-                json.dumps(
-                    [
-                        [64, 2, {"hash_ids": [1, 2, 3, 4]}],
-                        [64, 2, {"hash_ids": [5, 6, 7, 8]}],
-                        [64, 2, {"hash_ids": [1, 2, 3, 4]}],
-                    ]
-                )
+                json.dumps([[64, 2, {"hash_ids": ids}] for ids in prefixes])
             )
             services = []
-            for run in range(2):
-                target = path / str(run)
-                args = self.args(
-                    target,
-                    "--distribution",
-                    "uniform",
-                    "--qps",
-                    "1",
-                    "--batching",
-                    "paged-attn",
-                    "--trace_mode",
-                    "full" if run else "off",
-                    "--request_count",
-                    "3",
-                    "--max_num_batched_tokens",
-                    "32",
-                    "--cluster",
-                    str(cluster),
-                    "--kv_transfer_config",
-                    str(connector),
-                    "--dataset_path",
-                    str(dataset),
-                    "--workload_type",
-                    "json_pairs",
+            for mode in ("off", "full"):
+                target = path / mode
+                engine = self.run_main(
+                    self.args(
+                        target,
+                        distribution="uniform",
+                        qps=1,
+                        batching="paged-attn",
+                        trace_mode=mode,
+                        request_count=3,
+                        max_num_batched_tokens=32,
+                        cluster=cluster,
+                        kv_transfer_config=connector,
+                        dataset_path=dataset,
+                        workload_type="json_pairs",
+                    )
                 )
-                engine = self.run_main(args)
                 result = json.loads((target / "result_1.0.json").read_text())
                 self.assertEqual(result["request_count"], 3)
                 store = engine.workers[0].connector
                 self.assertGreater(store.mooncake_stats.mooncake_memory_hit_tokens, 0)
                 self.assertEqual(store.mooncake_stats.store_hit_count, 1)
-                if run:
+                if mode == "full":
                     trace = json.loads(Path(result["trace"]["path"]).read_text())
                     self.assertTrue(
                         any(
@@ -146,31 +132,17 @@ class RuntimeTest(unittest.TestCase):
                     }
                 )
             )
-            args = build_parser().parse_args(
-                [
-                    "--model",
-                    str(ROOT / "data/models/moe-toy.yaml"),
-                    "--cluster",
-                    str(ROOT / "data/clusters/8_a100/moe_tp2_dp4.json"),
-                    "--workload_config",
-                    str(workload),
-                    "--request_count",
-                    "2",
-                    "--distribution",
-                    "burst",
-                    "--latency_backend",
-                    "analytical",
-                    "--moe_routing_distribution",
-                    "hot",
-                    "--moe_hot_experts",
-                    "0,1",
-                    "--moe_hot_expert_fraction",
-                    "0.8",
-                    "--verbose",
-                    "none",
-                    "--results_path",
-                    str(path),
-                ]
+            args = simulation_args(
+                path,
+                model="moe-toy",
+                cluster=ROOT / "data/clusters/8_a100/moe_tp2_dp4.json",
+                workload_config=workload,
+                request_count=2,
+                prefill_mean_len=None,
+                decode_mean_len=None,
+                moe_routing_distribution="hot",
+                moe_hot_experts="0,1",
+                moe_hot_expert_fraction=0.8,
             )
             engine = self.run_main(args)
             self.assertEqual(engine.model_spec.hidden_size, 128)
@@ -185,32 +157,8 @@ class RuntimeTest(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "hidden_size"):
                 WorkloadConfig.from_file(workload)
 
-    def args(self, directory, *extra):
-        return build_parser().parse_args(
-            [
-                "--latency_backend",
-                "analytical",
-                "--verbose",
-                "none",
-                "--distribution",
-                "burst",
-                "--request_count",
-                "8",
-                "--prefill_mean_len",
-                "16",
-                "--decode_mean_len",
-                "3",
-                "--max_num_seqs",
-                "2",
-                "--results_path",
-                str(directory),
-                *extra,
-            ]
-        )
-
-    def run_main(self, args):
-        with redirect_stdout(io.StringIO()):
-            return main(args)
+    args = staticmethod(simulation_args)
+    run_main = staticmethod(run_quiet)
 
     def test_equal_priority_messages_are_fifo_and_cancel_has_priority(self):
         messages = [Message(Task.ADD, sender_id=i) for i in range(40)]

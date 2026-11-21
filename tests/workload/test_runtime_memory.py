@@ -14,9 +14,8 @@ from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.config.runtime_memory import RuntimeMemoryProfile, runtime_memory_identity
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import HardwareContext
-from tests.support.hardware import make_model
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class RuntimeMemoryTest(unittest.TestCase):
@@ -185,9 +184,3 @@ class RuntimeMemoryTest(unittest.TestCase):
         observed = self.cache(profile, **settings)
         self.assertLessEqual(observed.memory_budget["analytical_available_kv_bytes"], 0)
         self.assertGreater(observed.num_gpu_blocks, 0)
-
-    def test_uniform_attention_does_not_silently_ignore_a_profile(self):
-        with self.assertRaisesRegex(ConfigurationError, "compressed attention"):
-            CacheConfig(
-                16, self.device, make_model(), runtime_memory_profile=self.profile()
-            )

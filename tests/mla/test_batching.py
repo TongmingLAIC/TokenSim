@@ -19,7 +19,7 @@ from TokenSim.operator_data.package import (
     PackageMeta,
     SourceRecord,
 )
-from tests.mla.test_attention import core_key
+from tests.support.mla import core_key
 
 
 class BatchTimingTest(unittest.TestCase):

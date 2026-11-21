@@ -270,7 +270,7 @@ class CooperationTest(unittest.TestCase):
         from TokenSim.workload.agentx_support.parser import parse_trace_graph
         from TokenSim.errors import WorkloadValidationError
 
-        path = Path(__file__).parent / "fixtures/agentx_weka.jsonl"
+        path = Path(__file__).resolve().parents[1] / "fixtures/agentx_weka.jsonl"
         raw = json.loads(path.read_text().splitlines()[0])
         self.assertFalse(
             any(c.cache_one_shot for c in parse_trace_graph(raw).conversations)

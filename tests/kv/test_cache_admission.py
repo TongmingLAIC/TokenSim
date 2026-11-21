@@ -12,7 +12,7 @@ from TokenSim.config.cache_policy import PRESETS
 from TokenSim.kv_transfer.policies.native import NativeCacheController
 from TokenSim.kv_transfer.policies.quota import should_defer
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class ByteBudgetTest(unittest.TestCase):

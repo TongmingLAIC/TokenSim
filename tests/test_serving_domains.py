@@ -25,7 +25,7 @@ from TokenSim.reporting.stats import (
 )
 from TokenSim.reporting import RunReport, export_result
 from tests.support.hardware import make_hardware, moe_test_model
-from tests.test_kv_transfer_integration import _DeterministicBackend
+from tests.support.pd import _DeterministicBackend
 
 
 def cluster():

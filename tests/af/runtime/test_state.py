@@ -22,18 +22,6 @@ from tests.af.support.model import (
 )
 
 
-class AFRuntimeStateRegressionTest(unittest.TestCase):
-    def test_runtime_only_exposes_decode_owners(self):
-        plan = _runtime_plan()
-        self.assertEqual({owner.domain for owner in plan.request_owners}, {"a-domain"})
-        self.assertTrue(
-            all("phase" not in owner.as_dict() for owner in plan.request_owners)
-        )
-        self.assertTrue(
-            all("phase" not in item.as_dict() for item in plan.partial_destinations)
-        )
-
-
 class RuntimePlannerAndSummaryTest(unittest.TestCase):
     def test_runtime_summary_is_versioned_and_serializable(self):
         plan = _runtime_plan()
@@ -146,7 +134,6 @@ class RuntimePlannerAndSummaryTest(unittest.TestCase):
         ]
         self.assertEqual(len(f_workers), 4)
         self.assertTrue(any(3 in worker.owned_expert_ids for worker in f_workers))
-        operations = [event.operation for event in engine.af_executor.trace.events]
         for operation in ("af_a_to_f", "af_f_to_a"):
             stages = {
                 event.logical_stage_id

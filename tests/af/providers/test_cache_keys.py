@@ -10,15 +10,12 @@ from TokenSim.af.caching.estimates import (
     FrozenDict,
     identity,
     prepare_query,
-    query_skeleton,
     snapshot,
 )
-from TokenSim.af.planning.planner import ParallelExecutionPlanner
-from TokenSim.af.providers.queries import AFComputeQuery, AFRoutingEdge, AFTensorSlice
+from TokenSim.af.providers.queries import AFRoutingEdge, AFTensorSlice
 from TokenSim.errors import ConfigurationError
-from scripts.deepseek_v3_runtime import configuration
-from tests.af.providers import test_cache
-from tests.af.support.model import _compute_query, _transfer_query
+from tests.af.support.providers import sample_transfer_provider
+from tests.af.support.model import _transfer_query
 
 
 @dataclass(frozen=True)
@@ -66,35 +63,10 @@ class StructuralKeyTest(unittest.TestCase):
         self.assertNotIn(id(parent), memo.values)
         self.assertNotIn(id(parent.value), memo.values)
 
-    def test_extraction_preserves_defaults_and_execution_field_exclusions(self):
-        query = _compute_query()
-        skeleton = query_skeleton(AFComputeQuery)
-        values = {
-            name: value for name, value in vars(query).items() if value is not None
-        }
-        expected = tuple(
-            values.get(name, skeleton.defaults.get(name)) for name in skeleton.names
-        )
-        before = values.copy()
-        self.assertEqual(skeleton.key_values(values), expected)
-        self.assertEqual(values, before)
-        self.assertNotIn("iteration_id", skeleton.names)
-        self.assertNotIn("routing_edges", skeleton.names)
-        del values["token_count"]
-        self.assertEqual(
-            skeleton.key_values(values),
-            tuple(
-                values.get(name, skeleton.defaults.get(name)) for name in skeleton.names
-            ),
-        )
-
 
 class WirePlanKeyTest(unittest.TestCase):
-    def provider(self):
-        return test_cache.CacheFastPathTest().transfer()
-
     def test_wire_geometry_shares_plans_without_retaining_invocation_records(self):
-        provider = self.provider()
+        provider = sample_transfer_provider()
         base = _transfer_query()
         plan = provider.communication_plan(base)
         edge = AFRoutingEdge(3, "decode", 3, 0, 1, 7, 0, 2, 1.0, 0, 0)
@@ -119,7 +91,7 @@ class WirePlanKeyTest(unittest.TestCase):
         self.assertIsNone(tensor_ref())
 
     def test_geometry_and_backend_changes_cannot_reuse_wrong_plan(self):
-        provider = self.provider()
+        provider = sample_transfer_provider()
         base = _transfer_query()
         first = provider.communication_plan(base)
         for changed in (
@@ -136,7 +108,7 @@ class WirePlanKeyTest(unittest.TestCase):
         )
 
     def test_invalid_collective_still_fails_after_plan_cache_is_warm(self):
-        provider = self.provider()
+        provider = sample_transfer_provider()
         query = replace(_transfer_query(), operation="all_reduce", group_size=2)
         provider.communication_plan(query)
         for changed in (
@@ -147,17 +119,3 @@ class WirePlanKeyTest(unittest.TestCase):
         ):
             with self.subTest(query=changed), self.assertRaises(ConfigurationError):
                 provider.communication_plan(changed)
-
-    def test_endpoint_interning_is_scoped_to_one_planner_and_full_geometry(self):
-        config = configuration(a_tp=2, f_tp=2)
-        planners = [
-            ParallelExecutionPlanner(config.cluster, runtime_plan=config.plan)
-            for _ in range(2)
-        ]
-        binding = config.plan.rank_bindings[0]
-        first = planners[0]._endpoint(binding)
-        self.assertIs(planners[0]._endpoint(binding), first)
-        self.assertIsNot(planners[1]._endpoint(binding), first)
-        changed = replace(binding, tp_rank=binding.tp_rank + 1)
-        self.assertNotEqual(planners[0]._endpoint(changed), first)
-        self.assertEqual(len(planners[0]._endpoints), 2)

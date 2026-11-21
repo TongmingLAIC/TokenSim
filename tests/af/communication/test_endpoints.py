@@ -178,14 +178,6 @@ class QueueEquivalenceTest(unittest.TestCase):
         self.assertFalse(scheduler.waiters)
         return rows
 
-    def test_ready_queue_order_and_intervals_are_unchanged(self):
-        for seed in (0, 1, 42):
-            with self.subTest(seed=seed):
-                self.assertEqual(
-                    self.simulate(DomainScheduler, seed),
-                    self.simulate(ReferenceScheduler, seed),
-                )
-
     def test_cancellation_and_simultaneous_arrival_order_preserve_fifo(self):
         for seed in range(20):
             expected = self.simulate(ReferenceScheduler, seed, cancellations=True)

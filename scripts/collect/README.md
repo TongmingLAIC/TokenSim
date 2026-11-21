@@ -26,11 +26,9 @@ CUDA_VISIBLE_DEVICES=0 \
     --output-tokens 3
 ```
 
-Use the authorized inference environment's Python executable for collection.
-Run collection from an independent copy of the vLLM checkout.
-Keep the source installation unchanged, including editable-install mappings and generated caches.
+Use the target inference environment's Python executable and a separate vLLM checkout for collection.
 Pass an output directory on the collection host with `--output`.
-The [tracing specification](../../docs/operator-latency-model.md#collection-environment) describes the collection environment and source verification.
+See the [tracing reference](../../docs/reference/operator-tracing.md#collection-environment) for how TokenSim uses the collected structure and timing.
 
 The collector warms up the same fixed workload before starting capture.
 It uses seeded token identifiers, greedy sampling and fixed output lengths.
@@ -52,15 +50,15 @@ The importer requires retained structure files and rejects changed artifacts.
 The manifest selects the actual upper-median timing sample and retains every other sample.
 Profiler startup, shutdown and export are excluded from `generate` wall-time measurements.
 `timing_quality` compares the selected sample with the unprofiled baseline and marks differences outside 10% as `perturbed`.
-This check reports collection quality; it does not correct measured durations.
+The report includes the original durations and the collection quality flag.
 Manifests also record software versions, source hashes, model configuration, worker clock identities, annotation coverage, capture policy and completion status.
 Inspect the run log and manifest before using a trace as validation evidence.
 GPU-only PyTorch profiling can still perturb execution, and the original timing traces retain that effect.
 Local `outputs/` data is already ignored by Git; preserve raw traces and logs there and commit only small relevant fixtures.
 
-Use the [offline comparison tool](../../docs/operator-latency-model.md#pytorch-profiler-comparison) to generate a combined timeline and difference report.
+Use the [offline comparison tool](../../docs/reference/operator-tracing.md#pytorch-profiler-comparison) to generate a combined timeline and difference report.
 Pass `--collection outputs/profiler/qwen3-8b/manifest.json` to select the manifest's timing sample automatically.
-Do not combine the structure pass or independent timing replicates into one comparison input.
+Select one timing sample per comparison.
 
 | Script | Tables produced | Requirements |
 | --- | --- | --- |
@@ -79,7 +77,7 @@ The scripts write data packages in the following ways.
 - `collect_elementwise.py` and `run_nccl_tests.sh` merge rows into the existing package with `merge_packages`.
   Newly collected rows replace existing rows with the same key.
 
-Run `run_aiconfigurator.sh` first and the other two afterwards.
+Generate the base package with `run_aiconfigurator.sh`, then merge in elementwise or network data.
 To preserve an existing package, import the profiling run into a separate directory and merge it as described in section 4.
 
 ---
@@ -305,7 +303,18 @@ The scripts automatically record the information listed below.
 | `run_nccl_tests.sh` | nccl-tests command, group and node count, NCCL version, `NCCL_DEBUG`, launcher |
 
 Add missing details to each source's `notes`, including the driver, clock state and person collecting the data for AIConfigurator runs.
-Run `validate` after completing these records.
+Run `tokensim-operator-data validate <package>` after completing these records.
 
 Upstream tables include `framework`, `version`, `device` and `kernel_source` columns.
 The importer preserves `kernel_source` in `kernel` to identify which implementation was measured for each set of dimensions.
+
+## Choose measurement shapes
+
+Use `tokensim-operator-data manifest` to list the primitive operator shapes for the intended models and parallel layouts.
+Run `tokensim-operator-data coverage` against the target package to identify missing shapes.
+Collect compute data at the required activation, weight and KV precisions.
+For attention, include the relevant query sizes and cached context lengths; for mixture of experts, include expert geometry and routed token counts.
+Record the boundaries of complete operator modules so their measurements are used once per modeled invocation.
+Gather collective curves for the activation dtype, group sizes and node counts in the deployment.
+A multi-node collection command requires a launcher that starts all participating ranks.
+For SGLang wide-EP results from a flat collector directory, use `tokensim-operator-data import-aiconfigurator --gpus-per-node N` with the actual rank count per node.

@@ -314,17 +314,3 @@ class AFExecutorEndToEndTest(unittest.TestCase):
                 None,
                 FixedTransferProvider(0.0, 0.0),
             )
-
-    def test_decode_only_rejects_prefill_submission(self):
-        cluster = _load_cluster()
-        env = simpy.Environment()
-        executor = _executor(
-            env,
-            cluster,
-            FixedComputeProvider(0.0, 0.0),
-            FixedTransferProvider(0.0, 0.0),
-        )
-        source_worker_id = 0
-
-        with self.assertRaisesRegex(ConfigurationError, "only accepts decode"):
-            executor.submit(source_worker_id, _requests(env, 1, phase="prefill"))

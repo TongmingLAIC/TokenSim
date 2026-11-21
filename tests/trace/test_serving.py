@@ -1,8 +1,7 @@
 """Global recording across execution modes without changing serving results."""
 
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack
 from dataclasses import replace
-import io
 import json
 from pathlib import Path
 import tempfile
@@ -11,7 +10,7 @@ from unittest.mock import patch
 
 import simpy
 
-from TokenSim.cli import build_parser, main
+from tests.support.cli import run_quiet, simulation_args
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.errors import SimulationStateError
 from TokenSim.config.config import KVTransferConfig, ClusterConfig
@@ -71,31 +70,8 @@ class ServingTraceTest(unittest.TestCase):
         self.assertEqual(times[0], times[1])
 
     def run_cli(self, directory, mode, *extra):
-        args = build_parser().parse_args(
-            [
-                "--latency_backend",
-                "analytical",
-                "--verbose",
-                "none",
-                "--distribution",
-                "burst",
-                "--request_count",
-                "2",
-                "--prefill_mean_len",
-                "16",
-                "--decode_mean_len",
-                "3",
-                "--max_num_seqs",
-                "2",
-                "--results_path",
-                str(directory),
-                "--trace_mode",
-                mode,
-                *extra,
-            ]
-        )
-        with redirect_stdout(io.StringIO()):
-            engine = main(args)
+        args = simulation_args(directory, *extra, request_count=2, trace_mode=mode)
+        engine = run_quiet(args)
         result = json.loads((Path(directory) / "result_inf.json").read_text())
         result.pop("simulator_wall_time")
         result.pop("trace", None)

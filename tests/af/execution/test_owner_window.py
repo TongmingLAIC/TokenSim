@@ -3,7 +3,7 @@
 import unittest
 from TokenSim.config.af.settings import AFConfig
 from TokenSim.errors import ConfigurationError
-from tests.af.execution.test_batching import batch_runtime, submit_owner
+from tests.af.support.batching import batch_runtime, submit_owner
 
 
 class OwnerWindowTest(unittest.TestCase):

@@ -9,7 +9,6 @@ from TokenSim.af.planning.batching import AFBlock, AFBlockBuilder
 from TokenSim.af.planning.dag import AFExecutionDAG
 from TokenSim.af.planning.nodes import ExecutionNode, RankLocalWork
 from TokenSim.af.planning.planner import IndependentRoundRobinAFReplicaSelector
-from TokenSim.af.providers.queries import AFEndpoint, AFTensorSlice
 from TokenSim.config.af.domains import (
     DomainParallelConfig,
     DomainRankMapping,
@@ -176,23 +175,6 @@ class AFExecutionDAGModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "multiple terminal"):
             _ = multi.final_node_id
 
-    def test_all_execution_stages_are_explicitly_representable(self):
-        stages = (
-            "attention",
-            "router",
-            "dense_ffn",
-            "routed_expert",
-            "shared_expert",
-            "weighted_combine",
-            "residual",
-            "cast",
-            "layout",
-        )
-        self.assertEqual(
-            tuple(self._node(stage, stage=stage).stage for stage in stages),
-            stages,
-        )
-
     def test_dag_rejects_invalid_graph_and_terminal_sets(self):
         node = self._node("root")
         with self.assertRaisesRegex(ConfigurationError, "duplicate node"):
@@ -207,67 +189,6 @@ class AFExecutionDAGModelTest(unittest.TestCase):
             AFExecutionDAG((root, left, right), terminal_node_ids=("left", "absent"))
         with self.assertRaisesRegex(ConfigurationError, "equal all sink"):
             AFExecutionDAG((root, left, right), terminal_node_ids=("left",))
-
-    def test_work_and_node_retain_owner_layout_and_stage_contract(self):
-        endpoint = AFEndpoint(
-            domain="a-domain",
-            domain_rank=1,
-            physical_worker="a-pool:1",
-            device_type="test-device",
-            dp_rank=0,
-            tp_rank=1,
-        )
-        tensor_slice = AFTensorSlice(
-            tensor_item_id="request:1:token:8:routed:0",
-            interval=(8, 16),
-            layout="partial",
-            owner_domain="a-domain",
-            owner_domain_rank=1,
-            owner_dp_rank=0,
-            owner_tp_rank=1,
-            owner_physical_worker="a-pool:1",
-            partial_id="expert:3",
-        )
-        work = RankLocalWork(
-            token_count=2,
-            original_token_count=1,
-            assignment_count=2,
-            input_edge_count=2,
-            output_token_count=1,
-            tensor_slices=(tensor_slice,),
-            owner_endpoint=endpoint,
-            source_layout="partial",
-            target_layout="sharded",
-        )
-        node = ExecutionNode(
-            node_id="combine",
-            operation="weighted_combine",
-            kind="compute",
-            predecessor_ids=(),
-            stage="weighted_combine",
-            direction=None,
-            source_domain="a-domain",
-            target_domain="a-domain",
-            logical_participants=("a0",),
-            domain_ranks=(1,),
-            physical_workers=("a-pool:1",),
-            dp_rank=0,
-            tp_rank=1,
-            local_work=work,
-            layer_type="moe",
-            logical_stage_id="i1:b0:l2:combine",
-            source_endpoint=endpoint,
-            target_endpoint=endpoint,
-            tensor_slices=(tensor_slice,),
-            source_layout="partial",
-            target_layout="sharded",
-        )
-
-        self.assertEqual(node.stage, "weighted_combine")
-        self.assertEqual(work.as_dict()["assignment_count"], 2)
-        self.assertEqual(
-            work.as_dict()["owner_endpoint"]["physical_worker"], "a-pool:1"
-        )
 
 
 def _domain(

@@ -44,6 +44,14 @@ Tests use small deterministic inputs and do not assert historical throughput val
 For documentation-only changes, check sentence layout, prohibited expressions, links and any edited examples.
 Review the diff to confirm that it contains the intended changes and preserves unrelated work.
 
+Keep a regression at the layer where its outcome can be observed.
+Use the shared fixtures in `tests/support/` or `tests/af/support/` to build small deterministic scenarios.
+For focused runs, select the directories for attention/FFN execution, cache and storage, operator data, workloads, or tracing:
+
+```bash
+python -m pytest tests/af tests/kv tests/operator_data tests/workload tests/trace
+```
+
 ## Changes that affect simulated results
 
 Simulations are deterministic for a given input and seed.
@@ -54,7 +62,7 @@ For changes intended to alter results, describe the expected effect and measured
 ## Operator data
 
 Operator packages live in `data/operator_data/<device>/<backend>`.
-Import AIConfigurator measurements with the operator-data CLI as described in [docs/aiconfigurator.md](docs/aiconfigurator.md), or collect your own with [scripts/collect](scripts/collect/README.md).
+Import AIConfigurator measurements with the operator-data CLI as described in [docs/reference/operator-data.md](docs/reference/operator-data.md), or collect your own with [scripts/collect](scripts/collect/README.md).
 Keep each package's `generation_meta.yaml` because it records the source, version and operations included in each measurement.
 Validate a package before committing it.
 

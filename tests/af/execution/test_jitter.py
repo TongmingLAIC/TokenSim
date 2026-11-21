@@ -3,7 +3,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-import simpy
 
 from TokenSim.af.execution.barrier import PeerLayerBarrier
 from TokenSim.af.execution.jitter import perturb_service, request_multiplier
@@ -11,7 +10,7 @@ from TokenSim.af.providers.queries import AFServiceEstimate
 from TokenSim.config.af.settings import AFConfig
 from TokenSim.config.af.jitter import AFJitterConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
-from tests.af.execution.test_batching import batch_runtime, submit_owner
+from tests.af.support.batching import batch_runtime, submit_owner
 
 
 class JitterTest(unittest.TestCase):

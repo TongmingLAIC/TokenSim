@@ -7,7 +7,7 @@ import unittest
 import simpy
 
 from TokenSim.af.execution.executor import AFExecutor
-from tests.af.execution.test_batching import batch_runtime, submit_owner
+from tests.af.support.batching import batch_runtime, submit_owner
 from tests.af.support.config import _cluster
 from tests.af.support.execution import (
     FixedComputeProvider,

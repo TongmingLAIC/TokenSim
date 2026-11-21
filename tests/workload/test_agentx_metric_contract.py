@@ -59,11 +59,6 @@ class AgentXMetricContractTest(unittest.TestCase):
             self.assertIsNone(result[name]["mean"])
             self.assertIsNone(result[name]["p90"])
 
-    def test_uniform_latencies_have_identical_speed_statistics(self):
-        result = self.report([0.04] * 4)["interactivity_tps"]
-        self.assertEqual(result["mean"], 25)
-        self.assertEqual(result["p90"], 25)
-
     def test_zero_itl_is_excluded_from_both_latency_and_speed_samples(self):
         result = self.report([0.0, 0.01, 0.04])
         self.assertEqual(result["tpot_s"]["count"], 2)

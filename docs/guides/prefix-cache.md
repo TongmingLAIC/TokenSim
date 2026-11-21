@@ -1,15 +1,14 @@
 # Prefix Cache
 
 With paged attention, TokenSim reuses cached attention key/value (KV) blocks when requests share a matching prompt prefix.
-The simulator does not tokenize prompts or hash prompt text.
-The workload must provide one `hash_ids` entry for every full input block that should be reusable.
+The workload supplies one `hash_ids` entry for every full input block that should be reusable.
 
 ## Quick Start
 
 The included trace contains three requests that share part of their prompt prefixes.
 
 ```bash
-./benchmark.py \
+tokensim \
   --batching paged-attn \
   --block_size 16 \
   --request_count 3 \
@@ -37,27 +36,7 @@ For `qwen_jsonl`, each line can contain a request with the following fields.
 ```
 
 For `json_pairs`, put the same metadata in the optional third element of each request record.
-
-```json
-[
-  [
-    48,
-    4,
-    {
-      "hash_ids": ["a", "b", "c"],
-      "reuse_group": "tenant-a"
-    }
-  ],
-  [
-    48,
-    4,
-    {
-      "hash_ids": ["a", "b", "x"],
-      "reuse_group": "tenant-a"
-    }
-  ]
-]
-```
+For example, use `[48, 4, {"hash_ids": ["a", "b", "x"], "reuse_group": "tenant-a"}]`.
 
 With `--block_size 16` and `input_length 48`, the three identifiers represent the three complete input blocks.
 Supply at least `floor(input_length / block_size)` identifiers to make every full input block reusable.
@@ -93,8 +72,8 @@ A prefix can be reused only if the pages needed by every cache group are still i
 
 The local prefix index belongs to one worker.
 Data parallelism or separate workers for prompt processing (prefill) and token generation (decode) can send related requests to different workers.
-`--sticky_sessions` or `--router_policy consistent_hash` keep a conversation on one model replica, as described in [Parallelism](parallelism.md).
-Use `MooncakeStoreConnector` to share prefixes through an external store, as described in [Mooncake](mooncake.md).
+`--sticky_sessions` or `--router_policy consistent_hash` keep a conversation on one model replica, as described in [Parallelism](serving.md).
+Use `MooncakeStoreConnector` to share prefixes through an external store, as described in [Mooncake](kv-storage.md).
 
 ## Reusing Generated Output
 
@@ -112,7 +91,7 @@ For a block size of 16, generating 17 tokens makes the first 16 eligible as one 
 Run the included example with the following command.
 
 ```bash
-./benchmark.py \
+tokensim \
   --batching paged-attn \
   --block_size 16 \
   --request_count 2 \
@@ -141,4 +120,31 @@ The result JSON includes the following metrics.
 | `effective_prefill_tokens` | Tokens that still require prefill compute |
 | `prefix_cache_hit_rate` | `hit_blocks / (hit_blocks + miss_blocks)` |
 
-Mooncake-specific local, memory, and SSD hit counters are documented in the [Mooncake guide](mooncake.md).
+Mooncake-specific local, memory, and SSD hit counters are documented in the [Mooncake guide](kv-storage.md).
+
+## Programmable cache policies
+
+Select a policy with `--cache_policy`.
+Use `apc` for automatic prefix caching or `noop` for the baseline cache-control behavior.
+`retain` prioritizes eligible parent content until its retention deadline; `quota` uses replay trace, play and lane identity to group related requests.
+`movement` uses observed idle gaps to move reusable pages to a configured asynchronous store.
+`retain_movement` combines retention and movement.
+`all`, `forced_movement` and `enhanced_coop` combine retention, quota and their respective movement strategies.
+
+Quota reserves distinct resident slots and estimated growth across running, loading and loaded-waiting requests.
+The reservation threshold defaults to 92% of GPU slots.
+Queue scoring uses the current prefix hit count, age and parent status.
+Grouped reservation uses the declared decode window and speculative lookahead.
+Configure policy limits with the `--cache_retention_*`, `--cache_quota_*` and `--cache_prefetch_*` options listed by `tokensim --help`.
+
+`all` and `enhanced_coop` require 80% occupied physical GPU memory and an observed gap of at least 0.5 seconds before demotion.
+`forced_movement` uses a 30-second window without an occupancy gate.
+The source stays valid until the external copy completes.
+`enhanced_coop` uses observed admission and queue service to estimate the window.
+It also accepts explicit `cache_one_shot=true` metadata to bypass private child writes and reclaim eligible unreferenced child pages.
+Parent content and live request or transfer references remain protected.
+The queue window, child write admission and child reclamation have independent Boolean controls.
+
+For ordinary workers, `--kv_cache_memory_bytes` sets a per-rank physical budget below the hardware-derived available memory.
+Choose one capacity source: this byte budget, a token override or an [observed runtime memory profile](workloads.md#observed-runtime-kv-capacity).
+Grouped allocators round the budget down to physical slot boundaries.

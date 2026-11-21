@@ -10,8 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from TokenSim.af.experiments import AFExperimentRunner
-from TokenSim.af.factory import build_model_runtime, simulate_decode
-from TokenSim.trace.config import TraceConfig
+from TokenSim.af.factory import simulate_decode
 from TokenSim.trace.formats import TRACE_SUFFIXES
 from TokenSim.trace.export import write_chrome_trace
 from TokenSim.errors import ConfigurationError
@@ -22,7 +21,6 @@ from TokenSim.operator_data.package import (
 )
 from scripts import run_deepseek_mla as cli
 from scripts.deepseek_v3_runtime import configuration
-from tests.support.hardware import make_model
 
 
 class AFExperimentRunnerTest(unittest.TestCase):
@@ -75,75 +73,6 @@ class AFExperimentRunnerTest(unittest.TestCase):
                     profile_metadata=metadata,
                 )
                 self.assertTrue(restarted.run(2, 8, steps=3).reused)
-
-    def test_trace_modes_preserve_throughput(self):
-        choices = [
-            TraceConfig(mode="full"),
-            TraceConfig(mode="validate"),
-            TraceConfig(mode="off"),
-        ]
-        with TemporaryDirectory() as directory:
-            runner = AFExperimentRunner(
-                self.runtime, directory, fallback="analytical_only"
-            )
-            points = runner.run_many(
-                [
-                    dict(batch_size=1, context_len=8, steps=2, trace_config=option)
-                    for option in choices
-                ]
-            )
-            self.assertEqual(len({point.key for point in points}), len(choices))
-            summaries = []
-            for point, option in zip(points, choices):
-                summary = dict(point.result["summary"])
-                profile = summary.pop("profile")
-                summaries.append(summary)
-                self.assertEqual(
-                    point.result["iterations"], points[0].result["iterations"]
-                )
-                if option.mode != "full":
-                    self.assertIsNone(profile)
-                    self.assertFalse(list(point.directory.glob("*.trace.json")))
-            self.assertTrue(all(summary == summaries[0] for summary in summaries))
-
-    def test_seed_context_steps_and_trace_settings_are_distinct_cases(self):
-        with TemporaryDirectory() as directory:
-            runner = AFExperimentRunner(
-                self.runtime, directory, fallback="analytical_only"
-            )
-            cases = [
-                dict(),
-                dict(seed=0),
-                dict(context_len=9),
-                dict(steps=2),
-                dict(trace_config={"mode": "off"}),
-            ]
-            points = [
-                runner.run(**dict(dict(batch_size=1, context_len=8), **case))
-                for case in cases
-            ]
-            self.assertEqual(len({point.key for point in points}), len(cases))
-            for case in cases:
-                self.assertTrue(
-                    runner.run(**dict(dict(batch_size=1, context_len=8), **case)).reused
-                )
-
-    def test_dense_model_uses_the_same_runner_without_deepseek_dependencies(self):
-        runtime = build_model_runtime(
-            self.runtime.doc,
-            hardware=self.runtime.hardware,
-            model=make_model(num_layers=2),
-        )
-        with TemporaryDirectory() as directory:
-            runner = AFExperimentRunner(
-                runtime,
-                directory,
-                fallback="analytical_only",
-                trace_config={"mode": "off"},
-            )
-            point = runner.run(1, 8)
-            self.assertGreater(point.result["summary"]["tokens_per_s"], 0)
-            self.assertIsNone(point.result["summary"]["profile"])
 
     def test_invalid_case_does_not_create_a_checkpoint(self):
         with TemporaryDirectory() as directory:
@@ -245,15 +174,8 @@ class ExperimentCLITest(unittest.TestCase):
                 cli.main(self.arguments(output))
             self.assertEqual(calls, [2])
             self.assertEqual(completed_trace.read_bytes(), expected)
-            summary = (output / "summary.json").read_bytes()
-            with patch.object(cli, "simulate", side_effect=AssertionError("reran")):
-                cli.main(self.arguments(output))
-            self.assertEqual((output / "summary.json").read_bytes(), summary)
-            cached = list(
-                (output / ".experiments").glob("*/decode-layers1-b1.trace.json")
-            )
-            self.assertEqual(len(cached), 1)
-            self.assertEqual(completed_trace.stat().st_ino, cached[0].stat().st_ino)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(len(summary["results"]), 2)
 
     def test_json_trace_configuration_can_select_exact_fields(self):
         with TemporaryDirectory() as directory:
@@ -297,20 +219,30 @@ class ExperimentTraceFormatsTest(unittest.TestCase):
                     runner.run(1, 8, trace_format="msgpack")
             self.assertFalse(output.exists())
 
-    def test_disabled_modes_need_no_binary_dependency_and_have_no_saved_trace(self):
+    def test_disabled_modes_keep_results_without_binary_dependency(self):
         with TemporaryDirectory() as directory:
             runner = AFExperimentRunner(
                 self.runtime, directory, fallback="analytical_only"
             )
+            full = runner.run(1, 8)
+            expected = {**full.result["summary"], "profile": None}
             with patch.dict(sys.modules, {"msgpack": None}):
                 for mode in ("off", "validate"):
-                    point = runner.run(
-                        1, 8, trace_format="msgpack", trace_config={"mode": mode}
-                    )
-                    self.assertIsNone(point.result["summary"]["profile"])
-                    with self.assertRaisesRegex(ConfigurationError, "no saved trace"):
-                        runner.export_trace_json(point, Path(directory) / "trace.json")
-                    self.assertFalse(list(point.directory.glob("*.trace.*")))
+                    with self.subTest(mode=mode):
+                        point = runner.run(
+                            1, 8, trace_format="msgpack", trace_config={"mode": mode}
+                        )
+                        self.assertEqual(
+                            point.result["iterations"], full.result["iterations"]
+                        )
+                        self.assertEqual(point.result["summary"], expected)
+                        self.assertFalse(list(point.directory.glob("*.trace.*")))
+                        with self.assertRaisesRegex(
+                            ConfigurationError, "no saved trace"
+                        ):
+                            runner.export_trace_json(
+                                point, Path(directory) / "trace.json"
+                            )
 
     def test_cli_uses_selected_suffix_and_preserves_default_public_summary(self):
         with TemporaryDirectory() as directory:

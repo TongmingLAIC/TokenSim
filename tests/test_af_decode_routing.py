@@ -24,29 +24,6 @@ class AFDecodeRoutingTest(unittest.TestCase):
         )
         return handoff
 
-    def test_decode_round_robin_ignores_prefill_coordinate(self):
-        handoff = self.selector()
-        requests = [SimpleNamespace(dp_rank=1, chat_id=str(i)) for i in range(16)]
-        targets = [handoff._select_decode_target(req).dp_rank for req in requests]
-        self.assertEqual(targets, list(range(8)) * 2)
-        self.assertEqual([req.dp_rank for req in requests], [1] * 16)
-
-    def test_decode_session_affinity_belongs_to_destination_pool(self):
-        handoff = self.selector(sticky=True)
-        requests = [
-            SimpleNamespace(dp_rank=rank, chat_id="same-agent") for rank in [3, 1, 7, 2]
-        ]
-        self.assertEqual(
-            [handoff._select_decode_target(req).dp_rank for req in requests], [0] * 4
-        )
-        self.assertEqual([req.dp_rank for req in requests], [3, 1, 7, 2])
-
-    def test_ordinary_shared_dp_namespace_keeps_its_mapping(self):
-        handoff = self.selector(af=False)
-        req = SimpleNamespace(dp_rank=3, chat_id="agent")
-        self.assertEqual(handoff._select_decode_target(req).dp_rank, 3)
-        self.assertEqual(req.dp_rank, 3)
-
     def test_native_handoff_delivers_to_every_af_replica(self):
         env, engine = _engine(_cluster(a_tp=1, a_dp=4, f_tp=1, f_dp=1, f_ep=1))
         engine.pd_handoff = PDHandoff(

@@ -95,131 +95,77 @@ def _cluster(
     placement_strategy="manual",
 ):
     f_ep = f_tp * f_dp if f_ep is None else f_ep
-    a_workers = a_tp * a_dp
-    f_workers = f_tp * f_dp
-    return ClusterConfig(
-        num_workers=a_workers + f_workers,
-        networks={"af-net": "test"},
-        worker_groups=[
-            {
-                "name": "a-pool",
-                "capabilities": ["af_attention"],
-                "hardware": "a-device",
-                "num_workers": a_workers,
-                "network": "af-net",
-            },
-            {
-                "name": "f-pool",
-                "capabilities": ["af_ffn"],
-                "hardware": "f-device",
-                "num_workers": f_workers,
-                "network": "af-net",
-            },
-        ],
-        af={
-            "enabled": True,
-            "communication_domains": {
-                "node_size": 8,
-                "node_count": (
-                    (a_workers + 7) // 8 + (f_workers + 7) // 8
-                    if placement_strategy == "dedicated"
-                    else (a_workers + f_workers + 7) // 8
-                ),
-                "placement_strategy": placement_strategy,
-            },
-            "af_block_size": 1,
-            "links": [
-                {
-                    "name": "af-link",
-                    "attention_group": "a-pool",
-                    "ffn_group": "f-pool",
-                    "attention_domain": "a-domain",
-                    "ffn_domain": "f-domain",
-                    "network": "af-net",
-                    "resource_group": "af-fabric",
-                    "duplex": "full",
-                    "a_to_f_capacity": 1,
-                    "f_to_a_capacity": 1,
-                }
-            ],
-            "execution_domains": [
-                {
-                    "name": "a-domain",
-                    "capability": "af_attention",
-                    "worker_group": "a-pool",
-                    "parallel": {
-                        "tensor_parallel_size": a_tp,
-                        "pipeline_parallel_size": 1,
-                        "data_parallel_size": a_dp,
-                    },
-                    "logical_instances": [
-                        _replica("a-pool", f"a{rank}", rank, a_tp, 1, rank * a_tp)
-                        for rank in range(a_dp)
-                    ],
-                    "communication_plan": (
-                        [
-                            {
-                                "operation": "all_reduce",
-                                "after_stage": "a_compute",
-                                "participants": list(range(a_tp)),
-                                "network": "af-net",
-                                "resource_group": "af-fabric",
-                                "resource_lane": "a_to_f",
-                            },
-                            {
-                                "operation": "all_gather",
-                                "after_stage": "residual",
-                                "participants": list(range(a_tp)),
-                                "network": "af-net",
-                                "resource_group": "af-fabric",
-                                "resource_lane": "f_to_a",
-                            },
-                        ]
-                        if a_tp > 1
-                        else []
-                    ),
-                },
-                {
-                    "name": "f-domain",
-                    "capability": "af_ffn",
-                    "worker_group": "f-pool",
-                    "parallel": {
-                        "tensor_parallel_size": f_tp,
-                        "pipeline_parallel_size": 1,
-                        "data_parallel_size": f_dp,
-                        "expert_parallel_size": f_ep,
-                        "expert_placement_strategy": expert_placement_strategy,
-                    },
-                    "logical_instances": [
-                        _replica(
-                            "f-pool",
-                            f"f{rank}",
-                            rank,
-                            f_tp,
-                            f_ep,
-                            rank * f_tp,
-                            f_tp * f_dp // f_ep,
-                        )
-                        for rank in range(f_dp)
-                    ],
-                    "communication_plan": (
-                        [
-                            {
-                                "operation": "all_reduce",
-                                "after_stage": "expert_compute",
-                                "participants": list(range(f_tp)),
-                                "network": "af-net",
-                                "resource_group": "af-fabric",
-                                "resource_lane": "f_to_a",
-                            }
-                        ]
-                        if f_tp > 1
-                        else []
-                    ),
-                },
-            ],
-        },
+    raw = _cluster_dict(attention_workers=a_tp * a_dp, ffn_workers=f_tp * f_dp)
+    raw["networks"]["af-net"] = "test"
+    af = raw["af"]
+    af.pop("trace_enabled")
+    af["communication_domains"]["placement_strategy"] = placement_strategy
+    if placement_strategy == "dedicated":
+        af["communication_domains"]["node_count"] = sum(
+            (group["num_workers"] + 7) // 8 for group in raw["worker_groups"]
+        )
+    af["links"][0].update(
+        attention_domain="a-domain",
+        ffn_domain="f-domain",
+        resource_group="af-fabric",
     )
+
+    domain_layouts = (
+        (
+            "a",
+            a_tp,
+            a_dp,
+            1,
+            (
+                ("all_reduce", "a_compute", "a_to_f"),
+                ("all_gather", "residual", "f_to_a"),
+            ),
+        ),
+        ("f", f_tp, f_dp, f_ep, (("all_reduce", "expert_compute", "f_to_a"),)),
+    )
+    domains = []
+    for group, (role, tp, dp, ep, collectives) in zip(
+        raw["worker_groups"], domain_layouts
+    ):
+        name = group["name"]
+        parallel = dict(
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=1,
+            data_parallel_size=dp,
+        )
+        if role == "f":
+            parallel.update(
+                expert_parallel_size=ep,
+                expert_placement_strategy=expert_placement_strategy,
+            )
+        domains.append(
+            dict(
+                name=f"{role}-domain",
+                capability=group["capabilities"][0],
+                worker_group=name,
+                parallel=parallel,
+                logical_instances=[
+                    _replica(
+                        name, f"{role}{rank}", rank, tp, ep, rank * tp, tp * dp // ep
+                    )
+                    for rank in range(dp)
+                ],
+                communication_plan=[
+                    dict(
+                        operation=operation,
+                        after_stage=stage,
+                        participants=list(range(tp)),
+                        network="af-net",
+                        resource_group="af-fabric",
+                        resource_lane=lane,
+                    )
+                    for operation, stage, lane in collectives
+                    if tp > 1
+                ],
+            )
+        )
+    af["execution_domains"] = domains
+    return ClusterConfig(**raw)
 
 
 def _with_prefill_pool(cluster):

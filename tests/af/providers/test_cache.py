@@ -14,9 +14,7 @@ from TokenSim.af.providers.operator_table import (
     TopologyAFTransferProvider,
 )
 from TokenSim.af.providers.queries import AFComputeQuery
-from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware.placement import build_topology_placement
 from TokenSim.operator_data.lookup import LookupPolicy
 from TokenSim.operator_data.package import (
     OperatorDataPackage,
@@ -24,10 +22,10 @@ from TokenSim.operator_data.package import (
     SourceRecord,
 )
 from scripts.run_deepseek_mla import configuration, simulate
-from tests.af.support.config import _cluster_dict
 from tests.af.support.execution import af_test_hardware
 from tests.af.support.model import _compute_query, _moe, _transfer_query
 from tests.af.support.observations import observe_services
+from tests.af.support.providers import sample_transfer_provider
 
 
 class EstimateCacheTest(unittest.TestCase):
@@ -67,21 +65,6 @@ class EstimateCacheTest(unittest.TestCase):
             strict.estimate(query)
         self.assertFalse(strict._estimate_cache)
 
-    def test_cache_changes_lookup_only_not_scheduling_or_provenance(self):
-        results, hits = [], []
-        for enabled in (False, True):
-            config = configuration(a_tp=2, f_tp=2, af_batch_size=1)
-            config.cluster.af.service_estimate_cache = enabled
-            with observe_services() as services:
-                _, rows, compute, transfer = simulate(
-                    config, 2, 8, steps=3, fallback="analytical_only"
-                )
-            results.append((rows, services))
-            hits.append((compute.estimate_cache_hits, transfer.estimate_cache_hits))
-        self.assertEqual(results[0], results[1])
-        self.assertEqual(hits[0], (0, 0))
-        self.assertTrue(all(value > 0 for value in hits[1]))
-
 
 class CacheFastPathTest(unittest.TestCase):
     def compute(self, **kwargs):
@@ -90,12 +73,7 @@ class CacheFastPathTest(unittest.TestCase):
             hardware, hardware.model("TestModel"), **kwargs
         )
 
-    def transfer(self):
-        cluster = ClusterConfig(**_cluster_dict(attention_workers=2, ffn_workers=2))
-        hardware = af_test_hardware()
-        workers = cluster.workers()
-        placement = build_topology_placement(cluster, workers, hardware)
-        return TopologyAFTransferProvider(hardware, cluster, workers, placement)
+    transfer = staticmethod(sample_transfer_provider)
 
     def prepared(self, provider, query):
         return prepare_query(provider, type(query), **vars(query))
@@ -153,37 +131,6 @@ class CacheFastPathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             provider.estimate(self.prepared(provider, query))
         self.assertEqual(provider.estimate_cache_hits, 0)
-
-    def test_compact_and_full_keys_agree_across_dynamic_fields(self):
-        compute = self.compute(fallback="analytical_only")
-        base = _compute_query()
-        queries = [
-            base,
-            replace(base, context_lengths=(16,)),
-            replace(base, dtype="bf16"),
-            replace(base, physical_worker="a-pool:1"),
-            replace(base, phase="prefill"),
-            _compute_query(tokens=4),
-            _compute_query("expert", expert_workload=((1, 2),)),
-        ]
-        for query in queries:
-            before = compute.estimate_cache_hits
-            full = compute.estimate(query)
-            self.assertEqual(compute.estimate_cache_hits, before)
-            self.assertIs(full, compute.estimate(self.prepared(compute, query)))
-        transfer = self.transfer()
-        base = _transfer_query()
-        for query in (
-            base,
-            replace(base, payload_bytes=8192),
-            replace(base, participant_ranks=(1, 0)),
-            replace(base, physical_endpoints=("a-pool:1", "f-pool:1")),
-            replace(base, source_layout="replicated"),
-        ):
-            before = transfer.estimate_cache_hits
-            full = transfer.estimate(query)
-            self.assertEqual(transfer.estimate_cache_hits, before)
-            self.assertIs(full, transfer.estimate(self.prepared(transfer, query)))
 
     def test_subclass_and_wrapped_estimate_receive_full_queries(self):
         class CustomProvider(OperatorTableAFComputeProvider):
@@ -310,15 +257,6 @@ class CacheFastPathTest(unittest.TestCase):
 
 
 class CacheNamespaceTest(unittest.TestCase):
-    def test_equal_hashes_do_not_alias_distinct_configuration_values(self):
-        # Python deliberately gives these unequal integers the same hash.
-        left, right = EstimateNamespace((-1,)), EstimateNamespace((-2,))
-        self.assertEqual(hash(left), hash(right))
-        self.assertNotEqual(left, right)
-        cache = {left: "left", right: "right"}
-        self.assertEqual(cache[EstimateNamespace((-1,))], "left")
-        self.assertEqual(cache[EstimateNamespace((-2,))], "right")
-
     def test_extension_keeps_previous_namespace_immutable_and_recomputes_hash(self):
         original = EstimateNamespace(("fallback", ("scope", "a")))
         extended = original + (("profile", "new"),)

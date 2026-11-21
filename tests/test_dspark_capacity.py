@@ -14,7 +14,7 @@ from TokenSim.config.weight_memory import packed_weight_memory
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import HardwareContext
 from tests.test_dspark import model
-from tests.test_kv_cache import layout
+from tests.support.kv import layout
 
 ROOT = Path(__file__).resolve().parents[1]
 

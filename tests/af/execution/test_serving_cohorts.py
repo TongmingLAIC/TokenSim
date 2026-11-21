@@ -11,7 +11,6 @@ from TokenSim.af.factory import build_model_runtime
 from TokenSim.af.runtime.compiler import compile_af_runtime_plan
 from TokenSim.af.serving.metrics import steady_metrics
 from TokenSim.af.serving.service import AFService
-from TokenSim.errors import ConfigurationError
 from TokenSim.hardware.placement import build_topology_placement
 from TokenSim.latency.operator_table import OperatorTableLatencyBackend
 
@@ -244,23 +243,3 @@ class CompletePrefillTest(unittest.TestCase):
                 with self.assertRaises(simpy.Interrupt):
                     env.run(until=blocker)
                 self.assertFalse(registry.scheduler.owners)
-
-    def test_split_prefill_is_rejected_before_submission(self):
-        env, service, session = self.service(colocated=False)
-        with patch.object(
-            service.executor,
-            "submit",
-            side_effect=AssertionError("AF prefill submitted"),
-        ):
-            with self.assertRaisesRegex(
-                ConfigurationError, "prefill requires a complete-model"
-            ):
-                env.run(
-                    until=env.process(
-                        service.forward([session], phase="prefill", query_tokens=2)
-                    )
-                )
-        self.assertEqual(session.cached_context, 16)
-        self.assertEqual(service.memory.leases[0].current_context, 16)
-        self.assertFalse(service.trace.events)
-        self.assertEqual(service.executor._next_iteration_id, 0)

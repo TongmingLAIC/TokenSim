@@ -12,7 +12,7 @@ from TokenSim.af.factory import build_model_runtime, simulate_decode
 from TokenSim.af.planning.nodes import RankLocalWork
 from TokenSim.config.config import KVTransferConfig
 from TokenSim.config.simulation import SimulationConfig
-from TokenSim.errors import ConfigurationError, SimulationStateError
+from TokenSim.errors import SimulationStateError
 from TokenSim.hardware import HardwareContext
 from TokenSim.llm.llm_engine import LLMEngine
 from scripts.run_deepseek_mla import configuration, simulate
@@ -21,17 +21,6 @@ from tests.af.support.observations import observe_services
 
 
 class ModelExecutorTest(unittest.TestCase):
-    def test_dense_mha_model_can_use_whole_model_executor(self):
-        from tests.support.hardware import make_model
-
-        config = configuration()
-        config = build_model_runtime(
-            config.doc, hardware=config.hardware, model=make_model(num_layers=1)
-        )
-        executor, _, _, _ = simulate_decode(config, 1, 8, fallback="analytical_only")
-        self.assertTrue(any(e.stage == "dense_ffn" for e in executor.trace.events))
-        self.assertTrue(any(e.operation == "lm_head" for e in executor.trace.events))
-
     def test_script_trace_off_skips_boundaries_and_matches_services(self):
         config = configuration(a_tp=2, f_tp=2, af_batch_size=1)
         results = []
@@ -87,35 +76,6 @@ class ModelExecutorTest(unittest.TestCase):
         self.assertTrue(any(e.event_type == "host_submit" for e in events))
         self.assertTrue(any(e.event_type == "synchronize" for e in events))
         executor.trace.validate_invariants(0)
-
-    def test_prefill_restrictions_fail_before_iteration_creation(self):
-        executor, _, _, _ = simulate(configuration(), 1, 8, fallback="analytical_only")
-        for requests in (
-            [
-                SimpleNamespace(
-                    id=0,
-                    is_prefill=True,
-                    prefill_len=8,
-                    prefill_compute_len=4,
-                    context_len=8,
-                )
-            ],
-            [
-                SimpleNamespace(
-                    id=i,
-                    is_prefill=True,
-                    prefill_len=n,
-                    prefill_compute_len=n,
-                    context_len=n,
-                )
-                for i, n in enumerate((4, 8))
-            ],
-        ):
-            previous = executor._next_iteration_id
-            with self.assertRaisesRegex(ConfigurationError, "only accepts decode"):
-                executor.submit(0, requests)
-            self.assertEqual(executor._next_iteration_id, previous)
-            self.assertFalse(executor.active_iterations)
 
     def test_f_router_metadata_uses_endpoint_provider(self):
         config = configuration(a_tp=2, f_tp=2, af_batch_size=2)

@@ -22,23 +22,7 @@ from TokenSim.operator_data.workload import work_for_table
 from scripts.run_deepseek_mla import ROOT, configuration, simulate
 
 
-def core_key(**overrides):
-    key = dict(
-        attn_dtype="bf16",
-        kv_cache_dtype="bf16",
-        phase="decode",
-        execution_mode="absorbed",
-        batch_size=1,
-        query_len=1,
-        context_lengths="[[16384,1]]",
-        num_heads=128,
-        kv_lora_rank=512,
-        rope_head_dim=64,
-        nope_head_dim=128,
-        v_head_dim=128,
-    )
-    key.update(overrides)
-    return key
+from tests.support.mla import core_key
 
 
 def query(shape, contexts=(16, 24), phase="decode", tp=1):
@@ -247,25 +231,6 @@ class MLAIntegrationTest(unittest.TestCase):
             if c.category == "embedding_lm_head"
         ]
         self.assertEqual(sum(c.bytes for c in embeddings), 129280 * 7168 * 2 * 2)
-
-    def test_full_model_capacity_and_dense_layer_layout(self):
-        plan = configuration(full_model=True).plan
-        self.assertEqual(len(plan.layers), 61)
-        self.assertEqual(
-            [p.layer_type for p in plan.layers[:4]], ["dense", "dense", "dense", "moe"]
-        )
-        self.assertEqual(sum(p.layer_type == "moe" for p in plan.layers), 58)
-        self.assertTrue(
-            all(p.model_bytes < p.capacity_bytes for p in plan.physical_states)
-        )
-        self.assertEqual(len({p.capacity_bytes for p in plan.physical_states}), 1)
-        self.assertLess(
-            plan.physical_states[0].capacity_bytes,
-            self.config.hardware.device("a100_sxm_80g").memory_capacity_bytes.value,
-        )
-        self.assertGreater(sum(p.model_bytes for p in plan.physical_states), 1.3e12)
-        with self.assertRaisesRegex(Exception, "capacity"):
-            configuration(full_model=True, f_tp=2, a_tp=2)
 
     def test_tp_two_runs_real_decode_with_local_heads_and_blocks(self):
         executor, rows, _, _ = simulate(

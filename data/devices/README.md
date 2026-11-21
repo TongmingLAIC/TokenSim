@@ -3,7 +3,7 @@
 Each YAML file describes one accelerator.
 The catalog loads YAML files recursively, including grouped device examples in subdirectories.
 Every number carries a `source_id` (declared in the file's `sources:` block) and an evidence grade: **A** official spec or first-party measurement, **B** public third-party benchmark, **C** calibrated or derived estimate, **D** project assumption.
-See [`TokenSim/hardware/README.md`](../../TokenSim/hardware/README.md) for the field definitions and [`docs/operator-latency-model.md`](../../docs/operator-latency-model.md) for how the values are used.
+See [`TokenSim/hardware/README.md`](../../TokenSim/hardware/README.md) for the field definitions and [the operator latency model](../../docs/reference/operator-latency-model.md) for how the values are used.
 
 ## Devices and available operator data
 
@@ -32,11 +32,11 @@ The table uses GEMM for matrix multiplication, MoE for mixture-of-experts comput
 | `b300_sxm` | NVIDIA B300 SXM (HGX B300) | nvidia_gpu | A compute / C memory+fp4 | `b300_sxm` | same as B200 | INT8 tensor throughput reduced on Blackwell Ultra |
 | `gb200` | NVIDIA GB200 (NVL72) | nvidia_gpu | **C** (per-GPU derived) | `gb200` | same as B200; collectives 2/4 GPUs only (4 GPUs per tray, `--gpus-per-node 4`) | topology `gb200_nvl72` |
 | `gb300` | NVIDIA GB300 (NVL72, Blackwell Ultra) | nvidia_gpu | **C** (per-GPU derived) | `gb300` | same as B200; collectives 2/4 GPUs only | topology `gb300_nvl72` |
-| `groqchip_v1` | Groq GroqChip v1 (TSP / LPU) | groq_tsp | A (product brief, ISCA papers) | — | `analytical` only (grade D formulas) | no measured kernels; see docs/data-collection-checklist.md §4 |
+| `groqchip_v1` | Groq GroqChip v1 (TSP / LPU) | groq_tsp | A (product brief, ISCA papers) | — | `analytical` only (grade D formulas) | analytical kernel costs |
 | `intel_arc_pro_b60` | Intel Arc Pro B60 (XPU) | generic | A memory / C compute | `b60` | vllm 0.26.0 (+0.20.0); oneCCL 2021.17.2 collectives | only vLLM XPU exists upstream; analytical family `generic` |
 
 With the default `table_first` fallback policy, "none" means operator times for that device are estimated by formulas and reported as `match_type = analytical`.
-Priority for local measurement is documented in [`docs/data-collection-checklist.md`](../../docs/data-collection-checklist.md).
+Use the [coverage command](../../docs/reference/operator-data.md#package-tools) to select measurements for a model and layout.
 
 ### Why versions differ between systems
 
@@ -72,9 +72,6 @@ Devices without an upstream system file (H20, RTX 4090, V100) borrow the values 
 
 ## Adding a device
 
-Experimental HBF1/HBF2 memory variants in `hbf/` are independent catalog entries with grade D memory assumptions and separate device IDs.
-See [HBF examples](../../docs/hbf.md) for their parameters and storage selection.
-
 1. Copy the YAML for the closest device and change `device_id`, `display_name` and `aliases`.
    Names such as `B200`, `B300` and `H100` identify the SXM/HGX devices.
    Superchip entries (`gb200`, `gb300`) use only `GB...` aliases, keeping `B300` distinct from the NVL72 superchip.
@@ -89,3 +86,28 @@ See [HBF examples](../../docs/hbf.md) for their parameters and storage selection
        -s tests \
        -t .
    ```
+
+## HBF memory variants
+
+The [`hbf/`](hbf/) directory contains experimental memory variants of H100, H200 and B200.
+Each entry uses its base GPU compute and interconnect values with separate memory kind, capacity and bandwidth assumptions (grade D).
+Base-device aliases such as `H100` continue to select the standard GPU.
+
+| Device ID | GPU memory | Capacity per GPU | Bandwidth per GPU |
+| --- | --- | --- | --- |
+| `h100_sxm_hbf1` | GDDR7 | 32 GiB | 1.792 TB/s |
+| `h100_sxm_hbf1_48gib` | GDDR7 | 48 GiB | 1.344 TB/s |
+| `h100_sxm_hbf2` | HBM3e | 48 GiB | 1.5 TB/s |
+| `h200_sxm_hbf1` | GDDR7 | 32 GiB | 1.792 TB/s |
+| `h200_sxm_hbf2` | HBM3e | 48 GiB | 1.5 TB/s |
+| `b200_sxm_hbf1` | GDDR7 | 64 GiB | 3.584 TB/s |
+| `b200_sxm_hbf1_48gib` | GDDR7 | 96 GiB | 2.688 TB/s |
+| `b200_sxm_hbf2` | HBM3e | 96 GiB | 4 TB/s |
+
+Select a variant in the worker group's `hardware` field.
+`data/clusters/8_h100/tp8_hbf1.json` provides an eight-GPU HBF1 example.
+GPU variants can use HBF storage, SSD storage or no external store.
+Each variant has a distinct device ID and evaluates operator times through the analytical model under the default `table_first` policy.
+Add measurements under the variant's own device ID when available.
+
+Choose the [HBF storage plugin](../../examples/storage/hbf/README.md) separately when modeling flash as external KV storage.

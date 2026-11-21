@@ -6,33 +6,12 @@ from unittest.mock import patch
 import simpy
 
 from TokenSim.block.hybrid.manager import HybridKVBlockManager
-from TokenSim.block.hybrid.kv_layout import CacheGroup, CacheLayerPage, HybridKVLayout
 from TokenSim.llm.llm_request import Request, RequestStatus
 from TokenSim.llm.llm_scheduler import LLMPagedAttnScheduler
 from TokenSim.errors import ConfigurationError
 
 
-def layout(eagle=False):
-    return HybridKVLayout(
-        groups=(
-            CacheGroup(0, (CacheLayerPage("full", "full", 16, 8, alignment=1),)),
-            CacheGroup(
-                1,
-                (
-                    CacheLayerPage(
-                        "window", "window", 4, 16, window_tokens=8, alignment=1
-                    ),
-                ),
-                eagle=eagle,
-            ),
-        ),
-        logical_block_tokens=16,
-        physical_slot_bytes=128,
-        retention_interval=32,
-        speculative_tokens=1 if eagle else 0,
-        max_in_flight_tokens=8,
-        max_model_len=256,
-    )
+from tests.support.kv import layout
 
 
 class GroupedCacheTest(unittest.TestCase):

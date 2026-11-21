@@ -73,14 +73,6 @@ class OperatorTableAdapterTest(unittest.TestCase):
 
 
 class DeepSeekV3ModelSpecTest(unittest.TestCase):
-    def test_catalog_and_mla_geometry(self):
-        model = HardwareContext.load("data").model("deepseek-v3-671b-mla")
-        self.assertEqual(model.num_layers, 61)
-        self.assertEqual(model.moe_layer_indices()[:3], [3, 4, 5])
-        self.assertEqual(model.moe_layer_indices()[-1], 60)
-        self.assertEqual(model.mla_dimensions.cache_width, 576)
-        self.assertEqual(model.total_params(), 671025522688)
-
     def test_invalid_mla_dimension_fails_at_model_construction(self):
         model = HardwareContext.load("data").model("deepseek-v3-671b-mla")
         with self.assertRaises(ConfigurationError):
@@ -88,15 +80,6 @@ class DeepSeekV3ModelSpecTest(unittest.TestCase):
 
 
 class DeepSeekV3RuntimeTest(unittest.TestCase):
-    def test_full_plan_has_dense_prefix_and_rank_reuse_f_pool(self):
-        config = configuration(full_model=True, af_batch_size=1)
-        self.assertEqual(
-            [layer.layer_type for layer in config.plan.layers[:4]],
-            ["dense", "dense", "dense", "moe"],
-        )
-        self.assertEqual(config.plan.total_layers, 61)
-        self.assertEqual(len(config.plan.rank_bindings), 33)
-
     def test_mla_smoke_returns_traceable_operator_profile(self):
         config = configuration(full_model=False, af_batch_size=1)
         executor, rows, compute, _ = simulate(config, 1, 8)

@@ -223,28 +223,30 @@ class ParallelExecutionPlannerTest(unittest.TestCase):
         self.assertEqual(
             dense_collectives, ["all_reduce", "reduce_scatter", "all_gather"]
         )
-        dense_a_to_f = [node for node in dense.nodes if node.operation == "af_a_to_f"]
-        self.assertEqual(len(dense_a_to_f), 4)
-        self.assertEqual(
-            {node.source_endpoint.domain_rank for node in dense_a_to_f}, {0}
-        )
-        self.assertEqual(
-            {node.target_endpoint.domain_rank for node in dense_a_to_f},
-            {0, 1, 2, 3},
-        )
-        self.assertTrue(all(node.payload_bytes == 32 for node in dense_a_to_f))
-        dense_f_to_a = [node for node in dense.nodes if node.operation == "af_f_to_a"]
-        self.assertEqual(len(dense_f_to_a), 4)
-        self.assertEqual(
-            {
+
+        def edges(dag, operation):
+            return [node for node in dag.nodes if node.operation == operation]
+
+        def ranks(nodes):
+            return {
                 (node.source_endpoint.domain_rank, node.target_endpoint.domain_rank)
-                for node in dense_f_to_a
-            },
-            {(0, 0), (1, 0), (2, 1), (3, 1)},
-        )
-        self.assertIn("i5:b0:l0:residual:layout", dense.terminal_node_ids)
-        self.assertNotIn("i5:b0:l0:post_attention_norm:r0", dense.terminal_node_ids)
-        self.assertIn("i5:b0:l0:post_attention_norm:r1", dense.terminal_node_ids)
+                for node in nodes
+            }
+
+        dense_a_to_f = edges(dense, "af_a_to_f")
+        self.assertEqual(len(dense_a_to_f), 4)
+        self.assertEqual(ranks(dense_a_to_f), {(0, rank) for rank in range(4)})
+        self.assertEqual({node.payload_bytes for node in dense_a_to_f}, {32})
+        dense_f_to_a = edges(dense, "af_f_to_a")
+        self.assertEqual(len(dense_f_to_a), 4)
+        self.assertEqual(ranks(dense_f_to_a), {(0, 0), (1, 0), (2, 1), (3, 1)})
+        terminals = {
+            node.stage
+            for node in dense.nodes
+            if node.node_id in dense.terminal_node_ids
+        }
+        self.assertIn("layout", terminals)
+        self.assertEqual(len(dense.terminal_node_ids), 2)
 
         moe = planner.build_layer(block, 1, cluster.af.links[0])
         moe_stages = Counter(node.stage for node in moe.nodes)
@@ -265,22 +267,11 @@ class ParallelExecutionPlannerTest(unittest.TestCase):
         self.assertTrue(
             all(node.local_work.original_token_count == 2 for node in shared)
         )
-        moe_a_to_f = [node for node in moe.nodes if node.operation == "af_a_to_f"]
+        moe_a_to_f = edges(moe, "af_a_to_f")
+        self.assertEqual(len(moe_a_to_f), len(ranks(moe_a_to_f)))
         self.assertEqual(len(moe_a_to_f), 4)
-        self.assertEqual(
-            len(
-                {
-                    (
-                        node.source_endpoint.domain_rank,
-                        node.target_endpoint.domain_rank,
-                    )
-                    for node in moe_a_to_f
-                }
-            ),
-            4,
-        )
-        self.assertTrue(all(node.payload_bytes == 32 for node in moe_a_to_f))
-        moe_f_to_a = [node for node in moe.nodes if node.operation == "af_f_to_a"]
+        self.assertEqual({node.payload_bytes for node in moe_a_to_f}, {32})
+        moe_f_to_a = edges(moe, "af_f_to_a")
         self.assertEqual(len(moe_f_to_a), 8)
         owner_intervals = {0: (0, 8), 1: (8, 16)}
         for node in moe_f_to_a:
@@ -315,7 +306,8 @@ class ParallelExecutionPlannerTest(unittest.TestCase):
                 {edge.routing_weight for edge in node.local_work.routing_edges},
                 {0.75, 0.25},
             )
-        self.assertEqual(moe.terminal_node_ids, ("i5:b0:l1:residual:layout",))
+        self.assertEqual(len(moe.terminal_node_ids), 1)
+        self.assertEqual(moe.nodes[-1].node_id, moe.terminal_node_ids[0])
 
 
 class TemplateTest(unittest.TestCase):

@@ -3,7 +3,6 @@ from __future__ import annotations
 from TokenSim.config.simulation import SimulationConfig
 
 import json
-import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,13 +11,9 @@ from unittest.mock import patch
 import simpy
 
 from TokenSim.config.config import ClusterConfig, KVTransferConfig, WorkerGroupConfig
-from TokenSim.config.workload_config import WorkloadConfig
-from TokenSim.results import MetricData
-from TokenSim.hardware.links import LinkCatalog
-from TokenSim.latency.base import LatencyBackend
 from TokenSim.llm.llm_engine import LLMEngine, Task
 from TokenSim.llm.llm_request import Request, RequestStatus
-from tests.support.hardware import make_device, make_hardware, make_links, make_model
+from tests.support.hardware import make_hardware
 from TokenSim.workload.source import LLMSource
 from TokenSim.reporting import (
     RunReport,
@@ -27,71 +22,16 @@ from TokenSim.reporting import (
     get_mooncake_stats,
 )
 
-PREFILL_LATENCY = 0.0012
-DECODE_LATENCY = 0.0023
-
-# Tiny model so that a 32-token request spans exactly two 16-token blocks and
-# the KV bytes are easy to reason about: 1 head x head_dim 1 x (K,V) x fp16 x 1 layer = 4 B/token.
-_MODEL = make_model(
-    "TestModel",
-    hidden_size=1,
-    intermediate_size=2,
-    num_layers=1,
-    num_attention_heads=1,
-    vocab_size=4,
+from tests.support.pd import (
+    DECODE_LATENCY,
+    PREFILL_LATENCY,
+    _DeterministicBackend,
+    _DEVICE,
+    _MODEL,
+    _expected_transfer_latency,
+    _pd_cluster,
+    _workload_config,
 )
-_DEVICE = make_device("TestGPU", memory_gib=0.0002)
-
-
-class _DeterministicBackend(LatencyBackend):
-    """Fixed service times so timing assertions stay exact."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, int]] = []
-
-    def estimate_step_latency(self, requests):
-        if requests[0].is_prefill or getattr(requests[0], "needs_recompute", False):
-            self.calls.append(("prefill", len(requests)))
-            return PREFILL_LATENCY
-        self.calls.append(("decode", len(requests)))
-        return DECODE_LATENCY
-
-
-def _workload_config() -> WorkloadConfig:
-    return WorkloadConfig(
-        distribution="burst",
-        prefill_mean_len=32,
-        prefill_range_len=0,
-        decode_mean_len=2,
-        decode_range_len=0,
-        decode_len_distribution="uniform",
-        first_token_latency=MetricData(0, 0, 0),
-        decode_token_latency=MetricData(0, 0, 0),
-        qps=1,
-    )
-
-
-def _pd_cluster() -> ClusterConfig:
-    return ClusterConfig(
-        num_workers=2,
-        networks={"net1": "ethernet-test"},
-        worker_groups=[
-            WorkerGroupConfig(
-                role="prefill", hardware="TestGPU", num_workers=1, network="net1"
-            ),
-            WorkerGroupConfig(
-                role="decode", hardware="TestGPU", num_workers=1, network="net1"
-            ),
-        ],
-        kv_transfer=KVTransferConfig(kv_connector="P2PConnector"),
-    )
-
-
-def _expected_transfer_latency(bytes_: int) -> float:
-    # Both workers share network net1, so the synthesized topology puts them in
-    # one node connected by the device's scale-up link.
-    link = LinkCatalog(make_links()).get("nvlink-test")
-    return link.transfer_us(bytes_) * 1e-6
 
 
 def _run_single_request_p2p() -> (
@@ -246,67 +186,39 @@ class KVTransferIntegrationTest(unittest.TestCase):
 
         stats = get_connector_stats(engine)
 
-        self.assertTrue(request.is_done)
         self.assertEqual(request.status, RequestStatus.FINISHED_STOPPED)
-        self.assertEqual(len(engine.timing_recorder.timing.time), 1)
-        self.assertEqual(engine.timing_recorder.timing.time[0].id, request.id)
+        self.assertEqual(
+            [row.id for row in engine.timing_recorder.timing.time], [request.id]
+        )
         self.assertEqual(backend.calls, [("prefill", 1), ("decode", 1)])
-        self.assertEqual(stats["connector_transfer_count"], 2)
-        self.assertEqual(stats["connector_transfer_blocks"], expected_blocks * 2)
-        self.assertEqual(stats["connector_transfer_bytes"], expected_bytes * 2)
-        self.assertTrue(
-            math.isclose(
-                stats["connector_transfer_latency"],
-                expected_transfer_latency * 2,
-                rel_tol=0,
-                abs_tol=1e-15,
-            )
+        counts = dict(
+            connector_transfer_count=2,
+            connector_transfer_blocks=expected_blocks * 2,
+            connector_transfer_bytes=expected_bytes * 2,
+            connector_producer_count=1,
+            connector_consumer_count=1,
+            connector_placement_decision_count=2,
         )
-        self.assertTrue(
-            math.isclose(
-                stats["connector_load_wait_time"],
-                expected_transfer_latency,
-                rel_tol=0,
-                abs_tol=1e-15,
-            )
-        )
-        self.assertTrue(
-            math.isclose(
-                stats["connector_save_wait_time"],
-                expected_transfer_latency,
-                rel_tol=0,
-                abs_tol=1e-15,
-            )
-        )
-        self.assertEqual(stats["connector_producer_count"], 1)
-        self.assertEqual(stats["connector_consumer_count"], 1)
-        self.assertEqual(stats["connector_placement_decision_count"], 2)
+        self.assertEqual({key: stats[key] for key in counts}, counts)
+        wait = expected_transfer_latency
+        for key, expected in (
+            ("connector_transfer_latency", 2 * wait),
+            ("connector_load_wait_time", wait),
+            ("connector_save_wait_time", wait),
+        ):
+            self.assertAlmostEqual(stats[key], expected, delta=1e-15)
         self.assertEqual(request.prefill_batch_size, 1)
         self.assertEqual(request.decode_batch_sum, 1)
-        self.assertTrue(
-            math.isclose(
-                request.prefill_service_time, PREFILL_LATENCY, rel_tol=0, abs_tol=1e-15
-            )
+        self.assertAlmostEqual(
+            request.prefill_service_time, PREFILL_LATENCY, delta=1e-15
         )
-        self.assertTrue(
-            math.isclose(
-                request.decode_service_time_sum,
-                DECODE_LATENCY,
-                rel_tol=0,
-                abs_tol=1e-15,
-            )
+        self.assertAlmostEqual(
+            request.decode_service_time_sum, DECODE_LATENCY, delta=1e-15
         )
-        self.assertTrue(
-            duration > request.prefill_service_time + request.decode_service_time_sum
+        self.assertAlmostEqual(
+            request.decode_time_sum, DECODE_LATENCY + wait, delta=1e-15
         )
-        self.assertTrue(
-            math.isclose(
-                request.decode_time_sum,
-                expected_transfer_latency + DECODE_LATENCY,
-                rel_tol=0,
-                abs_tol=1e-15,
-            )
-        )
+        self.assertGreater(duration, PREFILL_LATENCY + DECODE_LATENCY)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_result(

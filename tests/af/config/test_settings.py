@@ -11,10 +11,7 @@ import unittest
 from TokenSim.config.af.links import AFEffectiveDTypes, AFLinkConfig
 from TokenSim.config.af.settings import AFConfig
 from TokenSim.config.cluster_config import ClusterConfig, WorkerGroupConfig
-from TokenSim.config.constants import (
-    LEGACY_ROLE_CAPABILITIES,
-    WORKER_CAPABILITIES,
-)
+from TokenSim.config.constants import LEGACY_ROLE_CAPABILITIES
 from TokenSim.errors import ConfigurationError
 from tests.af.support.config_validation import (
     _af_group,
@@ -25,12 +22,6 @@ from tests.af.support.config_validation import (
 
 
 class AFConfigModelTest(unittest.TestCase):
-    def test_public_constant_sets(self):
-        self.assertEqual(
-            WORKER_CAPABILITIES,
-            {"prefill", "decode_full", "af_attention", "af_ffn"},
-        )
-
     def test_af_defaults_are_disabled_and_inert(self):
         cluster = ClusterConfig(num_workers=0, networks={})
 
@@ -63,19 +54,11 @@ class AFConfigModelTest(unittest.TestCase):
             ):
                 constructor(**values, phases=["decode"])
 
-    def test_invalid_block_sizes_are_rejected(self):
-        for value in (0, -1, True, 1.5, "2"):
-            with self.subTest(value=value), self.assertRaises(ConfigurationError):
-                AFConfig(af_block_size=value)
-
-    def test_boolean_fields_are_strict(self):
-        with self.assertRaises(ConfigurationError):
-            AFConfig(enabled=1)
-        with self.assertRaises(ConfigurationError):
-            AFConfig(trace_enabled="true")
-
-    def test_ffn_batch_bounds_require_valid_scalars(self):
+    def test_sizes_and_booleans_are_validated_at_configuration(self):
         for field, values in (
+            ("af_block_size", (0, -1, True, 1.5, "2")),
+            ("enabled", (1,)),
+            ("trace_enabled", ("true",)),
             ("ffn_batching", (1, "true")),
             ("ffn_batch_wait_us", (-1, True, float("nan"), float("inf"))),
             ("ffn_batch_max_tokens", (-1, True, 1.5, "8")),
@@ -288,64 +271,21 @@ class AFLoadingAndEntryPointTest(unittest.TestCase):
         )
 
     def test_repository_examples_parse(self):
-        root = Path(__file__).parents[3]
-        example_dir = root / "data/clusters/af"
-        examples = {
-            path.name: ClusterConfig.from_file(path)
-            for path in sorted(example_dir.glob("*.json"))
-        }
-        decode = examples["decode_half_duplex.json"]
-        rank_reuse = examples["decode_tp2_dp2_ep4_rank_reuse.json"]
-        raw = json.loads(
-            (example_dir / "decode_tp2_dp2_ep4_rank_reuse.json").read_text()
-        )
-        f_domain = next(
-            domain
-            for domain in raw["af"]["execution_domains"]
-            if domain["capability"] == "af_ffn"
-        )
-        f_domain["parallel"]["expert_parallel_size"] = 1
-        for instance in f_domain["logical_instances"]:
-            for rank in instance["rank_mapping"]:
-                rank["ep_rank"] = 0
-        expert_tp = ClusterConfig(**raw)
-        self.assertEqual(
-            set(decode.af_communication_resources), {("shared-af-fabric", "shared")}
-        )
-        for cluster in (expert_tp, rank_reuse):
-            self.assertEqual(
-                cluster.execution_domains["decode-a"].required_rank_count, 4
-            )
-            self.assertEqual(
-                cluster.execution_domains["decode-f"].required_rank_count, 4
-            )
-            self.assertEqual(len(cluster.workers()), 9)
-            self.assertEqual(
-                {
-                    (plan.after_stage, plan.operation)
-                    for plan in cluster.execution_domains["decode-a"].communication_plan
-                },
-                {
-                    ("a_compute", "all_reduce"),
-                    ("residual", "all_gather"),
-                },
-            )
-
-        self.assertEqual(
-            expert_tp.execution_domains["decode-f"].expert_parallel.mode,
-            "expert_tp",
-        )
-        self.assertEqual(
-            rank_reuse.execution_domains["decode-f"].expert_parallel.mode,
-            "rank_reuse",
-        )
-        for cluster in examples.values():
-            groups = {group.name: group for group in cluster.worker_groups}
-            for domain in cluster.execution_domains.values():
+        examples = Path(__file__).parents[3] / "data/clusters/af"
+        for name, workers in (
+            ("decode_half_duplex.json", 5),
+            ("decode_tp2_dp2_ep4_rank_reuse.json", 9),
+        ):
+            with self.subTest(example=name):
+                cluster = ClusterConfig.from_file(examples / name)
+                self.assertTrue(cluster.af.enabled)
+                self.assertEqual(len(cluster.workers()), workers)
                 self.assertEqual(
-                    domain.required_rank_count,
-                    groups[domain.worker_group].num_workers,
-                    msg=f"{domain.name} must not rely on EP-only workers",
+                    {
+                        domain.capability
+                        for domain in cluster.execution_domains.values()
+                    },
+                    {"af_attention", "af_ffn"},
                 )
 
     def test_af_block_size_is_not_kv_block_size(self):

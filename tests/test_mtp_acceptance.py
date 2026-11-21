@@ -14,7 +14,7 @@ from TokenSim.llm.llm_request import Request
 from TokenSim.llm.paged_tokens import PagedTokenBudgetMixin
 from TokenSim.llm.speculative_acceptance import sample_acceptance
 from TokenSim.llm.llm_scheduler import LLMPagedAttnScheduler
-from tests.test_kv_cache import layout
+from tests.support.kv import layout
 from types import SimpleNamespace
 from TokenSim.latency.operator_table import OperatorTableLatencyBackend
 from TokenSim.reporting.stats import get_latency_stats

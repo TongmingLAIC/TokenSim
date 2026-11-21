@@ -9,7 +9,7 @@ import simpy
 from TokenSim.af.execution.executor import AFExecutor
 from TokenSim.af.runtime.compiler import compile_af_runtime_plan
 from TokenSim.errors import ConfigurationError, SimulationStateError
-from tests.af.execution.test_batching import submit_owner
+from tests.af.support.batching import submit_owner
 from tests.af.support.config import _cluster
 from tests.af.support.execution import (
     af_test_hardware,

@@ -181,7 +181,7 @@ class ReceiveQueueTest(unittest.TestCase):
         self.assertEqual(effects.receiver.slots.count, 0)
 
     def test_basic_executor_releases_input_slots_between_layers(self):
-        from tests.af.execution.test_batching import batch_runtime, submit_owner
+        from tests.af.support.batching import batch_runtime, submit_owner
 
         env, executor, _ = batch_runtime(
             owners=2,

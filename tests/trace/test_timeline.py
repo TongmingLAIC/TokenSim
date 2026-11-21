@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from TokenSim.profiler.compare import compare_traces
 from TokenSim.profiler.plot import export_timeline
 from TokenSim.profiler.timeline import prepare_timeline, pack_tracks
-from tests.trace.test_profiler import fixtures
+from tests.support.profiler import fixtures
 
 
 class TimelineTest(unittest.TestCase):

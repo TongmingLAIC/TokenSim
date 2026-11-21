@@ -23,7 +23,7 @@ A cluster's `worker_groups` use the following roles.
 `data/clusters/8_a100/p2d5.json` separates two prefill workers from six decode workers.
 After prefill, a request's KV blocks move to a decode worker over the link at the smallest topology level containing both workers.
 For example, workers on the same node use that node's local link, while workers on different nodes use their shared network level.
-With `MooncakeConnector`, transfer times follow the rules in [Mooncake](mooncake.md).
+With `MooncakeConnector`, transfer times follow the rules in [Mooncake](kv-storage.md).
 
 The prefill and decode pools select workers with `round_robin`, `least_gpu_memory` or `balanced_load`.
 Set these policies with `--prefill_worker_pool_type` and `--decode_worker_pool_type`, whose defaults are `round_robin` and `least_gpu_memory` respectively.
@@ -48,12 +48,12 @@ When `parallel_config` describes more than one rank, the sum of `worker_groups[*
 world_size = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
 ```
 
-Without `parallel_config` (one rank), every worker is an independent replica.
+In the shared layout, without a `parallel_config` each worker is an independent replica.
 
 The following command uses the eight-rank configuration in `data/clusters/8_a100/tp2_pp2_dp2.json`.
 
 ```bash
-./benchmark.py \
+tokensim \
   --batching paged-attn \
   --request_count 8 \
   --cluster ./data/clusters/8_a100/tp2_pp2_dp2.json \
@@ -78,7 +78,7 @@ The following table describes the `parallel_config` fields.
 | `tensor_parallel_collective_latency_scale` | 1.0 | Multiplier on TP collective time |
 | `pipeline_parallel_activation_latency_scale` | 1.0 | Multiplier on PP activation-transfer time |
 | `enable_expert_parallel` | `false` | Shard MoE experts across ranks |
-| `expert_parallel_scope` | `global` | `global` or `per_dp` (see [MoE](moe.md)) |
+| `expert_parallel_scope` | `global` | `global` or `per_dp` (see [MoE](../reference/models.md#mixture-of-experts)) |
 | `expert_parallel_size` | whole scope | Ranks per expert-parallel group |
 | `expert_placement_strategy` | `linear` | `linear` or `round_robin` |
 | `all2all_backend` | `allgather_reducescatter` | `allgather_reducescatter`, `naive`, `deepep_high_throughput`, `deepep_low_latency` |
@@ -132,18 +132,101 @@ The default, `global`, distributes experts across all `tensor_parallel_size * da
 MoE layers follow their PP stages.
 EP adds time for distributing tokens to experts (dispatch), collecting expert results (combine) and waiting for ranks with more work.
 It requires a MoE model configuration.
-See [MoE](moe.md).
+See [MoE](../reference/models.md#mixture-of-experts).
 
 ## Configuration Precedence
 
-The effective parallel configuration follows this precedence order.
+In a shared layout, the effective parallel configuration follows this precedence order.
 
 1. CLI values such as `--tensor_parallel_size` override individual fields (TP, PP, DP sizes, DP rank and local size, and the expert-parallel settings).
 2. The cluster's `parallel_config` supplies the base configuration.
 3. Missing values default to one rank with expert parallelism disabled.
 
 Changing TP/PP/DP on the CLI does not add workers.
-The cluster must already contain exactly the resulting `world_size` workers.
+For a shared layout with multiple ranks, the cluster must contain exactly the resulting `world_size` workers.
+
+## Independent prefill and decode layouts
+
+Dedicated prefill and decode worker groups can each declare `parallel_config` and `kv_transfer` in the cluster configuration.
+The global parallel layout stays omitted when group layouts are present.
+Every group has its own TP, DP and expert placement, and physical worker identifiers remain unique across the entire allocation.
+Collective discovery never crosses a complete-model group boundary.
+P/D handoff selects decode replicas in the destination group's DP coordinate space.
+The source coordinate remains attached during DMA, and delivery assigns the selected decode coordinate.
+Transport lifecycle rows retain both source and destination DP ranks for independent groups.
+DP lockstep maintains a separate busy wave and finished-state consensus for each group.
+Choose dedicated ordinary prefill and decode roles for every group; use the separate [AF configuration](attention-ffn.md) for split attention and FFN execution.
+
+```json
+{
+  "num_workers": 16,
+  "topology": "gb200_nvl72",
+  "networks": {"fabric": "ethernet800Gb"},
+  "worker_groups": [
+    {
+      "name": "P",
+      "role": "prefill",
+      "hardware": "gb200",
+      "num_workers": 8,
+      "network": "fabric",
+      "parallel_config": {
+        "data_parallel_size": 8,
+        "data_parallel_size_local": 8,
+        "enable_expert_parallel": true,
+        "expert_parallel_scope": "global",
+        "expert_parallel_size": 8
+      }
+    },
+    {
+      "name": "D",
+      "role": "decode",
+      "hardware": "gb200",
+      "num_workers": 8,
+      "network": "fabric",
+      "parallel_config": {
+        "data_parallel_size": 8,
+        "data_parallel_size_local": 8,
+        "enable_expert_parallel": true,
+        "expert_parallel_scope": "global",
+        "expert_parallel_size": 8
+      }
+    }
+  ],
+  "kv_transfer": {
+    "kv_connector": "NoopConnector",
+    "kv_connector_extra_config": {
+      "pd_endpoint_limits": {
+        "send_bytes_per_second": 50000000000,
+        "receive_bytes_per_second": 50000000000,
+        "fabric_bytes_per_second": 400000000000
+      }
+    }
+  }
+}
+```
+
+The example sets analytical endpoint and fabric rate limits in bytes per second.
+Ordinary workers may use independent TP layouts for complete-model execution.
+Endpoint transport currently supports TP1 ordinary workers, including independent DP-attention and global EP groups.
+The grouped transport requires identical native KV geometry at both ends and PP1.
+It copies the resident computed group pages using their actual physical slot stride, including padding.
+
+Source DMA references survive source request release.
+The receiver allocates private request-owned pages before DMA starts, and DMA holds separate references until physical completion.
+Receiver capacity can delay the transfer without publishing a destination prefix.
+Copy completion publishes only cache identities already proven complete at the source.
+Partial prompt tails remain private and are computed further by the normal decode scheduler.
+Cancellation drains the active transfer, releases both sets of references and publishes no cancelled destination data.
+The native scheduler resumes imported pages through its loaded-request queue without repeating prefill.
+
+The request's first token is sampled when prefill completes.
+Transfer and receiver scheduling occur after that sample and contribute to the following inter-token interval and end-to-end latency.
+This timing convention must be checked against a reference frontend's streaming behavior before an accuracy comparison.
+
+Results include `parallel_serving_domains`, `moe_serving_domains` and `pd_transport`.
+Physical capacity reporting distinguishes identical DP coordinates in different domains.
+Per-domain reports preserve each layout, expert ownership, rank loads and placement counts.
+The transport report retains physical endpoint flows, bandwidth-sharing intervals, lifecycle events and outstanding ownership counts.
 
 ## Communication Topology and Metrics
 
@@ -156,13 +239,13 @@ Network names must reference catalog link classes.
 An unknown link name causes a configuration error.
 Clusters with mixed device or network link types require an explicit topology.
 
-`TokenSim/comm/collectives.py` estimates communication operations involving a group of ranks, called collectives.
+Communication operations involving a group of ranks are called collectives.
 For each topology level crossed by the TP or EP group, the alpha-beta model adds fixed transfer latency and a term based on message size and bandwidth.
 The topology selects a ring, tree or direct communication algorithm at each level.
 If the device's `collective` table contains matching measurements for the operation, data type, group size and node count, the simulator uses that curve.
 Missing measurements follow `--latency_fallback`: `table_first` uses a formula and records the missing query, while `table_only` returns an error.
 Point-to-point transfers (PP activations, prefill-to-decode KV) use the link of the lowest topology level shared by the two workers.
-See [operator-latency-model.md](operator-latency-model.md#6-communication-model).
+See [operator-latency-model.md](../reference/operator-latency-model.md#communication-model).
 
 Results record the effective `parallel_config`, expected and actual rank counts, each rank's TP/PP/DP identifiers and utilization, and request placement counts for DP groups.
 `parallel_groups` describes rank 0's TP and EP groups and the topology levels they span.

@@ -15,7 +15,8 @@ Put the following object inside `kv_connector_extra_config` for `MooncakeStoreCo
     "backend": "my_storage_package:ExampleBackend",
     "name": "flash",
     "config": {
-      "capacity_bytes": 1099511627776
+      "capacity_bytes": 1099511627776,
+      "bandwidth_bytes_per_s": 107374182400
     }
   }
 }
@@ -23,7 +24,7 @@ Put the following object inside `kv_connector_extra_config` for `MooncakeStoreCo
 
 `backend` selects an installed Python module's exported class or a registered builder alias.
 The module reference uses `module:class` syntax.
-Only the configured module is imported; the core does not discover or import optional backend packages at startup.
+The factory imports the selected module on demand.
 An unavailable package produces a configuration error identifying its reference.
 
 `name` identifies this backend instance within the shared store and defaults to `offload`.
@@ -47,7 +48,6 @@ A builder accepts one configuration dictionary and returns an object satisfying 
 from TokenSim.config.validation import integer, number
 from TokenSim.storage import IOCost, IORequest
 
-
 class ExampleBackend:
     def __init__(self, config):
         if set(config) - {"capacity_bytes", "bandwidth_bytes_per_s"}:
@@ -66,7 +66,7 @@ class ExampleBackend:
 ```
 
 Production backends must reject non-finite numeric inputs and unknown options.
-The [HBF example package](../examples/storage/hbf/) provides a complete configuration validator and operation-size bandwidth curve.
+The [HBF example package](../../examples/storage/hbf/) provides a complete configuration validator and operation-size bandwidth curve.
 
 `IORequest` contains `operation` (`read` or `write`), `nbytes` and `access_pattern` (`auto`, `random` or `sequential`).
 The current uniform store sends `auto` requests with the bytes in each stored object.
@@ -129,5 +129,7 @@ Plugin configurations use the generic dictionary and do not add media-specific f
 
 Store objects become reusable after their transfer and media write finish.
 Reads pin their objects through the modeled completion time, and the common offload tier applies the same capacity and eviction rules to every backend.
-The current interface retains the uniform store's blocking I/O timing and does not add media queue contention or multi-tier migration.
-Grouped KV pages continue to use the native DRAM page store and reject offload backend selections.
+The connector determines when requests wait for I/O.
+`MooncakeStoreConnector` charges uniform media service as blocking transfer time, while `UniformAsyncStore` queues media operations and can overlap restoration with compute.
+Both connectors use the same plugin cost and capacity contracts.
+See the [connector capability table](../guides/kv-storage.md#select-a-connector) for the supported layouts and storage tiers.

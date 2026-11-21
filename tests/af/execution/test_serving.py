@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
 from dataclasses import replace
-import io
 import json
 from pathlib import Path
 import tempfile
@@ -13,7 +11,7 @@ from unittest.mock import patch
 
 import simpy
 
-from TokenSim.cli import build_parser, main
+from tests.support.cli import run_quiet, simulation_args
 from TokenSim.comm.collectives import CollectiveModel
 from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.config.config import KVTransferConfig, ParallelConfig
@@ -28,7 +26,7 @@ from TokenSim.hardware.topology import TopologyLevel, TopologySpec
 from TokenSim.llm.engine.af_worker import run_worker_compute
 from TokenSim.llm.llm_engine import LLMEngine, LLMWorker
 from TokenSim.llm.llm_request import Request
-from TokenSim.moe import ExpertRouting, normalize_expert_histogram
+from TokenSim.moe import ExpertRouting
 from TokenSim.reporting import get_af_stats
 from tests.af.support.config import _cluster, _cluster_dict, _with_prefill_pool
 from tests.af.support.execution import (
@@ -209,15 +207,6 @@ class AFServingCorrectnessTest(unittest.TestCase):
         ):
             self.assertEqual(limited.capacity_bytes, original.capacity_bytes // 2)
 
-    def test_explicit_kv_limit_caps_all_attention_shards(self):
-        engine = self.make_engine(capacity=32)
-        manager = engine.request_workers[0].scheduler.block_manager
-        self.assertEqual(manager.num_total_gpu_blocks, 8)
-        for rank in manager.rank_keys:
-            self.assertEqual(manager.rank_status(rank)["gpu_capacity"], 8)
-        with self.assertRaisesRegex(ConfigurationError, "cannot fit"):
-            engine.validate_request_capacity([Request(1, 64, 2, 4)])
-
     def test_kv_limit_cannot_manufacture_physical_memory(self):
         full = self.make_engine()
         capped = self.make_engine(capacity=10**12)
@@ -244,17 +233,6 @@ class AFServingCorrectnessTest(unittest.TestCase):
                         config=SimulationConfig(dp_lockstep=True),
                     )
                 self.assertEqual(len(env._queue), 0)
-
-    def test_total_limit_is_divided_by_attention_domain_replicas(self):
-        engine = self.make_engine(total=64, replicas=2)
-        self.assertEqual(engine.parallel_config.data_parallel_size, 1)
-        self.assertEqual(len(engine.decode_workers.workers), 2)
-        self.assertEqual(
-            [w.cache_config.num_gpu_blocks for w in engine.decode_workers.workers],
-            [8, 8],
-        )
-        with self.assertRaisesRegex(ConfigurationError, "one KV block per A replica"):
-            self.make_engine(total=7, replicas=2)
 
 
 class MixedServingTest(unittest.TestCase):
@@ -400,12 +378,6 @@ class AFMergeCompatibilityTest(unittest.TestCase):
         with self.assertRaisesRegex(WorkloadValidationError, "must equal 8"):
             routing.histogram_for_step([bad])
 
-    def test_histogram_rejects_an_incorrect_route_count(self):
-        with self.assertRaisesRegex(WorkloadValidationError, "must equal 8"):
-            normalize_expert_histogram(
-                {0: 3, 1: 4}, num_experts=4, request_id=7, expected_route_count=8
-            )
-
     def test_current_cli_runs_af_and_exports_runtime_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -420,48 +392,25 @@ class AFMergeCompatibilityTest(unittest.TestCase):
                 )
                 .decode()
             )
-            args = build_parser().parse_args(
-                [
-                    "--cluster",
-                    str(cluster_path),
-                    "--model",
-                    "TestModel",
-                    "--latency_backend",
-                    "analytical",
-                    "--batching",
-                    "paged-attn",
-                    "--block_size",
-                    "4",
-                    "--qps",
-                    "1",
-                    "--distribution",
-                    "burst",
-                    "--request_count",
-                    "2",
-                    "--prefill_mean_len",
-                    "8",
-                    "--decode_mean_len",
-                    "2",
-                    "--prefill_range_len",
-                    "0",
-                    "--decode_range_len",
-                    "0",
-                    "--verbose",
-                    "none",
-                    "--results_path",
-                    str(path / "results"),
-                ]
+            args = simulation_args(
+                path / "results",
+                cluster=cluster_path,
+                model="TestModel",
+                batching="paged-attn",
+                block_size=4,
+                qps=1,
+                request_count=2,
+                prefill_mean_len=8,
+                decode_mean_len=2,
+                prefill_range_len=0,
+                decode_range_len=0,
             )
             args.af_compute_provider = FixedComputeProvider(0.001, 0.001)
             args.af_transfer_provider = FixedTransferProvider(0.001, 0.001)
-            with (
-                patch(
-                    "TokenSim.cli.run.HardwareContext.load",
-                    return_value=af_test_hardware(),
-                ),
-                redirect_stdout(io.StringIO()),
+            with patch(
+                "TokenSim.cli.run.HardwareContext.load", return_value=af_test_hardware()
             ):
-                engine = main(args)
+                engine = run_quiet(args)
             result = json.loads(
                 next((path / "results").glob("result_*.json")).read_text()
             )

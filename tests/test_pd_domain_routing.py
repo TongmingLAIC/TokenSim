@@ -6,7 +6,7 @@ import unittest
 
 from TokenSim.kv_transfer.pd_handoff import PDHandoff
 from TokenSim.placement.policies import DataParallelWorkerPool, RoundRobinWorkerPool
-from tests.test_grouped_pd_handoff import setup
+from tests.support.grouped_handoff import setup
 
 
 class PDDomainRoutingTest(unittest.TestCase):

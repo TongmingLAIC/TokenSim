@@ -12,7 +12,7 @@ from TokenSim.kv_transfer.busy_intervals import BusyIndex, append_union
 from TokenSim.llm.llm_request import Request
 from TokenSim.workload.source import LLMSource
 from tests.support.hardware import make_hardware
-from tests.test_kv_transfer_integration import _MODEL, _DEVICE, _DeterministicBackend
+from tests.support.pd import _MODEL, _DEVICE, _DeterministicBackend
 
 
 def setup(policy=None, annotated=False, **options):

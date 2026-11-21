@@ -1,4 +1,4 @@
-# AIConfigurator data in TokenSim
+# Operator data packages
 
 TokenSim imports measured kernel and communication latencies from [NVIDIA AIConfigurator](https://github.com/ai-dynamo/aiconfigurator/tree/f254959eb89e2f206b8f9a77051644d7c1cbdb89).
 The bundled data uses commit `f254959eb89e2f206b8f9a77051644d7c1cbdb89`.
@@ -7,7 +7,7 @@ TokenSim runs its own event simulator; AIConfigurator, PyTorch and a GPU are not
 Each data package in `data/operator_data/<device>/<backend>` contains `generation_meta.yaml` and Parquet tables converted to TokenSim's schema.
 Every row has a `source_id` that identifies its source record in the metadata.
 That record lists the upstream path, collection version, device, framework, units and operations included in the measurement.
-Its evidence grade distinguishes direct measurements, measurements from another device or software stack, derived values and formula-based estimates, as defined in the operator latency model's section 7.
+Its evidence grade distinguishes direct measurements, measurements from another device or software stack, derived values and formula-based estimates, as defined in the [hardware evidence grades](../../TokenSim/hardware/README.md#evidence-grades).
 Original millisecond measurements become microseconds.
 Source data that already uses microseconds keeps its units.
 
@@ -47,7 +47,6 @@ Set `GPUS_PER_NODE` to pass that value through `scripts/collect/run_aiconfigurat
 The importer handles matrix multiplication (GEMM), attention, mixture-of-experts (MoE) operations, group communication (collectives) and DeepEP token transfers.
 It also imports tables that time complete sparse-attention, residual-mixing and fused expert modules.
 Imported rows retain the model identity and dimensions.
-All imported module source IDs are registered before the package is validated.
 
 ```bash
 python -m TokenSim.operator_data.cli validate /tmp/b200-vllm
@@ -57,7 +56,6 @@ Keep the original `generation_meta.yaml` beside copied tables so that each row's
 TokenSim checks loaded tables against the row counts declared in the metadata.
 Missing or truncated tables raise a validation error.
 Device and backend metadata must match the selected package directory.
-Registering an additional in-memory package preserves the other packages available on disk.
 A directory from your own profiling run can also be imported with `--system-dir`.
 Its source records identify that local collection.
 
@@ -87,8 +85,40 @@ The model's `operator_modules` configuration selects the source table and fields
 The latency calculation skips individual operations already included in the selected module's measured time.
 TokenSim checks that the model's data layout and dimensions satisfy the measured kernel's requirements.
 
-Full-model simulations combine these imported operator and module tables with configurable hardware parameters, cache layouts and analytical estimators as described in [the AgentX guide](agentx.md).
+Full-model simulations combine these imported operator and module tables with configurable hardware parameters, cache layouts and analytical estimators as described in [the AgentX guide](../guides/workloads.md).
 Result metadata records the exact provenance and match type of every operator and communication estimate.
 
+## Package tools
+
+`tokensim-operator-data` provides the commands below.
+Pass `--data-root PATH` before the subcommand to select another catalog directory.
+For a generated or imported package, set `--out` to a separate writable directory.
+Writing an import into a bundled package directory replaces that package's known tables.
+
+| Command | Result |
+| --- | --- |
+| `manifest` | Required primitive operator keys for the selected models, parallel layouts and workload grid |
+| `generate` | Analytical tables and work estimates for a device |
+| `import-aiconfigurator` | Measured tables from an upstream system or collector output |
+| `import-nccl` | A collective table merged with the destination package |
+| `validate` | Validation of schemas, key uniqueness, row counts and provenance |
+| `coverage` | Exact, interpolated, extrapolated or missing keys for a workload |
+| `calibrate` | Fit and holdout error statistics and fitted analytical parameters |
+
+For example, check table coverage for an eight-GPU configuration.
+
+```bash
+tokensim-operator-data coverage \
+  --device h100_sxm \
+  --backend vllm \
+  --models llama-3-70b \
+  --tp 8 \
+  --out tmp/coverage/h100_sxm-llama-3-70b.json
+```
+
+The calibration output includes per-table fits and a merged analytical block; inspect the per-table values before using any shared parameter.
+Use `tokensim-operator-data <command> --help` for operation-specific flags.
+See the [collection guide](../../scripts/collect/README.md) for gathering missing measurements.
+
 AIConfigurator data is Apache-2.0 licensed.
-Attribution and retained license text are in [the data notices](../data/operator_data/LICENSES.md), [NOTICE](../NOTICE) and `third_party/licenses/AIConfigurator-Apache-2.0.txt`.
+Attribution and retained license text are in [the data notices](../../data/operator_data/LICENSES.md), [NOTICE](../../NOTICE) and `third_party/licenses/AIConfigurator-Apache-2.0.txt`.

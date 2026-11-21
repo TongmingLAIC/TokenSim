@@ -1,4 +1,10 @@
-# Mixture-of-Experts Simulation
+# Model configurations and cost scope
+
+[Catalog models](../../data/models/) specify layer geometry, precision, attention and mixture-of-experts components.
+Select a catalog ID with `--model` or pass a model YAML file.
+The [operator latency reference](operator-latency-model.md) explains how those components select compatible costs.
+
+## Mixture of experts
 
 In a mixture-of-experts (MoE) layer, a router selects expert feed-forward networks to process each token.
 TokenSim models which layers use MoE, the selected experts' compute time and the extra time caused by uneven work across experts.
@@ -13,7 +19,7 @@ The routing histogram records how many token-expert assignments each expert rece
 These counts determine the extra time spent waiting for the busiest rank, and the communication model estimates dispatch and combine time.
 A fused MoE module combines expert computation and token transfers in one timing estimate, as described in [Fused MoE module](#fused-moe-module).
 
-## Quick Start
+### Run a model
 
 The included toy model has four experts and sends each token to two of them, called top-2 routing.
 Tensor parallelism (TP=2) divides each replica across two ranks, and data parallelism (DP=4) runs four replicas.
@@ -37,7 +43,7 @@ Expert parallelism spans all eight ranks in this example.
 The cluster uses A100 40 GB devices, which have no operator tables in the bundled data.
 Every operator time is therefore estimated by the analytical model, and the run summary records this.
 
-## Model Configuration
+### Expert geometry
 
 Add the following fields under `moe:` in the model YAML.
 
@@ -66,7 +72,7 @@ Their time is estimated with `gemm` queries and, for gated activations, `swiglu`
 Their weights are TP-sharded like a dense FFN, or replicated when expert parallelism shards MoE tokens over TP ranks (TP > 1 with several DP replicas or the fused MoE module).
 Routed experts are TP-sharded without expert parallelism and kept whole on their EP rank with it.
 
-## Expert Parallelism
+### Expert parallelism
 
 Configure expert parallelism inside the cluster's `parallel_config`, as shown below.
 
@@ -157,9 +163,9 @@ The following example runs Mixtral-8x7B on eight H100 GPUs with one global EP8 g
 ```
 
 Using `--enable_expert_parallel` with a dense model is a configuration error.
-See [Parallelism](parallelism.md) for the rank count and topology rules.
+See [Parallelism](../guides/serving.md) for the rank count and topology rules.
 
-## Routing Workloads
+### Routing workloads
 
 When requests provide no routing data, TokenSim generates repeatable token counts per expert.
 The default is `uniform`.
@@ -219,16 +225,16 @@ Expert IDs must be in `[0, num_experts)` and counts must be non-negative.
 A prefill chunk routes its share of the prompt's histogram.
 Requests without a histogram use the synthetic distribution.
 
-## Fused MoE Module
+### Fused MoE module
 
 `--moe_backend deep_gemm_amxf4_mega_moe` estimates dispatch, routed expert compute and combine together from the measured module selected by `operator_modules.moe`.
 For example, `data/models/deepseek-v4-pro.yaml` selects `dsv4_megamoe`.
 This mode requires expert parallelism, one pipeline stage (PP1) and a complete EP group on one node.
 With DP > 1, it also requires `--dp_lockstep`.
 Shared expert costs are accounted for separately, and `--disable_moe_shared_fusion` adds their execution time to the routed expert time.
-See [Operator-module tables](operator-latency-model.md#23-operator-module-tables).
+See [Operator-module tables](operator-latency-model.md#select-timing-inputs).
 
-## Metrics
+### Metrics
 
 The result JSON includes the following metrics.
 
@@ -245,3 +251,118 @@ The result JSON includes the following metrics.
 | `parallel_ep_all2all_latency` | Dispatch/combine time (also part of `parallel_latency_total`) |
 
 `parallel_comm_match_type_counts` tells whether communication estimates came from measured tables or the analytical model.
+
+## DeepSeek-V3 multi-head latent attention
+
+Multi-head latent attention (MLA) compresses the key/value (KV) state retained for each token and changes the attention projections used during decode.
+TokenSim represents DeepSeek-V3 with the [catalog model](../../data/models/deepseek-v3-671b-mla.yaml), whose architecture metadata references the [official configuration](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json) and a [checked-in snapshot](../../data/models/deepseek-v3-hf-config.json).
+The model supplies attention geometry, KV storage and operator shapes for latency estimation without loading checkpoint weights.
+
+### Model geometry
+
+The model separates the attention head's content dimensions from its rotary position embedding (RoPE) dimensions.
+Its mixture-of-experts (MoE) structure follows three dense layers with 58 expert layers.
+
+| Parameter | Catalog value |
+| --- | --- |
+| Hidden size | 7168 |
+| Transformer layers | 61 |
+| Query heads | 128 |
+| Query compression rank | 1536 |
+| KV compression rank | 512 |
+| Content dimensions per query/key head | 128 |
+| RoPE dimensions per query/key head | 64 |
+| Value dimensions per head | 128 |
+| Dense layers / MoE layers | 3 / 58 |
+| Routed experts / selected experts per token | 256 / 8 |
+| Shared experts | 1 |
+| Vocabulary size | 129280 |
+| Catalog context limit | 163840 tokens |
+
+A query/key head has `128 + 64 = 192` elements before decode absorption.
+The query compression rank controls projection work and weight storage, while the KV compression rank controls both the retained cache and compressed attention work.
+These ranks have separate roles in the model.
+
+### Compressed KV cache
+
+Each token retains one 512-element KV latent vector and one 64-element RoPE key vector per layer.
+The cache width is therefore
+
+$$
+d_{\mathrm{cache}} = r_{\mathrm{KV}} + d_{\mathrm{RoPE}} = 512 + 64 = 576.
+$$
+
+At bfloat16 (BF16) precision, this is `576 * 2 = 1152` bytes per token per layer.
+The cached latent vector is shared by the query heads; the cache does not store a separate expanded key and value vector for every head.
+
+Tensor parallelism (TP) shards query heads and the corresponding head-specific projections.
+The current cache layout replicates the compressed KV state on each TP rank that owns the layer.
+Increasing TP reduces the local head count while retaining the 576-element cache width on each rank.
+
+For a rank covering `L` layers and requests with resident context lengths `s_i`, the logical cache allocation is
+
+$$
+M_{\mathrm{KV}} = 1152 L \sum_i s_i \quad \text{bytes at BF16}.
+$$
+
+A single 8192-token context covering all 61 layers therefore requires 549 mebibytes (MiB) of logical KV storage per rank.
+This calculation excludes block padding, model weights and execution workspaces.
+Configured KV block sizes determine the padded allocation used by capacity checks.
+
+### Attention computation
+
+The latency model decomposes MLA into projections, normalization, positional work and an attention core.
+Its decode path uses absorbed attention, with these stages for each new token:
+
+- Compress the query from hidden size 7168 to rank 1536, normalize it and project it into the local query heads.
+- Project the hidden state into the 576-element KV-plus-RoPE representation and normalize the 512-element latent component.
+- Apply RoPE to the positional query and key components.
+- Absorb the key expansion into each head's content query, mapping 128 content dimensions into the 512-dimensional latent space.
+- Compute attention scores and the weighted aggregation over the compressed KV cache.
+- Expand each head's aggregated latent value from 512 to 128 dimensions and apply the output projection.
+
+The compressed attention core includes softmax and the cache read/write work.
+Query absorption, value expansion and output projection have separate service estimates.
+Decode accepts one context length per query token, so batches with different request lengths retain their actual cache-read workload.
+
+Full-sequence prefill uses an expanded attention path.
+It expands the latent KV representation into the local key and value heads before causal attention, then retains the compressed cache for later decode.
+This path has a KV-expansion estimate and omits the separate decode query-absorption and post-attention value-expansion operations.
+The [standalone MLA operator adapter](../../TokenSim/operator_data/mla.py) requires equal-length full sequences for prefill and rejects cached prefixes or partial chunks.
+
+Dense feed-forward networks (FFNs), routed experts, shared experts, model boundaries and required communication contribute separately to whole-model latency.
+An MLA-core measurement alone covers the attention core defined here.
+
+### Operator data and estimation
+
+| Operator table | Modeled MLA work |
+| --- | --- |
+| `gemm` | Query/KV projections, prefill KV expansion and output projection |
+| `batched_gemm` | Per-head query absorption and value expansion during decode |
+| `elementwise` | Normalization, RoPE and configured elementwise operations |
+| `mla_attention` | Phase-specific attention core, including its cache accesses |
+
+MLA-core lookup identifies the phase, execution mode, batch/query lengths, context-length distribution, local query-head count, latent dimensions and activation/cache precision.
+The query compression rank affects projection estimates and does not change the compressed attention core's cache width.
+Measurements must match the intended operator boundary to avoid charging a fused kernel together with its separately modeled components.
+
+`table_first` uses compatible measurements before analytical fallback.
+`table_only` rejects missing shapes, and `analytical_only` derives work from the supplied geometry and device parameters.
+Reported provenance distinguishes measurements, interpolation, extrapolation and analytical estimates.
+See [operator latency data](operator-latency-model.md) for package generation and lookup policies.
+
+## DeepSeek-V4 and speculative decoding
+
+The `deepseek-v4-pro` catalog entry defines compressed and sliding attention, indexer and compressor state, hyper-residual mixing and packed expert geometry.
+With `--attention_backend module` or `--mhc_backend module`, the selected operator tables price complete measured modules; component estimators account for operations outside the measured boundary.
+The `deepseek-v4-pro-0813-dspark` entry adds a three-layer DSpark draft for ordinary serving.
+Draft memory, verification work and lookahead use its declared configuration.
+Use an autoregressive target model for [split attention and FFN execution](../guides/attention-ffn.md#deepseek-v4-compressed-attention).
+
+`--mtp_num_speculative_tokens` sets the draft width for multi-token prediction (MTP).
+The ordinary engine estimates the complete verification query.
+`--mtp_acceptance_length` samples a two-point approximation for the expected accepted length.
+`--mtp_acceptance` accepts an object with a conditional probability for each draft position or an empirical distribution on accepted lengths 1 through K+1.
+The conditional and empirical forms require the default `--mtp_acceptance_length 1`.
+The accepted length is sampled deterministically by seed, request and committed round; a failed scheduling probe does not advance the round.
+Results report accepted and emitted tokens and verification counts under `module_stats.speculative.acceptance`.

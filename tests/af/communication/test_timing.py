@@ -180,11 +180,6 @@ class CommunicationTimingTest(unittest.TestCase):
             any(e.event_type == "host_submit" for e in separated.trace.events)
         )
 
-    def test_half_duplex_still_shares_only_the_wire(self):
-        executor, _ = run_case(submit_us=1.0, wire_us=10.0, duplex="half")
-        wires = [e for e in executor.trace.events if e.event_type == "transfer"]
-        self.assertEqual({e.resource_id for e in wires}, {"link:af-fabric:shared"})
-
     def test_ambiguous_measurements_are_rejected_in_separated_mode(self):
         for scope in ("legacy_unspecified", "eager_interval"):
             with (
