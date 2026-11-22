@@ -1,18 +1,18 @@
 """Timeline exports retain gaps, raw activities, clocks and concurrent streams."""
 
+from contextlib import redirect_stdout
 import copy
 import importlib.util
+import io
 import json
 import math
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
 from TokenSim.profiler.compare import compare_traces
-from TokenSim.profiler.plot import export_timeline
+from TokenSim.profiler.plot import export_timeline, main as plot_main
 from TokenSim.profiler.timeline import prepare_timeline, pack_tracks
 from tests.support.profiler import fixtures
 
@@ -119,27 +119,28 @@ class TimelineTest(unittest.TestCase):
                 event["end_us"] - event["start_us"],
                 event["display_end_us"] - event["display_start_us"],
             )
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "TokenSim.profiler.plot",
-                "--comparison",
-                str(self.report_path),
-                "--output",
-                str(self.root / "cli"),
-                "--formats",
-                "svg",
-                "--rank",
-                "0",
-                "--detail",
-                "module",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertEqual(json.loads(process.stdout)["events"], 4)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = plot_main(
+                [
+                    "--comparison",
+                    str(self.report_path),
+                    "--output",
+                    str(self.root / "cli"),
+                    "--formats",
+                    "svg",
+                    "--rank",
+                    "0",
+                    "--detail",
+                    "module",
+                    "--simulated-label",
+                    "Custom Simulated Label",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["events"], 4)
+        cli_svg = (self.root / "cli.svg").read_text()
+        self.assertIn("Custom Simulated Label", cli_svg)
 
 
 if __name__ == "__main__":

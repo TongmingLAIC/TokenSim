@@ -28,10 +28,3 @@ def sample_acceptance(config, mean, seed, request_id, round_index):
         return len(config.distribution)
     low = int(math.floor(mean))
     return low + int(uniform(0) < mean - low)
-
-
-def legacy_acceptance(mean, seed, request_id, generation_index):
-    state = (
-        request_id * 1103515245 + generation_index * 12345 + seed * 0x9E3779B9
-    ) & 0xFFFFFFFF
-    return int(math.floor(mean)) + int(state / 4294967296.0 < mean % 1)

@@ -12,21 +12,13 @@ from unittest.mock import patch
 import simpy
 
 from tests.support.cli import run_quiet, simulation_args
-from TokenSim.comm.collectives import CollectiveModel
 from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.config.config import KVTransferConfig, ParallelConfig
 from TokenSim.config.simulation import SimulationConfig
-from TokenSim.errors import (
-    ConfigurationError,
-    SimulationStateError,
-    WorkloadValidationError,
-)
-from TokenSim.hardware.links import LinkCatalog
-from TokenSim.hardware.topology import TopologyLevel, TopologySpec
+from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.llm.engine.af_worker import run_worker_compute
 from TokenSim.llm.llm_engine import LLMEngine, LLMWorker
 from TokenSim.llm.llm_request import Request
-from TokenSim.moe import ExpertRouting
 from TokenSim.reporting import get_af_stats
 from tests.af.support.config import _cluster, _cluster_dict, _with_prefill_pool
 from tests.af.support.execution import (
@@ -40,7 +32,6 @@ from tests.af.support.execution import (
     af_test_hardware,
 )
 from tests.af.support.model import _moe
-from tests.support.hardware import make_links, moe_test_model
 
 
 class AFEngineIntegrationTest(unittest.TestCase):
@@ -319,65 +310,7 @@ class MixedServingTest(unittest.TestCase):
             self.assertFalse(resource.queue)
 
 
-class AFMergeCompatibilityTest(unittest.TestCase):
-    def test_point_to_point_oversubscription_never_improves_latency(self):
-        self.links = LinkCatalog(make_links())
-
-        topology = TopologySpec(
-            "three-level",
-            (
-                TopologyLevel("node", 4, "nvlink-test", links_per_endpoint=2),
-                TopologyLevel("rack", 2, "ethernet-test"),
-                TopologyLevel("cluster", None, "ethernet-test"),
-            ),
-        )
-        for endpoints, level_index in (((0, 1), 0), ((0, 4), 1), ((0, 8), 2)):
-            for payload in (0, 1, 1 << 20):
-                with self.subTest(endpoints=endpoints, payload=payload):
-                    layout = topology.group_layout(endpoints)
-                    self.assertEqual(layout.lowest_common_level, level_index)
-                    previous = -1
-                    for oversubscription in (1, 2, 4):
-                        levels = list(topology.levels)
-                        levels[level_index] = replace(
-                            levels[level_index], oversubscription=oversubscription
-                        )
-                        model = CollectiveModel(
-                            replace(topology, levels=tuple(levels)), self.links
-                        )
-                        estimate = model.point_to_point(payload, layout)
-                        self.assertGreaterEqual(estimate.latency_us, previous)
-                        previous = estimate.latency_us
-                        if payload:
-                            self.assertEqual(
-                                estimate.levels[0].level, levels[level_index].name
-                            )
-
-    def test_routing_validates_each_phase_and_does_not_reuse_prefill_cache(self):
-        routing = ExpertRouting(moe_test_model().moe, seed=1)
-        req = Request(
-            0,
-            prefill_len=4,
-            decode_len=2,
-            block_size=16,
-            prefill_expert_histogram={0: 8},
-            decode_expert_histogram={1: 2},
-        )
-
-        self.assertEqual(routing.histogram_for_step([req]), {0: 8})
-        req.generation_idx = 1
-        self.assertEqual(routing.histogram_for_step([req]), {1: 2})
-
-        bad = Request(
-            1,
-            prefill_len=4,
-            decode_len=1,
-            block_size=16,
-            prefill_expert_histogram={0: 7},
-        )
-        with self.assertRaisesRegex(WorkloadValidationError, "must equal 8"):
-            routing.histogram_for_step([bad])
-
+class AFCLIIntegrationTest(unittest.TestCase):
     def test_current_cli_runs_af_and_exports_runtime_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

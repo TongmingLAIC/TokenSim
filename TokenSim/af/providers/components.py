@@ -271,9 +271,17 @@ class ComputeComponentsMixin:
         return self._component(resolver, name, "elementwise", key)
 
     def _component(
-        self, resolver: OperatorResolver, name: str, table: str, key: Mapping[str, Any]
+        self,
+        resolver: OperatorResolver,
+        name: str,
+        table: str,
+        key: Mapping[str, Any],
+        *,
+        record_stats: bool = True,
     ) -> OperatorComponent:
-        estimate: OperatorEstimate = resolver.query(table, key)
+        estimate: OperatorEstimate = resolver.query(
+            table, key, record_stats=record_stats
+        )
         covered = ()
         if self.require_device_scope and estimate.match_type != "analytical":
             metadata = (

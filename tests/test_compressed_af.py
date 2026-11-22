@@ -11,13 +11,16 @@ from TokenSim.af.factory import build_model_runtime
 from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.hardware import HardwareContext
 from TokenSim.af.providers.queries import AFComputeQuery
-from TokenSim.af.providers.operator_table import build_operator_table_af_providers
+from TokenSim.af.providers.operator_table import (
+    OperatorTableAFComputeProvider,
+    build_operator_table_af_providers,
+)
 from TokenSim.af.runtime.admission import ResidentKV, rank_kv_bytes
 from TokenSim.af.runtime.compressed import compressed_layout
 from TokenSim.af.serving.service import AFService
 from TokenSim.config.weight_memory import packed_weight_memory
 from TokenSim.errors import ConfigurationError
-from TokenSim.trace.host import run_environment
+from TokenSim.operator_data.package import OperatorDataPackage, SourceRecord
 from tests.af.support.config import _cluster
 
 
@@ -330,7 +333,7 @@ class CompressedAFTests(unittest.TestCase):
             service.release(session)
 
         env.process(run())
-        run_environment(env)
+        env.run()
         self.assertEqual(len(service.completed_passes), 2)
         self.assertFalse(service.memory.leases)
         modules = [
@@ -401,7 +404,7 @@ class CompressedAFTests(unittest.TestCase):
             ],
         )
         env.process(executor.run_iteration(iteration))
-        run_environment(env)
+        env.run()
         events = [
             e
             for e in executor.trace.events
@@ -411,32 +414,20 @@ class CompressedAFTests(unittest.TestCase):
         for event in events:
             self.assertEqual(event.payload_bytes, 7168 // 2 * 2 * 4)
 
-    def test_measured_module_keeps_native_geometry_and_source(self):
-        runtime = self.runtime
-        from TokenSim.af.providers.operator_table import OperatorTableAFComputeProvider
-
-        provider = OperatorTableAFComputeProvider(
-            runtime.hardware,
-            runtime.model,
-            operator_backend="vllm",
-            fallback="table_first",
-        )
-        query = replace(self.query(layer=2), device_type="gb200")
-        result = provider.estimate(query)
-        module = result.details["components"][-1]
-        self.assertNotEqual(module["match_type"], "analytical")
-        self.assertIn("compose:", module["source_id"])
-
-    def test_native_attention_retains_exact_dynamic_ffn_histogram(self):
-        from TokenSim.af.providers.operator_table import OperatorTableAFComputeProvider
-
+    def test_measured_provenance_clamped_attention_and_dynamic_ffn(self):
         provider = OperatorTableAFComputeProvider(
             self.runtime.hardware,
             self.runtime.model,
             operator_backend="vllm",
             fallback="table_first",
         )
-        query = replace(
+        module = provider.estimate(
+            replace(self.query(layer=2), device_type="gb200")
+        ).details["components"][-1]
+        self.assertNotEqual(module["match_type"], "analytical")
+        self.assertIn("compose:", module["source_id"])
+
+        routed_q = replace(
             self.query(layer=2, stage="routed_expert", operation="routed_expert"),
             device_type="gb200",
             expert_ids=(0, 1),
@@ -444,12 +435,52 @@ class CompressedAFTests(unittest.TestCase):
             weight_dtype="mxfp4",
             ep_group=tuple(range(8)),
         )
-        result = provider.estimate(query)
-        component = result.details["components"][0]
-        self.assertEqual(component["table"], "routed_experts")
-        self.assertEqual(component["match_type"], "analytical")
-        self.assertEqual(component["key"]["routed_assignments"], 2)
+        comp = provider.estimate(routed_q).details["components"][0]
+        self.assertEqual(
+            (comp["table"], comp["match_type"]), ("routed_experts", "analytical")
+        )
 
-
-if __name__ == "__main__":
-    unittest.main()
+        rt = compressed_runtime(device="b300_sxm", topology="gb300_nvl72")
+        hw, model = rt.hardware, rt.model
+        pkg = hw.operator_package("b300_sxm", "vllm")
+        source = SourceRecord("test:rmsnorm", "A", "measured")
+        meta = replace(pkg.meta, sources={**pkg.meta.sources, source.source_id: source})
+        norm = OperatorDataPackage.from_rows(
+            meta,
+            {
+                "elementwise": [
+                    dict(
+                        op_name="rmsnorm",
+                        dtype=model.operator_dtype("norm"),
+                        num_tokens=1,
+                        hidden_size=model.hidden_size,
+                        latency_us=1.0,
+                        source_id=source.source_id,
+                    )
+                ]
+            },
+        )
+        hw.register_package(
+            replace(pkg, meta=meta, tables={**pkg.tables, **norm.tables})
+        )
+        providers = build_operator_table_af_providers(
+            hardware=hw,
+            model=model,
+            cluster_config=rt.cluster,
+            worker_configs=rt.workers,
+            placement=rt.placement,
+            dtype=model.activation_dtype,
+            operator_backend="vllm",
+        )
+        env = simpy.Environment()
+        service = AFService(env, rt, providers=providers)
+        session = service.admit(0, 0, maximum_context=1, current_context=0)
+        env.process(service.forward([session], phase="prefill"))
+        env.run()
+        csa = next(l.layer_id for l in model.layer_specs() if l.attention_kind == "csa")
+        event = next(
+            e
+            for e in service.trace.events
+            if e.stage == "attention" and e.layer_id == csa
+        )
+        self.assertEqual(event.match_type, "clamped")

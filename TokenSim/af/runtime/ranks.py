@@ -1,10 +1,11 @@
 """Compile physical rank components and per-stage KV partitions."""
 
-from TokenSim.af.runtime.memory import _components_for_binding, _experts_by_ep
+from TokenSim.af.runtime.memory import _components_for_binding
 from TokenSim.af.runtime.layer_kv import layer_kv_partitions
 from TokenSim.af.runtime.component_storage import stored_components
 from TokenSim.config.cache_config import stage_layer_range
 from TokenSim.errors import ConfigurationError
+from TokenSim.moe.placement import _assign_experts
 
 
 def compile_rank_components(
@@ -68,11 +69,14 @@ def compile_rank_components(
         if layout is not None and domain.capability == "af_attention":
             partitions = {0: compressed_partitions(layout, tp)}
         view = domain.expert_parallel
-        experts_by_rank = _experts_by_ep(
-            model.moe.num_experts if model.moe.enabled else 0,
-            view.expert_parallel_size,
-            domain.parallel.expert_placement_strategy,
-        )
+        experts_by_rank = {
+            rank: tuple(experts)
+            for rank, experts in _assign_experts(
+                strategy=domain.parallel.expert_placement_strategy,
+                num_experts=model.moe.num_experts if model.moe.enabled else 0,
+                ep_rank_count=view.expert_parallel_size,
+            ).items()
+        }
         for instance in domain.logical_instances:
             ordered = tuple(
                 sorted(

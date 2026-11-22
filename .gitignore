@@ -3,6 +3,10 @@
 /.codex/
 /.claude/
 /.venv/
+/.cache/
+/experiments/
+results
+tmp
 /outputs/
 __pycache__/
 *.py[cod]

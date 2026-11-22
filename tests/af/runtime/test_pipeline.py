@@ -7,17 +7,26 @@ import unittest
 import simpy
 
 from TokenSim.af.execution.model import ModelAFExecutor
+from TokenSim.af.factory import build_model_runtime
+from TokenSim.af.planning.batching import AFBlockBuilder
 from TokenSim.af.providers.operator_table import build_operator_table_af_providers
 from TokenSim.af.runtime.admission import ResidentKV, rank_kv_bytes
 from TokenSim.af.runtime.compiler import compile_af_runtime_plan
-from TokenSim.trace.recorder import TraceRecorder
+from TokenSim.af.serving.service import AFService
 from TokenSim.errors import ConfigurationError
+from TokenSim.hardware.context import HardwareContext
 from TokenSim.hardware.placement import build_topology_placement
+from TokenSim.trace.recorder import TraceRecorder
 
-from tests.af.support.config import _cluster
-from tests.af.support.execution import FixedComputeProvider, FixedTransferProvider
-from tests.af.support.model import _moe, _request, _runtime_hardware, _runtime_plan
+from tests.af.support.config import _cluster, _cluster_dict
+from tests.af.support.execution import (
+    FixedComputeProvider,
+    FixedTransferProvider,
+    af_test_hardware,
+)
+from tests.af.support.model import _moe, _runtime_hardware, _runtime_plan
 from tests.af.support.pipeline import decode_request, pipeline_cluster
+from tests.support.hardware import make_device
 
 
 class PipelineRuntimeTest(unittest.TestCase):
@@ -350,3 +359,81 @@ class ResidentKVTest(unittest.TestCase):
         self.assertEqual(len(ledger.leases), 1)
         ledger.release(1)
         self.assertEqual(sum(ledger.reserved.values()), 0)
+
+
+class ServingLimitsTest(unittest.TestCase):
+    @staticmethod
+    def _limits_runtime(*, block_tokens=1, f_capacity=0.1, **fields):
+        base = af_test_hardware(capacity_gib=0.1)
+        model = replace(base.model("TestModel"), vocab_size=32)
+        hardware = HardwareContext.in_memory(
+            [
+                make_device("a-device", memory_gib=0.1),
+                make_device("f-device", memory_gib=f_capacity),
+            ],
+            [model],
+            list(base.links),
+            list(base.topologies),
+        )
+        document = _cluster_dict(af_block_size=block_tokens)
+        document.update(fields)
+        return build_model_runtime(
+            document, hardware=hardware, model=model, block_size=4
+        )
+
+    def test_explicit_kv_limits_and_multi_owner_partition(self):
+        for field in (
+            "kv_cache_capacity_tokens_per_dp_rank",
+            "kv_cache_capacity_tokens_total",
+        ):
+            env = simpy.Environment()
+            service = AFService(env, self._limits_runtime(**{field: 32}))
+            first = service.admit(0, 0, maximum_context=32, current_context=31)
+            with self.assertRaisesRegex(ConfigurationError, "compiled replica budget"):
+                service.admit(1, 0, maximum_context=32, current_context=31)
+            env.process(service.forward([first]))
+            env.run()
+            self.assertEqual(first.cached_context, 32)
+            service.release(first)
+            service.admit(1, 0, maximum_context=32, current_context=31)
+
+        base = af_test_hardware(capacity_gib=0.1)
+        document = _cluster_dict(attention_workers=2)
+        document["kv_cache_capacity_tokens_total"] = 64
+        service = AFService(
+            simpy.Environment(),
+            build_model_runtime(
+                document, hardware=base, model=base.model("TestModel"), block_size=4
+            ),
+        )
+        for owner in (0, 1):
+            service.admit(owner, owner, maximum_context=32, current_context=0)
+            with self.assertRaisesRegex(ConfigurationError, "compiled replica budget"):
+                service.admit(owner + 10, owner, maximum_context=1, current_context=0)
+
+    def test_workspace_token_budget_and_block_packing(self):
+        tight = self._limits_runtime(f_capacity=6400 / (1 << 30))
+        env = simpy.Environment()
+        service = AFService(env, tight)
+        session = service.admit(0, 0, maximum_context=64, current_context=0)
+        with self.assertRaisesRegex(ConfigurationError, "workspace token budget"):
+            env.run(until=env.process(service.forward([session], query_tokens=64)))
+
+        wide = self._limits_runtime(block_tokens=64)
+        env2 = simpy.Environment()
+        svc2 = AFService(env2, wide)
+        s2 = svc2.admit(0, 0, maximum_context=64, current_context=0)
+        env2.run(until=env2.process(svc2.forward([s2], query_tokens=64)))
+        self.assertEqual(s2.cached_context, 64)
+
+        packed = self._limits_runtime(block_tokens=8)
+        requests = [
+            SimpleNamespace(
+                id=i, is_prefill=False, context_len=16, scheduled_query_tokens=count
+            )
+            for i, count in enumerate((3, 5, 2))
+        ]
+        iteration = AFBlockBuilder().build(
+            0, requests, 8, 0, packed.cluster.af.links[0]
+        )
+        self.assertEqual([b.token_count for b in iteration.blocks], [8, 2])

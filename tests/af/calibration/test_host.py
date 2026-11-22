@@ -1,31 +1,35 @@
+"""Host overhead profiles, native call groups, and deterministic routing replay."""
+
 import copy
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 import unittest
-from tests.af.support.config import _with_prefill_pool
+from unittest.mock import patch
 
-from TokenSim.af.calibration.host import HOST_COVERAGE
+import simpy
+from pydantic import TypeAdapter
+
+from TokenSim.af.calibration.host import (
+    COMPUTE_CALL_FIELDS,
+    EXTENDED_HOST_COVERAGE,
+    HOST_COVERAGE,
+    MESSAGE_CALL_FIELDS,
+)
+from TokenSim.af.execution.model import ModelAFExecutor
 from TokenSim.af.factory import build_model_runtime, simulate_decode
+from TokenSim.af.providers.operator_table import OperatorTableAFComputeProvider
+from TokenSim.af.providers.queries import AFServiceEstimate
+from TokenSim.config.config import ClusterConfig, KVTransferConfig
 from TokenSim.config.simulation import SimulationConfig
-from TokenSim.errors import ConfigurationError
-from tests.af.support.profiles import HostProfileFixture
-
-
-"""Af host profile."""
+from TokenSim.errors import ConfigurationError, WorkloadValidationError
+from TokenSim.hardware.device.sourced_value import SourcedValue
+from TokenSim.llm.llm_engine import LLMEngine
+from tests.af.support.config import _with_prefill_pool
+from tests.af.support.profiles import HostProfileFixture, OperationProfileFixture
 
 
 class HostProfileTest(HostProfileFixture, unittest.TestCase):
-    def test_v3_reserves_batch5_without_changing_old_schema(self):
-        runtime = self.runtime()
-        profile = self.document(runtime)
-        profile["schema_version"] = 3
-        profile["evidence"]["heldout_batches"] = [5]
-        self.load(profile, runtime)
-        for version, heldout in ((3, [2]), (2, [5]), (1, [5])):
-            profile["schema_version"] = version
-            profile["evidence"]["heldout_batches"] = heldout
-            with self.assertRaisesRegex(ConfigurationError, "held-out"):
-                self.load(profile, runtime)
-
-    def test_domain_bandwidth_and_placement_invalidate_profile(self):
+    def test_domain_placement_and_explicit_conflicts_invalidate_profile(self):
         original = self.runtime()
         doc = copy.deepcopy(original.doc)
         doc["af"]["transfer_topology_mode"] = "physical"
@@ -51,21 +55,15 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
             )
             with self.assertRaisesRegex(ConfigurationError, "fingerprint mismatch"):
                 self.load(profile, runtime)
-
-    def test_explicit_default_value_is_still_a_conflict(self):
-        runtime = self.runtime({"host_submit_us": 5})
-        self.assertIn(
-            "host_submit_us",
-            runtime.cluster.af.communication_timing._explicit_cost_fields,
-        )
+        conflict = self.runtime({"host_submit_us": 5})
         with self.assertRaisesRegex(ConfigurationError, "duplicate"):
             self.load(
-                self.document(runtime),
-                runtime,
-                runtime.cluster.af.communication_timing._explicit_cost_fields,
+                self.document(conflict),
+                conflict,
+                conflict.cluster.af.communication_timing._explicit_cost_fields,
             )
 
-    def test_measured_cost_origin_and_unique_control_charges(self):
+    def test_measured_cost_origin_scope_validation_and_bounds(self):
         runtime = self.runtime()
         doc = copy.deepcopy(runtime.doc)
         profile = self.document(runtime)
@@ -82,11 +80,11 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
             engine_overhead_profile=profile,
             calibration_environment=profile["environment"],
         )
-        runtime = build_model_runtime(
+        configured = build_model_runtime(
             doc, hardware=runtime.hardware, model=runtime.model
         )
         ex, _, _, _ = simulate_decode(
-            runtime, 1, 129, steps=3, fallback="analytical_only"
+            configured, 1, 129, steps=3, fallback="analytical_only"
         )
         for name, expected in [("control_encode_us", 7), ("control_decode_us", 11)]:
             charged = [
@@ -96,74 +94,60 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
             self.assertTrue(
                 all(abs(e.service_duration * 1e6 - expected) < 1e-9 for e in charged)
             )
-            self.assertTrue(all(e.details["calibrated"] for e in charged))
             self.assertEqual(
                 ex.host_cost_provenance(name, tokens=1)["origin"], "measured_profile"
             )
-        missing = ex.host_cost_provenance("a_step_prepare_us", tokens=1)
-        self.assertEqual(missing["origin"], "unmeasured_default")
-        self.assertFalse(missing["calibrated"])
-        self.assertEqual(missing["value_us"], 0)
-
-    def test_scope_coverage_environment_and_version_rejected(self):
-        original = self.document(self.runtime())
-        edits = [
+        self.assertEqual(
+            ex.host_cost_provenance("a_step_prepare_us", tokens=1)["origin"],
+            "unmeasured_default",
+        )
+        original = self.document(runtime)
+        for edit in (
             lambda d: d.update(contains_wait=True),
             lambda d: d.update(excludes_device_launch=False),
             lambda d: d.update(timing_scope="inclusive"),
-            lambda d: d.update(schema_version=2),
             lambda d: d["environment"].update(software_sha256="changed"),
             lambda d: d.update(runtime_fingerprint="changed"),
             lambda d: d["costs"]["host_submit_us"].update(coverage=["a_input_prepare"]),
             lambda d: d["costs"]["host_submit_us"].update(fixed_us=-1),
-            lambda d: d["costs"]["host_submit_us"].update(fixed_us=float("nan")),
             lambda d: d["costs"]["host_submit_us"].update(fixed_us=True),
             lambda d: d["evidence"].update(window_count=1),
             lambda d: d["evidence"].update(heldout_batches=[8]),
-        ]
-        edits += [
-            lambda d: d.update(environment=5),
-            lambda d: d.update(evidence=None),
-            lambda d: d["costs"].update(host_submit_us=5),
-            lambda d: d["costs"]["host_submit_us"].update(coverage=5),
-            lambda d: d["costs"]["host_submit_us"].update(per_token_us=1e308),
-            lambda d: d["evidence"].update(training_batches=5),
-        ]
-        for edit in edits:
-            doc = copy.deepcopy(original)
-            edit(doc)
-            with self.subTest(doc=doc), self.assertRaises(ConfigurationError):
-                self.load(doc)
-
-    def test_fingerprint_changes_with_content_and_workload_is_bounded(self):
-        from types import SimpleNamespace
-
-        doc = self.document(self.runtime())
-        first = self.load(doc)
-        doc["costs"]["host_submit_us"]["fixed_us"] = 3
-        second = self.load(doc)
-        self.assertNotEqual(first.fingerprint, second.fingerprint)
+        ):
+            bad = copy.deepcopy(original)
+            edit(bad)
+            with self.assertRaises(ConfigurationError):
+                self.load(bad)
+        loaded = self.load(original)
         for requests, phase in (
             ([SimpleNamespace(context_len=128)], "decode"),
             ([SimpleNamespace(context_len=129)] * 9, "decode"),
             ([SimpleNamespace(context_len=129)], "prefill"),
         ):
             with self.assertRaises(ConfigurationError):
-                first.validate_workload(requests, phase)
+                loaded.validate_workload(requests, phase)
 
-    def test_standard_engine_keeps_model_boundaries_and_profile(self):
-        import simpy
-        from types import SimpleNamespace
-        from unittest.mock import patch
-
-        from TokenSim.config.config import ClusterConfig
-        from TokenSim.config.config import KVTransferConfig
-        from TokenSim.llm.llm_engine import LLMEngine
-        from TokenSim.af.execution.model import ModelAFExecutor
-
+    def test_standard_engine_boundaries_and_protocol_buffer_reservation(self):
         runtime = self.runtime()
-        from pydantic import TypeAdapter
-
+        states = {s.physical_identity: s for s in runtime.plan.physical_states}
+        a = states["a-pool:0"]
+        self.assertEqual(dict(a.protocol_buffers)["a_return_hidden"], 8 * 256 * 2)
+        original_device = runtime.hardware.device
+        with patch.object(
+            runtime.hardware,
+            "device",
+            side_effect=lambda name: replace(
+                original_device(name),
+                memory_capacity_bytes=SourcedValue(
+                    a.model_bytes + a.protocol_buffer_bytes - 1, "test", "D"
+                ),
+                memory_reserved_bytes=SourcedValue(0, "test", "D"),
+            ),
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "required_bytes"):
+                build_model_runtime(
+                    runtime.doc, hardware=runtime.hardware, model=runtime.model
+                )
         raw = TypeAdapter(ClusterConfig).dump_python(
             _with_prefill_pool(runtime.cluster), mode="json", exclude_none=True
         )
@@ -175,9 +159,7 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
         doc["af"].update(
             engine_overhead_profile=profile,
             calibration_environment=profile["environment"],
-        )
-        doc["af"]["communication_timing"] = dict(
-            enabled=True, native_control_enabled=True
+            communication_timing=dict(enabled=True, native_control_enabled=True),
         )
         env = simpy.Environment()
         with patch.object(runtime.hardware, "model", return_value=runtime.model):
@@ -191,34 +173,28 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
                     trace={"mode": "full"},
                     block_size=16,
                     batching="paged-attn",
-                    prefill_worker_pool_type="round_robin",
-                    decode_worker_pool_type="round_robin",
                     max_num_seqs=8,
                     latency_fallback="analytical_only",
                 ),
             )
         ex = engine.af_executor
         self.assertIsInstance(ex, ModelAFExecutor)
-        request = SimpleNamespace(
-            id=0, is_prefill=False, prefill_len=128, context_len=129, generation_idx=0
+        iteration = ex.submit(
+            0,
+            [
+                SimpleNamespace(
+                    id=0,
+                    is_prefill=False,
+                    prefill_len=128,
+                    context_len=129,
+                    generation_idx=0,
+                )
+            ],
         )
-        iteration = ex.submit(0, [request])
         env.run(until=env.process(ex.run_iteration(iteration)))
-        boundaries = {
-            e.operation
-            for e in ex.trace.events
-            if e.layer_id == -1 and e.event_type == "compute"
-        }
-        self.assertEqual(
-            boundaries, {"embedding_lookup", "final_norm", "lm_head", "token_selection"}
-        )
-        self.assertEqual(ex.overhead_profile.describe()["profile_id"], "unit-test-host")
         ex.trace.validate_invariants(iteration.iteration_id)
 
-    def test_measured_compute_scope_and_combine_coverage(self):
-        from types import SimpleNamespace
-        from TokenSim.af.providers.operator_table import OperatorTableAFComputeProvider
-
+    def test_measured_compute_scope_and_fused_combine_coverage(self):
         provider = OperatorTableAFComputeProvider(
             self.runtime().hardware,
             self.fixture.model,
@@ -233,98 +209,23 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
         )
         metadata = {}
         resolver = SimpleNamespace(
-            query=lambda *args: estimate,
+            query=lambda *args, **kwargs: estimate,
             package=SimpleNamespace(meta=SimpleNamespace(extra=metadata)),
             dataset_version="test",
         )
-        for scope in (None, "inclusive", "host_service", "eager_interval"):
-            metadata["timing_scopes"] = {"routed_experts": scope}
-            with self.assertRaises(ConfigurationError):
-                provider._component(resolver, "experts", "routed_experts", {})
-        metadata["timing_scopes"]["routed_experts"] = "device_service"
+        metadata["timing_scopes"] = {"routed_experts": "inclusive"}
         with self.assertRaises(ConfigurationError):
             provider._component(resolver, "experts", "routed_experts", {})
-        metadata["operation_coverage"] = {"routed_experts": ["routed_experts"]}
-        self.assertEqual(
-            provider._component(resolver, "experts", "routed_experts", {}).latency_us, 1
-        )
-        metadata["operation_coverage"]["routed_experts"] = (
-            "routed_experts",
-            "weighted_combine",
-        )
+        metadata["timing_scopes"]["routed_experts"] = "device_service"
+        metadata["operation_coverage"] = {
+            "routed_experts": ("routed_experts", "weighted_combine")
+        }
         self.assertEqual(
             provider._component(
                 resolver, "experts", "routed_experts", {}
             ).covered_operations,
             ("routed_experts", "weighted_combine"),
         )
-
-    def test_native_buffers_are_reserved_once_and_reduce_kv_capacity(self):
-        runtime = self.runtime()
-        states = {s.physical_identity: s for s in runtime.plan.physical_states}
-        a, f = states["a-pool:0"], states["f-pool:0"]
-        self.assertEqual(dict(a.protocol_buffers)["a_return_hidden"], 8 * 256 * 2)
-        self.assertEqual(dict(f.protocol_buffers)["f_output_hidden"], 8 * 256 * 2)
-        self.assertEqual(len(dict(a.protocol_buffers)), len(a.protocol_buffers))
-        raw = (
-            a.capacity_bytes - a.model_bytes - a.protocol_buffer_bytes
-        ) // a.kv_bytes_per_block
-        replica = next(r for r in runtime.plan.replicas if r.is_attention)
-        self.assertEqual(replica.logical_gpu_blocks, raw - int(0.01 * raw))
-        self.assertEqual(f.kv_bytes_per_block, 0)
-        from dataclasses import replace
-        from unittest.mock import patch
-        from TokenSim.hardware.device.sourced_value import SourcedValue
-
-        original = runtime.hardware.device
-        with patch.object(
-            runtime.hardware,
-            "device",
-            side_effect=lambda name: replace(
-                original(name),
-                memory_capacity_bytes=SourcedValue(
-                    a.model_bytes + a.protocol_buffer_bytes - 1, "test", "D"
-                ),
-                memory_reserved_bytes=SourcedValue(0, "test", "D"),
-            ),
-        ):
-            with self.assertRaisesRegex(ConfigurationError, "required_bytes"):
-                build_model_runtime(
-                    runtime.doc, hardware=runtime.hardware, model=runtime.model
-                )
-
-    def test_grouped_expert_submit_not_multiplied_by_topk(self):
-        from dataclasses import replace
-
-        for k in (1, 2):
-            runtime = self.runtime({"compute_submit_us": 7})
-            model = replace(
-                runtime.model, moe=replace(runtime.model.moe, num_experts_per_tok=k)
-            )
-            runtime = build_model_runtime(
-                runtime.doc, hardware=runtime.hardware, model=model
-            )
-            ex, _, _, _ = simulate_decode(runtime, 8, 129, fallback="analytical_only")
-            experts = [
-                e
-                for e in ex.trace.events
-                if e.event_type == "compute" and e.stage == "routed_expert"
-            ]
-            self.assertEqual(len(experts), 2)
-            for expert in experts:
-                submits = [
-                    e
-                    for e in ex.trace.events
-                    if e.node_id == expert.node_id + ":compute_submit"
-                ]
-                self.assertEqual(len(submits), 1)
-                self.assertAlmostEqual(submits[0].service_duration, 7e-6)
-
-    def test_fused_combine_keeps_dependency_without_second_service_or_submit(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        from TokenSim.af.providers.queries import AFServiceEstimate
-
         runtime = self.runtime({"compute_submit_us": 7})
         ex, _, _, _ = simulate_decode(runtime, 1, 129, fallback="analytical_only")
         original = ex.compute_provider.estimate
@@ -343,8 +244,8 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
                 raise AssertionError("combine must not be estimated again")
             return original(query)
 
-        def submit():
-            return ex.submit(
+        with patch.object(ex.compute_provider, "estimate", fused):
+            iteration = ex.submit(
                 0,
                 [
                     SimpleNamespace(
@@ -356,27 +257,161 @@ class HostProfileTest(HostProfileFixture, unittest.TestCase):
                     )
                 ],
             )
-
-        with patch.object(ex.compute_provider, "estimate", fused):
-            iteration = submit()
             ex.env.run(until=ex.env.process(ex.run_iteration(iteration)))
-        events = ex.trace.events_for(iteration.iteration_id)
-        combined = [e for e in events if e.stage == "weighted_combine"]
-        self.assertEqual(len(combined), 2)
-        for event in combined:
-            self.assertEqual(event.service_duration, 0)
-            self.assertTrue(event.details["semantic_completion_only"])
-            self.assertFalse(
-                any(e.node_id == event.node_id + ":compute_submit" for e in events)
-            )
-        self.assertFalse(ex._fused_combines)
+        combined = [
+            e
+            for e in ex.trace.events_for(iteration.iteration_id)
+            if e.stage == "weighted_combine"
+        ]
+        self.assertTrue(all(e.service_duration == 0 for e in combined))
         ex.trace.validate_invariants(iteration.iteration_id)
-        resumed = submit()
-        ex.env.run(until=ex.env.process(ex.run_iteration(resumed)))
-        self.assertTrue(
-            all(
-                e.service_duration > 0
-                for e in ex.trace.events_for(resumed.iteration_id)
-                if e.event_type == "compute" and e.stage == "weighted_combine"
+
+
+class NativeCallAndRoutingReplayTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        OperationProfileFixture.setUpClass()
+        cls.fixture = OperationProfileFixture()
+
+    def profile(self, fields):
+        doc = self.fixture.host.document(self.fixture.host.runtime())
+        doc["schema_version"] = 2
+        doc["evidence"]["heldout_batches"] = [2]
+        doc["costs"] = {
+            name: dict(
+                fixed_us=value, per_token_us=0, coverage=[EXTENDED_HOST_COVERAGE[name]]
             )
+            for name, value in fields.items()
+        }
+        doc["evidence"]["quantiles_us"] = {
+            name: dict(p50=value, p95=value) for name, value in fields.items()
+        }
+        return doc
+
+    def run_profile(self, fields, steps=2, **options):
+        runtime = self.fixture.configured(
+            self.fixture.sampled_profile(),
+            engine_overhead_profile=self.profile(fields),
+            **options,
         )
+        return simulate_decode(
+            runtime,
+            1,
+            129,
+            steps=steps,
+            fallback="analytical_only",
+            trace=options.get("trace_enabled", True),
+        )
+
+    def test_native_call_groups_ordering_and_duplicate_rejection(self):
+        fields = {name: 7 for name in COMPUTE_CALL_FIELDS.values()}
+        fields.update({name: 3 for name in MESSAGE_CALL_FIELDS.values()})
+        ex, _, _, _ = self.run_profile(fields)
+        counts = {}
+        for e in ex.trace.events:
+            field = e.details.get("cost_field")
+            if field in fields:
+                counts[field] = counts.get(field, 0) + 1
+        for name in MESSAGE_CALL_FIELDS.values():
+            self.assertEqual(counts.get(name, 0), 4)
+        book_fields = {
+            "compute_f_moe_block_us": 23,
+            "engine_step_schedule_us": 13,
+            "engine_runner_bookkeeping_us": 19,
+            "engine_output_process_us": 17,
+        }
+        ex, rows, _, _ = self.run_profile(book_fields)
+        _, quiet, _, _ = self.run_profile(
+            book_fields,
+            trace_enabled=False,
+            service_estimate_cache=False,
+            dag_template_cache=False,
+        )
+        self.assertEqual(rows, quiet)
+        events = ex.trace.events_for(0)
+        readback = next(e for e in events if e.operation == "sampled_token_readback")
+        book = next(
+            e
+            for e in events
+            if e.details.get("cost_field") == "engine_runner_bookkeeping_us"
+        )
+        output = next(
+            e
+            for e in events
+            if e.details.get("cost_field") == "engine_output_process_us"
+        )
+        self.assertGreaterEqual(book.start_at, readback.end_at)
+        self.assertGreaterEqual(output.start_at, book.end_at)
+        with self.assertRaisesRegex(ConfigurationError, "duplicate"):
+            self.fixture.host.load(
+                self.profile({"compute_f_moe_block_us": 23, "compute_f_router_us": 7})
+            )
+
+    def test_routing_replay_assignments_and_validation(self):
+        runtime = self.fixture.host.runtime()
+        profile = self.fixture.host.document(runtime)
+        replay = dict(
+            schema_version=1,
+            runtime_fingerprint=profile["runtime_fingerprint"],
+            environment=profile["environment"],
+            source="unit-test://routing",
+            kind="synthetic_test",
+            assignments=[
+                dict(
+                    phase="decode",
+                    decode_step=step,
+                    layer_id=layer,
+                    request_id=0,
+                    token_id=128 + step,
+                    top_k_index=k,
+                    expert_id=(layer + k) % 4,
+                    routing_weight=0.25 if k == 0 else 0.75,
+                    a_dp_rank=0,
+                    a_tp_rank=0,
+                )
+                for step in range(2)
+                for layer in range(2)
+                for k in range(2)
+            ],
+        )
+        doc = copy.deepcopy(runtime.doc)
+        doc["af"].update(
+            routing_replay=replay, calibration_environment=profile["environment"]
+        )
+        configured = build_model_runtime(
+            doc, hardware=runtime.hardware, model=runtime.model
+        )
+        executor, rows, _, _ = simulate_decode(
+            configured, 1, 129, steps=2, fallback="analytical_only"
+        )
+        iteration = executor.submit(
+            0,
+            [
+                SimpleNamespace(
+                    id=0, is_prefill=False, context_len=129, generation_idx=0
+                )
+            ],
+        )
+        records = [
+            {k: v for k, v in asdict(a).items() if k != "iteration_id"}
+            for snap in iteration.blocks[0].routing_snapshots
+            for a in snap.assignments
+        ]
+        self.assertEqual(records, replay["assignments"][:4])
+        for edit in (
+            lambda r: r["assignments"].pop(),
+            lambda r: r["assignments"][0].update(expert_id=99),
+            lambda r: r.update(runtime_fingerprint="wrong"),
+        ):
+            bad = copy.deepcopy(doc)
+            edit(bad["af"]["routing_replay"])
+            with self.assertRaises((ConfigurationError, WorkloadValidationError)):
+                simulate_decode(
+                    build_model_runtime(
+                        bad, hardware=runtime.hardware, model=runtime.model
+                    ),
+                    1,
+                    129,
+                    steps=2,
+                    fallback="analytical_only",
+                )

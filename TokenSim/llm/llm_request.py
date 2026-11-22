@@ -1,4 +1,4 @@
-from TokenSim.llm.request_time import RequestTime, LLMTime
+from TokenSim.llm.request_time import RequestTime, LLMTime, TimingRecorder
 
 import simpy
 from dataclasses import dataclass, field
@@ -22,8 +22,6 @@ class RequestStatus(Enum):
     FINISHED_CANCELLED = auto()
 
 
-# Request fields written by a scheduler admission (cache-hit accounting,
-# context-build position and status). A rolled-back admission restores them.
 _ADMISSION_FIELDS = (
     "status",
     "num_computed_tokens",
@@ -70,8 +68,6 @@ class Request:
     prefill_len: int
     decode_len: int
     block_size: int = field(repr=False)
-    # Public IDs are only unique within an engine. Unknown token content must
-    # remain private even when separate engines reuse the same request ID.
     cache_identity: object = field(
         default_factory=object, init=False, repr=False, compare=False
     )
@@ -91,6 +87,10 @@ class Request:
     af_a_owners: dict[str, str] = field(default_factory=dict, repr=False)
     cache_salt: str | None = None
     reuse_group: str | None = None
+    session_key: Any = field(default=None, repr=False)
+    cache_one_shot: bool = field(default=False, repr=False)
+    control_prefetch: bool = field(default=False, repr=False)
+    control_prefetch_callback: Any = field(default=None, repr=False)
     measurement_phase: str = "profile"
     record_timing: bool = True
     cached_prefill_blocks: int = 0
@@ -120,8 +120,6 @@ class Request:
     recomputed_tokens_total: int = 0
     recompute_service_time: float = 0.0
     status: RequestStatus = field(default=RequestStatus.WAITING, repr=False)
-    # Online timing aggregates (replacing per-step time/service_time/batch
-    # lists; accumulation order matches the old list arithmetic bit-for-bit).
     arrival_at: float | None = field(default=None, repr=False)
     completed_at: float | None = field(default=None, repr=False)
     total_time: float = field(default=0.0, repr=False)
@@ -132,16 +130,8 @@ class Request:
     decode_service_time_sum: float = field(default=0.0, repr=False)
     prefill_batch_size: float = field(default=0.0, repr=False)
     decode_batch_sum: float = field(default=0.0, repr=False)
-    # Per-step scheduling state (vLLM V1 semantics). ``num_computed_tokens`` is
-    # the number of context tokens whose KV is present on the worker (prefix
-    # hits included); ``scheduled_tokens`` is what the scheduler assigned to
-    # the current step: one token for a decode step, the next chunk of the
-    # remaining context for a (chunked) prefill or recompute step.
     num_computed_tokens: int = field(default=0, repr=False)
     scheduled_tokens: int = field(default=0, repr=False)
-    # MTP advances by the accepted 2/3 tokens while the target forward
-    # verifies 1+K query positions.  Ordinary requests keep this equal to
-    # scheduled_tokens.
     scheduled_query_tokens: int = field(default=0, repr=False)
     scheduled_accepted_tokens: int = field(default=0, repr=False)
     decode_round: int = field(default=0, repr=False)
@@ -153,19 +143,15 @@ class Request:
     cancelled_at: float | None = field(default=None, repr=False)
     owner_worker_ids: set[int] = field(default_factory=set, repr=False)
     cancel_pending_worker_ids: set[int] = field(default_factory=set, repr=False)
-    # Context-building steps this request's prompt took (1 without chunking).
     prefill_chunks: int = 0
-    # Routing decision of session-aware routers.
     dp_domain: str | None = field(default=None, repr=False)
     dp_rank: int | None = field(default=None, repr=False)
     routing_worker_id: int | None = field(default=None, repr=False)
-    # Workload-specific provenance, for example an AgentX trace turn.
     source: Any = field(default=None, repr=False)
     tqdm_submit_func = None
 
     def __post_init__(self):
         self._physical_token_blocks: list[PhysicalTokenBlock] = []
-        # Tokens in the logical blocks; blocks fill left to right.
         self._logical_tokens = 0
         self._append_tokens(self.prefill_len)
         self._last_event_at: float = 0.0
@@ -173,6 +159,10 @@ class Request:
         self.cancellation_event: simpy.Event | None = None
         if self.effective_prefill_tokens is None:
             self.effective_prefill_tokens = self.prefill_len
+
+    @property
+    def is_measured(self) -> bool:
+        return self.measurement_phase != "warmup"
 
     @property
     def prefill_compute_len(self) -> int:
@@ -233,17 +223,14 @@ class Request:
 
     @property
     def remaining_context_tokens(self) -> int:
-        """Context tokens still to compute before this request can sample a token."""
         return max(0, self.context_len - self.num_computed_tokens)
 
     @property
     def is_context_build(self) -> bool:
-        """True while the prompt, or a preempted context, is being (re)computed."""
         return self.is_prefill or self.needs_recompute
 
     @property
     def is_prompt_prefilling(self) -> bool:
-        """Serving's original-prompt progress, independent of output replay."""
         return self.is_context_build and self.num_computed_tokens < self.prefill_len
 
     @property
@@ -254,7 +241,6 @@ class Request:
 
     @property
     def logits_tokens(self) -> int:
-        # Invalid placeholder drafts still require logits but yield one output.
         return (
             1 + self.scheduled_placeholder_tokens
             if self.is_context_build
@@ -263,25 +249,13 @@ class Request:
 
     @property
     def step_tokens(self) -> int:
-        """Tokens this request computes in the current step.
-
-        The scheduler assigns ``scheduled_tokens`` (a decode token or a context
-        chunk); a request nobody scheduled, as with the legacy schedulers or
-        direct calls, computes its whole remaining context at once.
-        """
         return self.scheduled_tokens or max(1, self.remaining_context_tokens)
 
     @property
     def query_tokens(self) -> int:
-        """Target-model query width for the current scheduler step."""
         return self.scheduled_query_tokens or self.step_tokens
 
     def start_context_build(self, cached_tokens: int) -> None:
-        """Record the context already present in KV when the request is admitted.
-
-        At least one token is always computed (the last position's logits are
-        needed), which is vLLM's cap on full-prompt prefix hits.
-        """
         self.num_computed_tokens = min(
             max(0, cached_tokens), max(0, self.context_len - 1)
         )
@@ -304,6 +278,19 @@ class Request:
             self.reloaded_cpu_tokens += cpu_tokens
         self.prefill_admission_count += 1
 
+    def observe_uniform_sources(self, gpu_tokens, cpu_tokens) -> None:
+        gpu = min(gpu_tokens, max(0, self.context_len - 1))
+        cpu = min(cpu_tokens, max(0, self.context_len - 1 - gpu))
+        self.gpu_cached_context_tokens = gpu
+        self.external_cached_context_tokens = cpu
+        self.gpu_cached_prefill_tokens = min(self.prefill_len, gpu)
+        self.external_cached_prefill_tokens = min(
+            cpu, max(0, self.prefill_len - self.gpu_cached_prefill_tokens)
+        )
+        self.record_prefill_admission(
+            self.gpu_cached_prefill_tokens, self.external_cached_prefill_tokens
+        )
+
     def record_context_admission(self, gpu_tokens, cpu_tokens):
         """Record a whole-context hit without expanding the input denominator."""
         if (
@@ -325,11 +312,9 @@ class Request:
         self.record_prefill_admission(prompt_gpu, prompt_cpu)
 
     def admission_state(self) -> tuple:
-        """Snapshot of the fields an admission writes."""
         return tuple(getattr(self, name) for name in _ADMISSION_FIELDS)
 
     def restore_admission_state(self, state: tuple) -> None:
-        """Undo an admission that never ran: restore an :meth:`admission_state`."""
         for name, value in zip(_ADMISSION_FIELDS, state):
             setattr(self, name, value)
 
@@ -370,14 +355,7 @@ class Request:
     def advance(
         self, env: simpy.Environment, latency: float, batch: int, timing_recorder=None
     ):
-        """Apply one scheduler step to this request.
-
-        A step computes ``scheduled_tokens`` of context: a decode token, a
-        prefill chunk or a recompute chunk. Only the step that completes the
-        context samples a token (:meth:`step`); partial chunks just accumulate
-        service time, so TTFT spans every chunk plus the waits between them.
-        Returns the completed :class:`RequestTime` when the request finishes.
-        """
+        """Apply one scheduler step and emit RequestTime once sampling finishes."""
         if self.cancel_requested:
             return None
         context_build = self.is_prefill or self.needs_recompute
@@ -397,8 +375,6 @@ class Request:
                 self.prefill_service_time += latency
             return None
         if self.needs_recompute:
-            # The pass that restores the context also yields the next token;
-            # its service time is booked as recompute, not decode.
             self.finish_recompute(latency)
             latency = 0.0
         return self.step(
@@ -418,7 +394,7 @@ class Request:
         *,
         output_tokens: int = 1,
     ):
-        """Sample one token: bookkeeping for wall time, service time and batch size."""
+        """Sample output tokens and update online timing aggregates."""
         if self.cancel_requested:
             return None
         output_tokens = max(
@@ -464,12 +440,10 @@ class Request:
         return None
 
     def release_logical_blocks(self) -> None:
-        """Drop bulky request-local state after the scheduler has finished it."""
         self._logical_tokens = 0
         self.input_cache_keys.clear()
 
     def prepare_recompute(self) -> None:
-        """Preemption released the KV: the whole context must be rebuilt."""
         self.needs_recompute = True
         self.recompute_tokens = self.context_len
         self.num_computed_tokens = 0

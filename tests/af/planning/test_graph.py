@@ -409,33 +409,27 @@ class TemplateTest(unittest.TestCase):
             compared[1].nodes[0].metadata["changed"] = True
 
     def test_service_trace_and_completion_differential_matrix(self):
-        for tp, block, batch, context, router, dtype in (
-            (1, 1, 2, 8, "a", "bf16"),
-            (2, 2, 4, 16, "f", "bf16"),
-            (2, 1, 2, 9, "a", "fp8"),
-        ):
-            with self.subTest(tp=tp, block=block, dtype=dtype):
-                results = []
-                for enabled in (False, True):
-                    config = configuration(a_tp=tp, f_tp=2, af_batch_size=block)
-                    config.doc["af"].update(
-                        dag_template_cache=enabled,
-                        service_estimate_cache=enabled,
-                        router_location=router,
-                        kv_cache_dtype=dtype,
-                        communication_timing=dict(
-                            enabled=True, host_submit_us=5, host_completion_us=2
-                        ),
-                    )
-                    config = build_model_runtime(
-                        config.doc, hardware=config.hardware, model=config.model
-                    )
-                    with observe_services() as services:
-                        executor, rows, _, _ = simulate(
-                            config, batch, context, steps=2, fallback="analytical_only"
-                        )
-                    results.append((rows, services, executor.trace.events))
-                self.assertEqual(results[0], results[1])
+        results = []
+        for enabled in (False, True):
+            config = configuration(a_tp=2, f_tp=2, af_batch_size=2)
+            config.doc["af"].update(
+                dag_template_cache=enabled,
+                service_estimate_cache=enabled,
+                router_location="f",
+                kv_cache_dtype="fp8",
+                communication_timing=dict(
+                    enabled=True, host_submit_us=5, host_completion_us=2
+                ),
+            )
+            config = build_model_runtime(
+                config.doc, hardware=config.hardware, model=config.model
+            )
+            with observe_services() as services:
+                executor, rows, _, _ = simulate(
+                    config, 4, 16, steps=2, fallback="analytical_only"
+                )
+            results.append((rows, services, executor.trace.events))
+        self.assertEqual(results[0], results[1])
 
     def test_routing_changes_miss_and_eviction_is_bounded(self):
         config = configuration(af_batch_size=1, f_tp=2)

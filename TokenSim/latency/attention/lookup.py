@@ -14,23 +14,39 @@ class AttentionLookup:
     def _analytical_work(self, _table, key):
         return self.sol.estimate_us(key)
 
-    def _query(self, layer_kind, phase, batch_size, input_seq_len, context_len):
-        # Front cache over the raw arguments; it is cleared together with the
-        # resolved-key cache, so a hit returns exactly the object that cache
-        # would return.
+    def _query(
+        self,
+        layer_kind,
+        phase,
+        batch_size,
+        input_seq_len,
+        context_len,
+        *,
+        record_stats: bool = True,
+    ):
         request = (layer_kind, phase, batch_size, input_seq_len, context_len)
         cached = self.request_cache.get(request)
         if cached is None:
-            cached = self._resolve_query(*request)
+            cached = self._resolve_query(*request, record_stats=record_stats)
             self.request_cache[request] = cached
             return cached
-        self.backend.stats.record(self.table, cached.match)
-        self.counts[f"{phase}:{layer_kind}:{cached.match}"] += 1
-        if cached.ragged_grid:
-            self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
+        if record_stats:
+            self.backend.stats.record(self.table, cached.match)
+            self.counts[f"{phase}:{layer_kind}:{cached.match}"] += 1
+            if cached.ragged_grid:
+                self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
         return cached
 
-    def _resolve_query(self, layer_kind, phase, batch_size, input_seq_len, context_len):
+    def _resolve_query(
+        self,
+        layer_kind,
+        phase,
+        batch_size,
+        input_seq_len,
+        context_len,
+        *,
+        record_stats: bool = True,
+    ):
         key = {
             "layer_kind": layer_kind,
             "phase": phase,
@@ -75,12 +91,13 @@ class AttentionLookup:
         identity = (clamped, tuple(key.items()))
         cached = self.cache.get(identity)
         if cached is not None:
-            self.backend.stats.record(self.table, cached.match)
-            self.counts[f"{phase}:{layer_kind}:{cached.match}"] = (
-                self.counts.get(f"{phase}:{layer_kind}:{cached.match}", 0) + 1
-            )
-            if cached.ragged_grid:
-                self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
+            if record_stats:
+                self.backend.stats.record(self.table, cached.match)
+                self.counts[f"{phase}:{layer_kind}:{cached.match}"] = (
+                    self.counts.get(f"{phase}:{layer_kind}:{cached.match}", 0) + 1
+                )
+                if cached.ragged_grid:
+                    self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
             return cached
         ragged_grid = False
         try:
@@ -112,10 +129,11 @@ class AttentionLookup:
             key["input_seq_len"],
         )
         self.cache[identity] = result
-        self.backend.stats.record(self.table, result.match)
-        self.counts[f"{phase}:{layer_kind}:{result.match}"] += 1
-        if ragged_grid:
-            self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
+        if record_stats:
+            self.backend.stats.record(self.table, result.match)
+            self.counts[f"{phase}:{layer_kind}:{result.match}"] += 1
+            if ragged_grid:
+                self.decode_batch_stats["ragged_grid_lookup_queries"] += 1
         return result
 
     def _query_supported_generation_slices(self, key):

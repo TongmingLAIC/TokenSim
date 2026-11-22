@@ -1,9 +1,5 @@
 from TokenSim.kv_transfer.connectors.base import BaseKVConnector
 from TokenSim.kv_transfer.connectors.factory import KVConnectorFactory
-from TokenSim.kv_transfer.connectors.interfaces import (
-    SchedulerSideConnector,
-    WorkerSideConnector,
-)
 from TokenSim.kv_transfer.connectors.metadata import (
     ConnectorStats,
     ConnectorTransferPlan,
@@ -43,6 +39,4 @@ __all__ = [
     "SimpleCPUOffloadConnector",
     "MooncakeConnector",
     "MooncakeStoreConnector",
-    "SchedulerSideConnector",
-    "WorkerSideConnector",
 ]

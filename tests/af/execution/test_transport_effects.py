@@ -5,17 +5,20 @@ from types import SimpleNamespace
 import unittest
 import simpy
 
+from TokenSim.af.execution.barrier import PeerLayerBarrier
+from TokenSim.af.execution.jitter import perturb_service, request_multiplier
 from TokenSim.af.execution.transport_effects import (
-    ReceiverQueue,
-    packet_tail,
     AFTransportEffects,
     OrderedArrivalStream,
+    ReceiverQueue,
+    packet_tail,
 )
-from TokenSim.config.af.transport_effects import AFTransportEffectsConfig
-from TokenSim.config.af.jitter import AFJitterConfig
-from TokenSim.errors import ConfigurationError
-from TokenSim.af.execution.jitter import perturb_service
 from TokenSim.af.providers.queries import AFServiceEstimate
+from TokenSim.config.af.jitter import AFJitterConfig
+from TokenSim.config.af.settings import AFConfig
+from TokenSim.config.af.transport_effects import AFTransportEffectsConfig
+from TokenSim.errors import ConfigurationError, SimulationStateError
+from tests.af.support.batching import batch_runtime, submit_owner
 
 
 class PacketTailTest(unittest.TestCase):
@@ -282,3 +285,115 @@ class ReceiveQueueTest(unittest.TestCase):
             max(r[3].details["resource_occupancy_end_at"] for r in ends), 2e-6
         )
         self.assertGreater(max(r[2] for r in ends), 2e-6)
+
+
+class JitterAndPeerBarrierTest(unittest.TestCase):
+    def test_jitter_seed_additivity_rank_cv_and_validation(self):
+        block = SimpleNamespace(
+            request_ids=(1, 2),
+            phase="decode",
+            context_lengths=(8, 8),
+            source_a_worker_id=0,
+        )
+        estimate = AFServiceEstimate(1, "test")
+        self.assertIs(
+            perturb_service(estimate, AFJitterConfig(), block, 0, "a"), estimate
+        )
+        cfg = AFJitterConfig(enabled=True, compute_cv=0.3, seed=7)
+        a = perturb_service(estimate, cfg, block, 0, "a")
+        self.assertEqual(a, perturb_service(estimate, cfg, block, 0, "a"))
+        self.assertNotEqual(
+            a, perturb_service(estimate, replace(cfg, seed=8), block, 0, "a")
+        )
+
+        add_cfg = AFJitterConfig(enabled=True, compute_cv=0.2)
+
+        def service(ids):
+            b = SimpleNamespace(
+                request_ids=ids, phase="decode", context_lengths=(8,) * len(ids)
+            )
+            return perturb_service(
+                AFServiceEstimate(len(ids), "test"), add_cfg, b, 0, "a"
+            ).service_duration
+
+        self.assertAlmostEqual(service((1, 2)), service((1,)) + service((2,)))
+        values = [request_multiplier(0, "service", i, 0.3) for i in range(4000)]
+        self.assertAlmostEqual(sum(values) / len(values), 1, delta=0.025)
+
+        tp_cfg = AFJitterConfig(enabled=True, tp_rank_cv=0.3)
+        query = SimpleNamespace(
+            direction="collective",
+            operation="all_reduce",
+            physical_endpoints=("a:0", "a:1"),
+        )
+        small = perturb_service(
+            estimate, tp_cfg, block, 0, "all_reduce", network=True, query=query
+        )
+        block.request_ids = tuple(range(64))
+        block.context_lengths = (8,) * 64
+        self.assertEqual(
+            small,
+            perturb_service(
+                estimate, tp_cfg, block, 0, "all_reduce", network=True, query=query
+            ),
+        )
+        for fields in (
+            {"compute_cv": -1},
+            {"network_cv": float("nan")},
+            {"seed": True},
+            {"compute_cv": 3},
+        ):
+            with self.assertRaises((ValueError, ConfigurationError)):
+                AFJitterConfig(**fields)
+        with self.assertRaises((ValueError, ConfigurationError)):
+            AFConfig(peer_layer_barrier=1)
+
+    def test_peer_layer_barrier_wait_mismatch_and_abort(self):
+        env, ex, _ = batch_runtime(owners=2)
+        proxy = SimpleNamespace(
+            env=env,
+            cluster_config=SimpleNamespace(
+                af=SimpleNamespace(peer_layer_barrier=True),
+                af_domains=ex.cluster_config.af_domains,
+            ),
+            trace=ex.trace,
+        )
+        gate = PeerLayerBarrier(proxy)
+        iterations = [submit_owner(ex, owner)[0] for owner in range(2)]
+        for it in iterations:
+            gate.register(it)
+        a = env.process(gate.wait(iterations[0].blocks[0], 0, ()))
+        env.run()
+        self.assertFalse(a.triggered)
+
+        def late():
+            yield env.timeout(3)
+            yield from gate.wait(iterations[1].blocks[0], 0, ())
+
+        b = env.process(late())
+        env.run()
+        self.assertTrue(a.triggered and b.triggered)
+        for it in iterations:
+            gate.complete(it)
+        self.assertFalse(gate.rounds)
+
+        env2, ex2, _ = batch_runtime(owners=2)
+        gate2 = PeerLayerBarrier(
+            SimpleNamespace(
+                env=env2,
+                cluster_config=SimpleNamespace(
+                    af=SimpleNamespace(peer_layer_barrier=True),
+                    af_domains=ex2.cluster_config.af_domains,
+                ),
+                trace=ex2.trace,
+            )
+        )
+        first = submit_owner(ex2, 0, count=2)[0]
+        gate2.register(first)
+        task = env2.process(gate2.wait(first.blocks[0], 0, ()))
+        env2.run()
+        with self.assertRaisesRegex(ConfigurationError, "matching microbatch"):
+            gate2.register(submit_owner(ex2, 1, count=3)[0])
+        with self.assertRaises(SimulationStateError):
+            env2.run()
+        self.assertTrue(task.triggered)

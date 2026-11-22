@@ -1,9 +1,12 @@
 """Complete-model P/D groups retain distinct TP, DP and expert ownership."""
 
-import unittest
+from collections import Counter
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 import simpy
 
@@ -15,8 +18,10 @@ from TokenSim.config.config import (
 )
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.errors import ConfigurationError
+from TokenSim.kv_transfer.transport.uniform import PDHandoff
 from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.llm.llm_request import Request
+from TokenSim.placement.policies import DataParallelWorkerPool, RoundRobinWorkerPool
 from TokenSim.workload.source import LLMSource
 from TokenSim.reporting.stats import (
     get_parallel_stats,
@@ -24,6 +29,8 @@ from TokenSim.reporting.stats import (
     get_cache_capacity_stats,
 )
 from TokenSim.reporting import RunReport, export_result
+from tests.af.support.config import _cluster as _af_cluster
+from tests.support.grouped_handoff import setup as _setup_grouped_handoff
 from tests.support.hardware import make_hardware, moe_test_model
 from tests.support.pd import _DeterministicBackend
 
@@ -243,6 +250,83 @@ class ServingDomainsTest(unittest.TestCase):
                 self.assertRaises(ConfigurationError),
             ):
                 candidate.workers()
+
+    def test_ordinary_prefill_groups_retain_dp_ranks_beside_af_domains(self):
+        base = _af_cluster(a_tp=1, a_dp=1, f_tp=1, f_dp=1, f_ep=1)
+        mixed = replace(
+            base,
+            num_workers=6,
+            parallel_config=ParallelConfig(data_parallel_size=4),
+            worker_groups=[
+                *base.worker_groups,
+                WorkerGroupConfig(
+                    name="p",
+                    role="prefill",
+                    hardware="a-device",
+                    num_workers=4,
+                    network="af-net",
+                ),
+            ],
+        )
+        workers = mixed.workers()
+        self.assertEqual(
+            [w.rank_info.dp_rank for w in workers if w.name == "p"], [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            [w.rank_info.dp_rank for w in workers if w.name == "a-pool"], [0]
+        )
+
+    def test_destination_domain_routing_and_grouped_dma_coordinate_update(self):
+        def selector(independent=True, sticky=False):
+            workers = [
+                SimpleNamespace(
+                    id=i, dp_rank=i, execution_domain="D" if independent else None
+                )
+                for i in range(8)
+            ]
+            pool = DataParallelWorkerPool(
+                workers, RoundRobinWorkerPool, sticky_sessions=sticky
+            )
+            handoff = PDHandoff.__new__(PDHandoff)
+            handoff.engine = SimpleNamespace(
+                af_runtime_plan=None, request_workers=workers, decode_workers=pool
+            )
+            return handoff
+
+        rr = selector()
+        requests = [SimpleNamespace(dp_rank=0, chat_id=str(i)) for i in range(16)]
+        self.assertEqual(
+            [rr._select_decode_target(r).dp_rank for r in requests], list(range(8)) * 2
+        )
+        self.assertEqual([r.dp_rank for r in requests], [0] * 16)
+        sticky = selector(sticky=True)
+        self.assertEqual(
+            [
+                sticky._select_decode_target(
+                    SimpleNamespace(dp_rank=i, chat_id="agent")
+                ).dp_rank
+                for i in (1, 3, 0, 6)
+            ],
+            [0] * 4,
+        )
+        shared = selector(independent=False)
+        self.assertEqual(
+            shared._select_decode_target(SimpleNamespace(dp_rank=3)).dp_rank, 3
+        )
+        env, engine, handoff, req, failures = _setup_grouped_handoff()
+        source, target = engine.workers
+        source.dp_rank, target.dp_rank, req.dp_rank = 2, 5, 2
+        handoff.dispatch(source, [req])
+        source.scheduler.running.clear()
+        self.assertEqual(req.dp_rank, 2)
+        env.run()
+        self.assertEqual(failures, [])
+        self.assertEqual(req.dp_rank, 5)
+        rows = [e for e in handoff.events if e["kind"] == "transfer_start"]
+        self.assertEqual(
+            Counter((e["source_dp_rank"], e["target_dp_rank"]) for e in rows),
+            {(2, 5): 1},
+        )
 
 
 if __name__ == "__main__":

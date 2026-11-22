@@ -1,113 +1,84 @@
 # Device catalog (`data/devices/`)
 
-Each YAML file describes one accelerator.
-The catalog loads YAML files recursively, including grouped device examples in subdirectories.
-Every number carries a `source_id` (declared in the file's `sources:` block) and an evidence grade: **A** official spec or first-party measurement, **B** public third-party benchmark, **C** calibrated or derived estimate, **D** project assumption.
-See [`TokenSim/hardware/README.md`](../../TokenSim/hardware/README.md) for the field definitions and [the operator latency model](../../docs/reference/operator-latency-model.md) for how the values are used.
+Each YAML file in `data/devices/` defines one accelerator's compute peaks, memory hierarchy, interconnect links and analytical parameters.
+The catalog loads device files recursively, including variants in subdirectories.
 
-## Devices and available operator data
+## Evidence grades and provenance
 
-Operator tables come from NVIDIA AIConfigurator's measured kernel database (commit `f254959eb89e2f206b8f9a77051644d7c1cbdb89`, Apache-2.0, see [`../operator_data/LICENSES.md`](../operator_data/LICENSES.md)).
-Available upstream measurements are imported for the `vllm`, `trtllm` and `sglang` inference frameworks, as listed in the table below.
-`vllm` is the project default when the cluster does not specify `operator_backend`.
-Select one per worker group with `"operator_backend": "<name>"` or globally with `--operator_backend`.
-The table uses GEMM for matrix multiplication, MoE for mixture-of-experts computation and collectives for communication involving a group of GPU workers.
+Every `SourcedValue` stores a numeric value, a `source_id` declared in the file's `sources:` mapping and an evidence grade.
 
-| device_id | Device | Family | Spec grade | AIConfigurator system | Imported backends (framework versions) | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| `a100_sxm_80g` | NVIDIA A100-SXM4-80GB | nvidia_gpu | A | `a100_sxm` | vllm 0.14.0, trtllm 1.0.0, sglang 0.5.10; NCCL 2.27.3 | Ampere: no fp8; trtllm adds int8_wo/int4_wo/int8_sq GEMM, sglang int4_wo MoE |
-| `a100_sxm_40g` | NVIDIA A100-SXM4-40GB | nvidia_gpu | A | — | none | bandwidth 1.555 TB/s differs from the 80 GB part |
-| `a100_pcie_80g` | NVIDIA A100-PCIE-80GB | nvidia_gpu | A | `a100_pcie` | none — upstream data directory is empty | PCIe peers, NVLink bridge pairs only |
-| `a30` | NVIDIA A30 | nvidia_gpu | A | `a30` | none — upstream data directory is empty | 24 GB HBM2 |
-| `v100_sxm2` | NVIDIA V100-SXM2-32GB | nvidia_gpu | A | — | `nccl` collective only (legacy nccl-tests fp32, 2/4/8 GPUs) | Volta, not in AIConfigurator |
-| `h100_sxm` | NVIDIA H100 80GB HBM3 | nvidia_gpu | A | `h100_sxm` | vllm 0.24.0, trtllm 1.3.0rc20 (+rc23/rc10 backfill), sglang 0.5.14 (+0.5.6.post2); NCCL 2.29.2; DeepEP `ep_all2all` from all three | vllm attention FA3/FA4; sglang adds int8_wo GEMM; sglang DeepEP tables cover 1-8 nodes |
-| `h100_pcie` | NVIDIA H100 PCIe 80GB | nvidia_gpu | A | `h100_pcie` | none — upstream data directory is empty | 756 TFLOPS FP16 dense, PCIe peers |
-| `h200_sxm` | NVIDIA H200 141GB HBM3e | nvidia_gpu | A | `h200_sxm` | same as H100 | |
-| `h20` | NVIDIA H20 96GB | nvidia_gpu | **B** (third-party specs) | — | none | analytical parameters applied from `h100_sxm` |
-| `l40s` | NVIDIA L40S | nvidia_gpu | A | `l40s` | vllm 0.24.0, trtllm 1.3.0rc20 (+1.0.0), sglang 0.5.14; PCIe NCCL | Ada, fp8 supported, no NVLink |
-| `l4` | NVIDIA L4 | nvidia_gpu | A | `l4` | none — upstream data directory is empty | 72 W inference card |
-| `rtx_4090` | NVIDIA GeForce RTX 4090 | nvidia_gpu | A (Ada whitepaper) | — | none — collect locally with `scripts/collect/` | analytical parameters applied from `l40s` (same AD102) |
-| `rtx_pro_6000_server` | NVIDIA RTX PRO 6000 Blackwell Server Edition | nvidia_gpu | **C** (tensor peaks scaled to observed clock) | `rtx_pro_6000_server` | vllm 0.24.0, trtllm 1.3.0rc20, sglang 0.5.14; PCIe NCCL | NVIDIA page lists 1.6 TB/s memory bandwidth vs 1.792 upstream; verify |
-| `b200_sxm` | NVIDIA B200 SXM (HGX B200) | nvidia_gpu | A compute / C memory | `b200_sxm` | vllm 0.24.0, trtllm 1.3.0rc20 (+rc23), sglang 0.5.14; NCCL 2.29.2; DeepEP `ep_all2all` | nvfp4 and mxfp4 GEMM/MoE |
-| `b300_sxm` | NVIDIA B300 SXM (HGX B300) | nvidia_gpu | A compute / C memory+fp4 | `b300_sxm` | same as B200 | INT8 tensor throughput reduced on Blackwell Ultra |
-| `gb200` | NVIDIA GB200 (NVL72) | nvidia_gpu | **C** (per-GPU derived) | `gb200` | same as B200; collectives 2/4 GPUs only (4 GPUs per tray, `--gpus-per-node 4`) | topology `gb200_nvl72` |
-| `gb300` | NVIDIA GB300 (NVL72, Blackwell Ultra) | nvidia_gpu | **C** (per-GPU derived) | `gb300` | same as B200; collectives 2/4 GPUs only | topology `gb300_nvl72` |
-| `groqchip_v1` | Groq GroqChip v1 (TSP / LPU) | groq_tsp | A (product brief, ISCA papers) | — | `analytical` only (grade D formulas) | analytical kernel costs |
-| `intel_arc_pro_b60` | Intel Arc Pro B60 (XPU) | generic | A memory / C compute | `b60` | vllm 0.26.0 (+0.20.0); oneCCL 2021.17.2 collectives | only vLLM XPU exists upstream; analytical family `generic` |
-
-With the default `table_first` fallback policy, "none" means operator times for that device are estimated by formulas and reported as `match_type = analytical`.
-Use the [coverage command](../../docs/reference/operator-data.md#package-tools) to select measurements for a model and layout.
-
-### Why versions differ between systems
-
-Each upstream `(system, framework)` pair records the framework version used for the last complete profiling run on that hardware in `aic-core/src/aiconfigurator_core/systems/query_versions.yaml`.
-Regular collections for Hopper and Blackwell use TensorRT-LLM 1.3.0rc20, vLLM 0.24.0 and SGLang 0.5.14 in the bundled revision.
-The A100 collection remains at TensorRT-LLM 1.0.0, vLLM 0.14.0 and SGLang 0.5.10 because newer releases stopped adding Ampere kernels.
-Directories such as `1.3.0rc23` contain measurements only for changed operator dimensions, such as MXFP4 MoE, and use the last complete collection for other entries.
-The importer keeps the newest row for each key and fills missing keys from older versions.
-
-### Why the same shape differs between backends
-
-The frameworks can select different matrix multiplication (GEMM) or attention kernels for identical dimensions.
-Examples include cuBLAS/CUTLASS, FlashInfer and Triton for GEMM, and FlashAttention-2/3/4 or TensorRT-LLM fused MHA/XQA for attention.
-They also support different quantization formats and combine different operations into fused kernels.
-Each imported row preserves `kernel_source` in its `kernel` column to identify the implementation measured.
-
-## Analytical defaults shared with AIConfigurator (grade C)
-
-Every NVIDIA GPU file overrides the family defaults with corrections recorded in NVIDIA's `systems/<system>.yaml` files during validation against TensorRT-LLM deployments.
-The following table lists those corrections.
-
-| Field | Value | Upstream key |
+| Grade | Meaning | Example |
 | --- | --- | --- |
-| `analytical.memory_efficiency` | 0.8 | `mem_bw_empirical_scaling_factor` |
-| `analytical.kernel_launch_us` | 3.0 | `mem_empirical_constant_latency` (3 µs) |
-| `analytical.collective_launch_us` | 10.0 | `node.p2p_latency` (10 µs) |
-| `memory.reserved_bytes` | 4,169,138,176 (392 MB NCCL buffers + 3.5 GB runtime reserve) | `misc.nccl_mem[8] + misc.other_mem` |
+| **A** | Vendor datasheet, whitepaper or direct measurement on the target hardware | H100 HBM3 bandwidth 3.35 TB/s |
+| **B** | Published third-party benchmark or complete-module measurement | MLPerf submission or imported module curve |
+| **C** | Calibrated or derived estimate constrained by observations | Per-GPU NVL72 peak derived from rack specifications, or `calibrate` fit |
+| **D** | Architecture-family analytical default | Default `gemm_mfu` for an uncalibrated device |
 
-The Intel B60 file uses its upstream values: memory efficiency 0.5, point-to-point transfer latency 2 µs and reserved memory 500 MiB.
-Devices without an upstream system file (H20, RTX 4090, V100) borrow the values of the closest architecture and say so in their `sources` notes.
-`CacheConfig` subtracts `reserved_bytes` before sizing the attention key/value (KV) cache.
-`operator_data.cli calibrate` can fit the analytical parameters to measurements from the target device.
+Results report the lowest grade among their active inputs.
+`tokensim-operator-data calibrate` fits analytical efficiency parameters against measured tables and upgrades grade D defaults to grade C.
+
+## Analytical parameters and memory reserves
+
+When operator tables do not cover a query, the roofline model estimates execution time from floating-point operations (FLOPs) and memory traffic:
+
+$$
+t_{\mathrm{op}} = \max\left(\frac{F_{\mathrm{op}}}{P_d \eta_{\mathrm{op}}}, \frac{B_{\mathrm{op}}}{B_{\mathrm{mem}} \eta_{\mathrm{mem}}}\right) + \tau_{\mathrm{op}}.
+$$
+
+Parameters are grouped by device family (`nvidia_gpu`, `groq_tsp` and `generic`) and can be overridden per device under `analytical:`.
+GEMM denotes matrix multiplication, MoE denotes mixture-of-experts computation and a collective is a multi-rank communication operation.
+
+| Parameter | Meaning | `nvidia_gpu` default | `groq_tsp` default |
+| --- | --- | --- | --- |
+| `gemm_mfu` | Effective peak compute fraction for large GEMMs | 0.70 | 0.80 |
+| `attention_mfu` | Effective peak compute fraction for attention cores | 0.45 | 0.60 |
+| `moe_mfu` | Effective peak compute fraction for grouped/fused MoE | 0.50 | 0.70 |
+| `memory_efficiency` | Effective memory bandwidth fraction | 0.85 | 0.90 |
+| `elementwise_memory_efficiency` | Effective bandwidth fraction for elementwise kernels | 0.70 | 0.90 |
+| `kernel_launch_us` | Fixed launch overhead per kernel in microseconds | 4.0 | 0.2 |
+| `collective_launch_us` | Fixed launch overhead per collective in microseconds | 8.0 | 0.5 |
+| `gemm_small_m_knee` | Row-count tile threshold below which GEMM compute scales down | 64.0 | 1.0 |
+
+NVIDIA GPU catalog entries apply AIConfigurator's grade C system calibrations: `memory_efficiency: 0.8`, `kernel_launch_us: 3.0`, `collective_launch_us: 10.0` and `memory.reserved_bytes: 4169138176` (communication buffers plus runtime workspace).
+`DeviceSpec.usable_memory_bytes` and `CacheConfig` deduct `memory.reserved_bytes` before sizing the attention key/value (KV) cache.
+
+`DeviceSpec.peak_compute_for(dtype)` maps storage data types to compute pipelines: weight-only formats (`int8_wo`, `int4_wo`, `mxfp4_wo`) execute on `fp16`, `int4_a8` and `fp8_block` execute on `fp8`, and `mxfp4` executes on `nvfp4`.
+When a device lacks a requested compute pipe, `COMPUTE_PIPE_FALLBACKS` tries `nvfp4 -> fp8 -> fp16 -> bf16`, `int4 -> int8 -> fp16 -> bf16`, `bf16 <-> fp16` and `tf32 -> fp32`.
+
+## Bundled devices and operator packages
+
+Measured operator packages are imported from NVIDIA AIConfigurator (`f254959eb89e2f206b8f9a77051644d7c1cbdb89`, Apache-2.0; see [`../operator_data/LICENSES.md`](../operator_data/LICENSES.md)) for `vllm` (default), `trtllm` and `sglang`.
+Select a backend globally with `--operator_backend` or per worker group with `"operator_backend"`.
+
+| `device_id` | Accelerator | Family | Spec grade | Bundled operator backends |
+| --- | --- | --- | --- | --- |
+| `a100_sxm_80g` | NVIDIA A100-SXM4-80GB | `nvidia_gpu` | A | `vllm`, `trtllm`, `sglang` |
+| `a100_sxm_40g`, `a100_pcie_80g`, `a30` | NVIDIA Ampere GPUs | `nvidia_gpu` | A | analytical |
+| `v100_sxm2` | NVIDIA V100-SXM2-32GB | `nvidia_gpu` | A | `nccl` collectives; analytical compute |
+| `h100_sxm`, `h200_sxm` | NVIDIA H100 80GB / H200 141GB SXM | `nvidia_gpu` | A | `vllm`, `trtllm`, `sglang` (with DeepEP `ep_all2all`) |
+| `h100_pcie`, `l4`, `rtx_4090` | NVIDIA Hopper / Ada PCIe GPUs | `nvidia_gpu` | A | analytical |
+| `h20` | NVIDIA H20 96GB | `nvidia_gpu` | B | analytical |
+| `l40s` | NVIDIA L40S | `nvidia_gpu` | A | `vllm`, `trtllm`, `sglang` |
+| `rtx_pro_6000_server` | NVIDIA RTX PRO 6000 Blackwell Server | `nvidia_gpu` | C | `vllm`, `trtllm`, `sglang` |
+| `b200_sxm`, `b300_sxm` | NVIDIA HGX B200 / B300 SXM | `nvidia_gpu` | A / C | `vllm`, `trtllm`, `sglang` (with DeepEP, MegaMoE, mHC) |
+| `gb200`, `gb300` | NVIDIA GB200 / GB300 NVL72 | `nvidia_gpu` | C | `vllm`, `trtllm`, `sglang` (4 GPUs per tray) |
+| `rubin` | NVIDIA Vera Rubin NVL72 | `nvidia_gpu` | C / D | analytical |
+| `groqchip_v1` | GroqChip v1 LPU | `groq_tsp` | A | `analytical` package |
+| `groq_lp30` | NVIDIA Groq 3 LP30 LPU (LPX256) | `groq_tsp` | A / C / D | analytical SRAM roofline / unit pipeline |
+| `intel_arc_pro_b60` | Intel Arc Pro B60 XPU | `generic` | A / C | `vllm` (with oneCCL collectives) |
+
+Upstream framework versions follow each hardware generation's latest complete profiling collection, backfilling unchanged shapes from prior versions and retaining `kernel_source` in the `kernel` column.
+See [Operator latency and data packages](../../docs/reference/operator-latency.md) for lookup rules and `tokensim-operator-data` commands.
 
 ## Adding a device
 
-1. Copy the YAML for the closest device and change `device_id`, `display_name` and `aliases`.
-   Names such as `B200`, `B300` and `H100` identify the SXM/HGX devices.
-   Superchip entries (`gb200`, `gb300`) use only `GB...` aliases, keeping `B300` distinct from the NVL72 superchip.
-2. Fill `peak_compute` for each data type using dense compute figures, dividing NVIDIA sparse figures by two.
-   Fill `memory`, optional `on_chip_memory`, `interconnect` using link IDs from `data/topologies/links.yaml`, and `power`.
-3. Declare every `source_id` in `sources:` with a grade and a reference.
-4. Import or collect operator data into `data/operator_data/<device_id>/<backend>/` (see `scripts/collect/README.md`), or leave it to the analytical fallback.
-5. Run the core tests with the following command to check the new device entry.
+1. Copy a close device YAML and set `device_id`, `display_name` and `aliases` (keep `B200`/`B300` for HGX parts and `GB200`/`GB300` for NVL72 superchips).
+2. Populate dense `peak_compute` rates, `memory`, optional `on_chip_memory`, `interconnect` link IDs from `data/topologies/links.yaml` and `power`.
+3. Declare every `source_id` under `sources:` with its evidence grade and citation.
+4. Optionally import or collect operator tables under `data/operator_data/<device_id>/<backend>/` using [`scripts/collect/`](../../scripts/collect/README.md).
 
-   ```bash
-   python -m unittest discover \
-       -s tests \
-       -t .
-   ```
+## High-bandwidth flash (HBF) GPU memory variants
 
-## HBF memory variants
-
-The [`hbf/`](hbf/) directory contains experimental memory variants of H100, H200 and B200.
-Each entry uses its base GPU compute and interconnect values with separate memory kind, capacity and bandwidth assumptions (grade D).
-Base-device aliases such as `H100` continue to select the standard GPU.
-
-| Device ID | GPU memory | Capacity per GPU | Bandwidth per GPU |
-| --- | --- | --- | --- |
-| `h100_sxm_hbf1` | GDDR7 | 32 GiB | 1.792 TB/s |
-| `h100_sxm_hbf1_48gib` | GDDR7 | 48 GiB | 1.344 TB/s |
-| `h100_sxm_hbf2` | HBM3e | 48 GiB | 1.5 TB/s |
-| `h200_sxm_hbf1` | GDDR7 | 32 GiB | 1.792 TB/s |
-| `h200_sxm_hbf2` | HBM3e | 48 GiB | 1.5 TB/s |
-| `b200_sxm_hbf1` | GDDR7 | 64 GiB | 3.584 TB/s |
-| `b200_sxm_hbf1_48gib` | GDDR7 | 96 GiB | 2.688 TB/s |
-| `b200_sxm_hbf2` | HBM3e | 96 GiB | 4 TB/s |
-
-Select a variant in the worker group's `hardware` field.
-`data/clusters/8_h100/tp8_hbf1.json` provides an eight-GPU HBF1 example.
-GPU variants can use HBF storage, SSD storage or no external store.
-Each variant has a distinct device ID and evaluates operator times through the analytical model under the default `table_first` policy.
-Add measurements under the variant's own device ID when available.
-
-Choose the [HBF storage plugin](../../examples/storage/hbf/README.md) separately when modeling flash as external KV storage.
+The [`hbf/`](hbf/) subdirectory defines experimental memory variants (`h100_sxm_hbf1`, `h100_sxm_hbf1_48gib`, `h100_sxm_hbf2`, `h200_sxm_hbf1`, `h200_sxm_hbf2`, `b200_sxm_hbf1`, `b200_sxm_hbf1_48gib`, `b200_sxm_hbf2`) that pair standard GPU compute and interconnects with GDDR7 or HBM3e capacity and bandwidth profiles (grade D).
+Select a variant explicitly in `worker_groups[*].hardware`, such as `data/clusters/8_h100/tp8_hbf1.json`.
+For external flash KV storage behind a standard GPU cluster, use the [HBF storage plugin](../../examples/storage/hbf/README.md).

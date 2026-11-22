@@ -1,264 +1,149 @@
-"""Check physical placement and collective matching against explicit inventories."""
+"""Global Ring collective schedules and MegaMoE physical EP locality checks."""
 
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
-from TokenSim.comm.collectives import CollectiveModel
 from TokenSim.comm.collective_types import CollectiveQuery
-from TokenSim.config.cluster_config import ClusterConfig
+from TokenSim.comm.collectives import CollectiveModel
+from TokenSim.comm.global_ring import route_loads
+from TokenSim.config.parallel_config import ParallelConfig, ParallelRankInfo
 from TokenSim.errors import ConfigurationError
+from TokenSim.hardware import HardwareContext
 from TokenSim.hardware.links import LinkCatalog, LinkClass
-from TokenSim.hardware.placement import build_topology_placement
-from TokenSim.hardware.topology import TopologyLevel, TopologySpec
-from TokenSim.operator_data.lookup import (
-    LookupPolicy,
-    MissingOperatorDataError,
-    OperatorLookup,
-)
-from TokenSim.operator_data.package import (
-    OperatorDataPackage,
-    PackageMeta,
-    SourceRecord,
-)
-from tests.support.hardware import make_hardware
+from TokenSim.hardware.topology import TopologyLevel, TopologyPlacement, TopologySpec
+from TokenSim.latency.operator_table import OperatorTableLatencyBackend
+from TokenSim.llm.forward import ForwardPass, RankShape
+from TokenSim.parallel import ParallelCommunicator
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def measurements(rows, *, group_size=4, scopes=None):
-    sources = {
-        source: SourceRecord(source, "A", "measured") for _, _, _, source in rows
-    }
-    meta = PackageMeta(
-        "test-collective-v1",
-        "TestGPU",
-        "nccl",
-        sources=sources,
-        extra={"collective_measurement_scopes": scopes} if scopes else {},
-    )
-    return OperatorLookup(
-        OperatorDataPackage.from_rows(
-            meta,
-            {
-                "collective": [
-                    dict(
-                        dtype="fp16",
-                        operation="all_reduce",
-                        group_size=group_size,
-                        nodes=nodes,
-                        message_bytes=size,
-                        latency_us=cost,
-                        source_id=source,
-                    )
-                    for nodes, size, cost, source in rows
-                ]
-            },
-        ),
-        LookupPolicy(extrapolate="none"),
-    )
-
-
-class PhysicalCollectiveTest(unittest.TestCase):
+class GlobalRingTests(unittest.TestCase):
     def setUp(self):
-        self.topology = TopologySpec(
-            "two-racks",
-            (
-                TopologyLevel("node", 8, "nic"),
-                TopologyLevel("rack", 2, "nic"),
-                TopologyLevel("cluster", 2, "nic"),
-            ),
-        )
         self.links = LinkCatalog(
             [
                 LinkClass(
-                    "nic",
-                    "test",
-                    10e9,
+                    "local",
+                    "local",
+                    300e9,
                     1,
                     half_bandwidth_bytes=0,
                     collective_efficiency=1,
-                )
+                ),
+                LinkClass(
+                    "nic",
+                    "nic",
+                    25e9,
+                    2,
+                    half_bandwidth_bytes=0,
+                    collective_efficiency=1,
+                ),
             ]
         )
-
-    def test_measured_key_counts_actual_nodes_in_sparse_racks(self):
-        layout = self.topology.group_layout((0, 1, 8, 16))
-        lookup = measurements(((3, 1024, 17, "three"), (4, 1024, 99, "four")))
-        model = CollectiveModel(self.topology, self.links, measured_lookup=lookup)
-        result = model.estimate(CollectiveQuery("all_reduce", 1024, layout))
-        self.assertEqual((result.latency_us, result.source_id), (17, "three"))
-        self.assertEqual(layout.node_count, 3)
-        self.assertEqual(layout.fan, (2, 2, 2))
-
-    def test_finite_topology_validates_singleton_and_multirank_layouts(self):
-        for slots in ((32,), (0, 32)):
-            with self.subTest(slots=slots):
-                with self.assertRaisesRegex(
-                    ConfigurationError, "outside the inventory"
-                ):
-                    self.topology.group_layout(slots)
-                with self.assertRaisesRegex(
-                    ConfigurationError, "outside the inventory"
-                ):
-                    self.topology.lowest_common_level(slots)
-        self.assertEqual(self.topology.capacity, 32)
-        self.assertEqual(self.topology.lowest_common_level((0, 31)), 2)
-
-    def test_auto_uses_same_effective_budget_as_chosen_algorithm(self):
-        for ports, oversubscription, scope, expected in (
-            (1, 1, "link", "ring"),
-            (4, 1, "link", "tree"),
-            (4, 2, "link", "ring"),
-            (4, 1, "endpoint", "ring"),
-        ):
-            with self.subTest(
-                ports=ports, oversubscription=oversubscription, scope=scope
-            ):
-                topology = TopologySpec(
-                    "single-node",
-                    (
-                        TopologyLevel(
-                            "node",
-                            8,
-                            "nic",
-                            links_per_endpoint=ports,
-                            oversubscription=oversubscription,
-                        ),
-                    ),
-                )
-                links = LinkCatalog(
-                    [replace(self.links.get("nic"), bandwidth_scope=scope)]
-                )
-                model = CollectiveModel(
-                    topology, links, fallback="analytical_only", launch_us=0
-                )
-                query = CollectiveQuery(
-                    "all_reduce", 1_000_000, topology.group_layout(range(8))
-                )
-                auto = model.estimate(query)
-                explicit = [
-                    model.estimate(replace(query, algorithm=name))
-                    for name in ("ring", "tree")
-                ]
-                self.assertEqual(
-                    auto, min(explicit, key=lambda estimate: estimate.latency_us)
-                )
-                self.assertEqual(auto.levels[0].algorithm, expected)
-
-    def test_global_ring_filters_sources_before_interpolating(self):
-        ranks = (0, 1, 8, 9)
-        scope = {
-            "ring": {
-                "schedule": "global_ring",
-                "algorithm": "ring",
-                "topology_id": self.topology.topology_id,
-                "ranks": list(ranks),
-            },
-        }
-        lookup = measurements(
+        self.topology = TopologySpec(
+            "two_nodes",
             (
-                (2, 1024, 100, "ring"),
-                (2, 2048, 999, "unscoped"),
-                (2, 4096, 400, "ring"),
+                TopologyLevel("node", 8, "local"),
+                TopologyLevel("cluster", None, "nic", links_per_endpoint=2),
             ),
-            scopes=scope,
         )
-        query = CollectiveQuery(
-            "all_reduce",
-            2048,
+        self.model = CollectiveModel(
+            self.topology, self.links, launch_us=8, fallback="analytical_only"
+        )
+
+    def query(self, ranks, size, operation="all_reduce", algorithm="ring"):
+        return CollectiveQuery(
+            operation,
+            size,
             self.topology.group_layout(ranks),
-            schedule="global_ring",
-        )
-        model = CollectiveModel(self.topology, self.links, measured_lookup=lookup)
-        result = model.estimate(query)
-        self.assertEqual(
-            (result.match_type, result.source_id), ("interpolated", "ring")
-        )
-        self.assertGreater(result.latency_us, 100)
-        self.assertLess(result.latency_us, 400)
-        self.assertEqual(
-            model.estimate(replace(query, message_bytes=1024)).latency_us, 100
+            "fp32",
+            algorithm,
+            "global_ring",
         )
 
-        hierarchical = replace(query, schedule="hierarchical")
-        self.assertEqual(model.estimate(hierarchical).source_id, "unscoped")
-        self.assertEqual(
-            model.estimate(replace(hierarchical, message_bytes=1024)).match_type,
-            "analytical",
+    def test_contiguous_and_interleaved_rings_respect_nic_budgets(self):
+        result = self.model.estimate(self.query(tuple(range(16)), 16_000_000))
+        self.assertEqual(route_loads(self.topology, tuple(range(16))), (1, 1))
+        self.assertAlmostEqual(result.latency_us, 8 + 30 * 2 + 30e6 / 50e9 * 1e6)
+        self.assertEqual(result.bottleneck_level, "cluster")
+        ranks = tuple(rank for pair in zip(range(8), range(8, 16)) for rank in pair)
+        self.assertEqual(route_loads(self.topology, ranks), (0, 8))
+        interleaved = self.model.estimate(self.query(ranks, 16_000_000))
+        self.assertAlmostEqual(interleaved.latency_us, 8 + 60 + 30e6 * 8 / 50e9 * 1e6)
+
+    def test_single_node_allgather_hierarchical_and_validation(self):
+        single = self.model.estimate(self.query(tuple(range(8)), 8_000_000))
+        self.assertAlmostEqual(single.latency_us, 8 + 14 + 14e6 / 300e9 * 1e6)
+        ag = self.model.estimate(self.query(tuple(range(8)), 8_000_000, "all_gather"))
+        self.assertAlmostEqual(ag.latency_us, 8 + 7 + 7e6 / 300e9 * 1e6)
+        layout = self.topology.group_layout(tuple(range(16)))
+        default_q = CollectiveQuery("all_reduce", 16_000_000, layout, "fp32", "ring")
+        self.assertEqual(default_q.schedule, "hierarchical")
+        with self.assertRaises(ConfigurationError):
+            self.model.estimate(self.query(tuple(range(8)), 1024, algorithm="tree"))
+        with self.assertRaises(ConfigurationError):
+            self.model.estimate(self.query((0, 0), 1024))
+        self.assertEqual(self.model.estimate(self.query((0,), 1024)).latency_us, 0)
+
+
+class MegaMoETopologyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.hardware = HardwareContext.load(ROOT / "data")
+
+    def estimator(self, label="nvlink_domain", *, remote=False, members=8):
+        hardware = self.hardware
+        topology = hardware.topologies.get("gb200_nvl72")
+        topology = replace(
+            topology,
+            levels=(replace(topology.levels[0], name=label), *topology.levels[1:]),
         )
-        for topology, query in (
-            (
-                self.topology,
-                replace(query, layout=self.topology.group_layout((0, 8, 1, 9))),
-            ),
-            (replace(self.topology, topology_id="different"), query),
-        ):
-            with self.subTest(topology=topology.topology_id, ranks=query.layout.ranks):
-                model = CollectiveModel(topology, self.links, measured_lookup=lookup)
-                self.assertEqual(model.estimate(query).match_type, "analytical")
-                strict = CollectiveModel(
-                    topology, self.links, measured_lookup=lookup, fallback="table_only"
-                )
-                with self.assertRaisesRegex(
-                    MissingOperatorDataError, "Global Ring requires measurements"
-                ):
-                    strict.estimate(query)
-
-
-class PhysicalPlacementTest(unittest.TestCase):
-    @staticmethod
-    def cluster(groups, *, topology):
-        size = sum(group["num_workers"] for group in groups)
-        return ClusterConfig(
-            num_workers=size,
-            networks={"a": "ethernet-test", "b": "ethernet-test"},
-            worker_groups=[
-                dict(hardware="TestGPU", role="hybrid", network="a") | group
-                for group in groups
+        placement = TopologyPlacement(
+            topology,
+            {i: (i + 68 if remote and i >= 4 else i) for i in range(8)},
+        )
+        parallel = ParallelConfig(
+            data_parallel_size=8,
+            data_parallel_size_local=4,
+            enable_expert_parallel=True,
+            expert_parallel_scope="global",
+            expert_parallel_size=8,
+        )
+        communicator = ParallelCommunicator(
+            placement=placement,
+            collective_model=CollectiveModel(topology, hardware.links),
+            workers=[
+                SimpleNamespace(id=i, dp_rank=i, tp_rank=0, pp_rank=0)
+                for i in range(members)
             ],
-            parallel_config={"tensor_parallel_size": size},
-            topology=topology,
+            worker_id=0,
+            rank_info=ParallelRankInfo(),
+            parallel_config=parallel,
         )
-
-    def test_explicit_slots_are_reserved_before_implicit_ranks(self):
-        hardware = make_hardware()
-        hardware.topologies.add(
-            TopologySpec("finite", (TopologyLevel("node", 2, "nvlink-test"),))
+        backend = OperatorTableLatencyBackend(
+            device=hardware.device("gb200"),
+            model=hardware.models.resolve("deepseek-v4-pro"),
+            parallel_config=parallel,
+            communicator=communicator,
+            package=hardware.operator_package("gb200", "vllm"),
+            moe_execution={"backend": "deep_gemm_amxf4_mega_moe"},
         )
-        for pins, implicit_workers, expected in (
-            ([1], 1, {0: 1, 1: 0}),
-            ([2], 1, "outside the inventory"),
-            ([1], 2, "exceeds topology inventory"),
-        ):
-            with self.subTest(pins=pins, implicit_workers=implicit_workers):
-                cluster = self.cluster(
-                    [
-                        {"num_workers": 1, "device_indices": pins},
-                        {"num_workers": implicit_workers},
-                    ],
-                    topology="finite",
-                )
-                if isinstance(expected, str):
-                    with self.assertRaisesRegex(ConfigurationError, expected):
-                        build_topology_placement(cluster, cluster.workers(), hardware)
-                else:
-                    result = build_topology_placement(
-                        cluster, cluster.workers(), hardware
-                    )
-                    self.assertEqual(result.device_index_by_worker, expected)
+        estimator = backend.native_moe
+        estimator.set_step(ForwardPass({i: RankShape(8, 1, False) for i in range(8)}))
+        return estimator
 
-    def test_synthesized_topology_preserves_explicit_network_node(self):
-        hardware = make_hardware()
-        cluster = self.cluster(
-            [
-                {"num_workers": 1},
-                {"num_workers": 1, "device_indices": [3]},
-                {"num_workers": 1, "network": "b"},
-            ],
-            topology=None,
-        )
-        placement = build_topology_placement(cluster, cluster.workers(), hardware)
-        self.assertEqual(placement.device_index_by_worker, {0: 2, 1: 3, 2: 0})
-        self.assertEqual([placement.node_id(rank) for rank in range(3)], [1, 1, 0])
+    def test_nvlink_domain_label_independence_and_cross_domain_guard(self):
+        conventional = self.estimator("node").estimate(8, layers=1)
+        explicit = self.estimator("nvlink_domain").estimate(8, layers=1)
+        self.assertEqual(conventional, explicit)
+        for options in ({"remote": True}, {"members": 7}):
+            with self.assertRaisesRegex(
+                ConfigurationError, "complete single-node EP group"
+            ):
+                self.estimator(**options).estimate(8, layers=1)
 
-        cluster.worker_groups[-1].device_indices = [2]
-        with self.assertRaisesRegex(ConfigurationError, "multiple networks"):
-            build_topology_placement(cluster, cluster.workers(), hardware)
+
+if __name__ == "__main__":
+    unittest.main()

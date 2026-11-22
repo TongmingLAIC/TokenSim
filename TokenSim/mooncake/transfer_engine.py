@@ -35,28 +35,9 @@ class BatchTransfer:
         return self.fixed_latency + self.bytes / bandwidth
 
 
-@dataclass
-class TransferJob:
-    transfer: BatchTransfer
-    issued_time: float = 0.0
-    async_: bool = False
-    overlap: bool = False
-
-    @property
-    def completion_time(self) -> float:
-        return self.issued_time + self.transfer.latency
-
-    @property
-    def blocking_latency(self) -> float:
-        if self.async_ and self.overlap:
-            return 0.0
-        return self.transfer.latency
-
-
 class TransferEngineSimulator:
     def __init__(self, config: MooncakeConfig):
         self.config = config
-        self.jobs: list[TransferJob] = []
 
     def create_transfer(
         self,
@@ -83,26 +64,6 @@ class TransferEngineSimulator:
             topology=topology,
             kind=kind,
         )
-
-    def submit(
-        self,
-        transfer: BatchTransfer,
-        *,
-        now: float = 0.0,
-        async_: bool | None = None,
-        overlap: bool | None = None,
-    ) -> TransferJob:
-        job = TransferJob(
-            transfer=transfer,
-            issued_time=now,
-            async_=self.config.load_async if async_ is None else async_,
-            overlap=self.config.transfer_overlap if overlap is None else overlap,
-        )
-        self.jobs.append(job)
-        return job
-
-    def pending_jobs(self, now: float) -> int:
-        return sum(1 for job in self.jobs if job.completion_time > now)
 
     def _fixed_latency(self, protocol: str, topology: str) -> float:
         if self.config.fixed_latency_us is not None:

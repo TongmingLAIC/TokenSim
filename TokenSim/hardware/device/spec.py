@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware._yaml import require
-from TokenSim.hardware.device.dtypes import (
+from TokenSim.dtypes import (
     COMPUTE_PIPE_FALLBACKS,
     compute_dtype,
     normalize_dtype,

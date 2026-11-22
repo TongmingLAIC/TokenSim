@@ -1,17 +1,27 @@
 """Cross-owner FFN invocations preserve readiness, ownership and cancellation."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 
 import simpy
 
+from TokenSim.af.execution.executor import AFExecutor
 from TokenSim.af.serving.metrics import ResourceMetrics, steady_metrics
+from TokenSim.af.serving.work import ledger
+from TokenSim.af.trace.metrics import AFTraceEvent
+from TokenSim.config.af.settings import AFConfig
+from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.trace.occupancy import unique_executions, validate_resource_capacity
-from TokenSim.errors import SimulationStateError
-from tests.af.support.execution import FixedComputeProvider
-
-
 from tests.af.support.batching import batch_runtime, submit_owner
+from tests.af.support.config import _cluster
+from tests.af.support.execution import (
+    FixedComputeProvider,
+    FixedTransferProvider,
+    af_test_resources,
+    execution_plan,
+)
+from tests.support.hardware import make_device, make_hardware
 
 
 class FFNBatchingTest(unittest.TestCase):
@@ -229,3 +239,149 @@ class FFNBatchingTest(unittest.TestCase):
             validate_resource_capacity(
                 [members[0], replace(members[1], end_at=members[1].end_at + 1e-6)], {}
             )
+
+
+class MicrobatchAndOwnerWindowTests(unittest.TestCase):
+    @staticmethod
+    def _dense_runtime(limit):
+        cluster = _cluster(a_tp=1, a_dp=1, f_tp=1, f_dp=1)
+        cluster = replace(
+            cluster, af=replace(cluster.af, af_block_size=2, max_inflight_blocks=limit)
+        )
+        env = simpy.Environment()
+        executor = AFExecutor(
+            env,
+            cluster,
+            cluster.workers(),
+            FixedComputeProvider(1.0, 3.0),
+            FixedTransferProvider(0, 0, timing_scope="transport_service"),
+            "TestModel",
+            "bf16",
+            1,
+            16,
+            runtime_plan=execution_plan(cluster),
+            resources=af_test_resources(env, cluster),
+        )
+        requests = [
+            SimpleNamespace(
+                id=i, is_prefill=False, prefill_len=8, context_len=8, generation_idx=0
+            )
+            for i in range(4)
+        ]
+        return env, executor, executor.submit(0, requests)
+
+    def test_serial_window_changes_overlap_and_releases_on_cancel(self):
+        outcomes = []
+        for limit in (0, 1, 2):
+            env, executor, iteration = self._dense_runtime(limit)
+            env.process(executor.run_iteration(iteration))
+            env.run()
+            executor.trace.validate_invariants(iteration.iteration_id)
+            compute = [e for e in executor.trace.events if e.event_type == "compute"]
+            outcomes.append(
+                (
+                    env.now,
+                    [(e.operation, e.token_count, e.service_duration) for e in compute],
+                )
+            )
+        self.assertGreater(outcomes[1][0], outcomes[0][0])
+        self.assertEqual(outcomes[0][0], outcomes[2][0])
+        self.assertEqual(sorted(outcomes[0][1]), sorted(outcomes[1][1]))
+
+        env, executor, iteration = self._dense_runtime(1)
+        process = env.process(executor.run_iteration(iteration))
+
+        def cancel():
+            yield env.timeout(0.25)
+            process.interrupt("cancel window")
+
+        env.process(cancel())
+        with self.assertRaises(simpy.Interrupt):
+            env.run()
+        self.assertFalse(
+            executor.active_iterations
+            or executor.active_stages
+            or executor.ffn_batcher.tasks
+        )
+
+    def test_owner_credit_scope_and_cancellation(self):
+        for scope in ("iteration", "owner"):
+            env, executor, _ = batch_runtime(
+                owners=1, max_inflight=1, inflight_scope=scope
+            )
+            first, _ = submit_owner(executor, 0, offset=0)
+            second, _ = submit_owner(executor, 0, offset=100)
+            env.process(executor.run_iteration(first))
+            env.process(executor.run_iteration(second))
+            env.run()
+            starts = [
+                e.start_at
+                for e in executor.trace.events
+                if e.iteration_id == second.iteration_id
+                and e.event_type == "compute"
+                and e.source_domain == executor.cluster_config.af_domains[0].name
+            ]
+            if scope == "owner":
+                self.assertGreaterEqual(min(starts), first.end_at)
+            else:
+                self.assertLess(min(starts), first.end_at)
+        with self.assertRaises((ValueError, ConfigurationError)):
+            AFConfig(max_inflight_scope="global_guess")
+
+
+class AFWorkLedgerTest(unittest.TestCase):
+    @staticmethod
+    def _event(node, group=None):
+        return AFTraceEvent(
+            iteration_id=0,
+            block_id=0,
+            layer_id=0,
+            phase="decode",
+            event_type="compute",
+            resource_id="f0",
+            ready_at=0,
+            start_at=0,
+            end_at=1,
+            queue_duration=0,
+            service_duration=1,
+            request_count=2,
+            token_count=2,
+            source_id="fixture",
+            node_id=node,
+            execution_group_id=group,
+            details=dict(
+                device_id="TestGPU",
+                components=[
+                    dict(
+                        name="ffn",
+                        table="gemm",
+                        key=dict(m=2, n=4, k=8, dtype="bf16"),
+                        latency_us=1e6,
+                    )
+                ],
+            ),
+        )
+
+    def test_physical_deduplication_mixed_precision_and_partial_rejection(self):
+        hardware = make_hardware(make_device(peak_flops=128))
+        spans = [self._event("a", "shared"), self._event("b", "shared")]
+        value = ledger(iter(spans), hardware, {"TestGPU": 2}, start=0, end=1)
+        self.assertEqual(value, ledger(spans, hardware, {"TestGPU": 2}, start=0, end=1))
+        self.assertEqual(
+            (
+                value["useful_flops"]["TestGPU"],
+                value["physical_compute_invocations"],
+                value["logical_compute_spans"],
+                value["system_model_utilization"],
+            ),
+            (128, 1, 2, 0.5),
+        )
+        span = self._event("packed")
+        span.details["components"][0].update(
+            work_flops_by_dtype={"bf16": 128},
+            analytical_bounds={"compute_us": 1e6, "memory_us": 2e6},
+        )
+        mixed = ledger(iter([span]), hardware, {"TestGPU": 1}, start=0, end=1)
+        self.assertEqual(mixed["components"][0]["analytical_memory_seconds"], 2)
+        with self.assertRaises(ConfigurationError):
+            ledger([self._event("partial")], hardware, {"TestGPU": 1}, start=0.5, end=1)

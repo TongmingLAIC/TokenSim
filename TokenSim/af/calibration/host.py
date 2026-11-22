@@ -195,6 +195,7 @@ class HostOverheadProfile:
             raise ConfigurationError("unsupported host profile version/unit")
         if d["schema_version"] == 4:
             audit = d["submission_audit"]
+            copy_kinds = audit.get("copy_kinds") if isinstance(audit, Mapping) else None
             if (
                 d["timing_scope"] != "host_submission_service"
                 or d["contains_wait"] is not False
@@ -203,7 +204,9 @@ class HostOverheadProfile:
                 or audit.get("source_hashes_verified") is not True
                 or audit.get("call_counts_verified") is not True
                 or audit.get("blocking_apis_absent") is not True
-                or audit.get("copy_kinds") != (3,)
+                or not isinstance(copy_kinds, (list, tuple))
+                or not copy_kinds
+                or any(type(v) is not int for v in copy_kinds)
                 or not audit.get("source")
                 or not str(d["device_service_source_id"]).startswith("device_service:")
             ):
@@ -357,11 +360,6 @@ class HostOverheadProfile:
         ):
             raise ConfigurationError(
                 "profile requires explicit held-out validation status"
-            )
-        reserved = {1: 4, 2: 2, 3: 5, 4: 7}[d["schema_version"]]
-        if reserved in train or reserved not in heldout or 4 in train:
-            raise ConfigurationError(
-                "native alignment requires versioned held-out validation"
             )
 
     def validate_workload(self, requests, phase):

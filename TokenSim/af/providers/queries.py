@@ -5,6 +5,7 @@ import math
 from typing import Literal, Mapping, Protocol, get_args
 
 from TokenSim.af.planning.batching import ForwardPhase
+from TokenSim.moe.routing_models import RoutingAssignment
 
 
 # Order used to combine estimates from several operators or measured shapes.
@@ -30,53 +31,7 @@ AFComputeStage = Literal[
 AFTensorLayout = Literal["sharded", "replicated", "partial"]
 AFCommunicationKind = Literal["endpoint_leg", "collective"]
 
-
-@dataclass(frozen=True)
-class AFRoutingEdge:
-    iteration_id: int
-    phase: ForwardPhase
-    decode_step: int
-    layer_id: int
-    request_id: int
-    token_id: int
-    top_k_index: int
-    expert_id: int
-    routing_weight: float
-    a_dp_rank: int
-    a_tp_rank: int
-
-    def __post_init__(self) -> None:
-        for name in (
-            "iteration_id",
-            "decode_step",
-            "layer_id",
-            "request_id",
-            "token_id",
-            "top_k_index",
-            "expert_id",
-            "a_dp_rank",
-            "a_tp_rank",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value < 0:
-                raise ValueError(
-                    f"AF routing edge {name} must be a non-negative integer"
-                )
-        if self.phase not in {"prefill", "decode"}:
-            raise ValueError(
-                f"AF routing edge phase must be 'prefill' or 'decode', got "
-                f"{self.phase!r}"
-            )
-        if (
-            isinstance(self.routing_weight, bool)
-            or not isinstance(self.routing_weight, (int, float))
-            or not math.isfinite(self.routing_weight)
-            or self.routing_weight < 0
-        ):
-            raise ValueError(
-                "AF routing edge routing_weight must be finite and non-negative"
-            )
-        object.__setattr__(self, "routing_weight", float(self.routing_weight))
+AFRoutingEdge = RoutingAssignment
 
 
 @dataclass(frozen=True)

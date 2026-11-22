@@ -2,7 +2,6 @@
 
 import importlib
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -108,23 +107,6 @@ class StoragePluginTest(unittest.TestCase):
         for extra in ({"ssd_capacity_blocks": 1}, {"enable_offload": False}):
             with self.subTest(extra=extra), self.assertRaises(ConfigurationError):
                 parse_mooncake_config({**self.options(), **extra})
-
-    def test_unconfigured_plugins_are_not_imported(self):
-        program = """import sys
-class RejectOptionalImports:
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname.startswith(("tokensim_hbf", "tokensim_test_external_media")):
-            raise AssertionError("unconfigured backend was imported")
-sys.meta_path.insert(0, RejectOptionalImports())
-from TokenSim.mooncake.config import MooncakeConfig
-from TokenSim.mooncake.store import MooncakeStore
-assert MooncakeStore(MooncakeConfig(), 64).offload is None
-assert MooncakeStore(MooncakeConfig(enable_offload=True, ssd_capacity_blocks=1), 64).offload.tier == "ssd"
-"""
-        result = subprocess.run(
-            [sys.executable, "-c", program], capture_output=True, text=True
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_ssd_adapter_matches_generic_backend(self):
         options = {

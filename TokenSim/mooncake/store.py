@@ -60,7 +60,6 @@ class MooncakeStore:
         self.offload = (
             OffloadTier(config, self.block_bytes) if config.enable_offload else None
         )
-        self.ssd = self.offload
         self.register_storage_stats(self.stats)
         self._access_counter = 0
 

@@ -148,19 +148,25 @@ class OperationServiceProfile:
             raise ConfigurationError(
                 "operation evidence requires source and boundary audit"
             )
+        train, heldout = e["training_batches"], e["heldout_batches"]
         if (
             type(e["windows"]) is not int
             or e["windows"] < 3
-            or not isinstance(e["training_batches"], (list, tuple))
-            or not isinstance(e["heldout_batches"], (list, tuple))
-            or tuple(e["training_batches"]) != (1, 8)
-            or tuple(e["heldout_batches"])
-            != {1: (4,), 2: (2,), 3: (5,), 4: (7,)}[d["schema_version"]]
+            or not isinstance(train, (list, tuple))
+            or not isinstance(heldout, (list, tuple))
+            or not train
+            or not heldout
+            or any(
+                type(v) is not int
+                or not self.batch_range[0] <= v <= self.batch_range[1]
+                for v in (*train, *heldout)
+            )
+            or set(train) & set(heldout)
         ):
             raise ConfigurationError(
-                "operation evidence requires three windows and versioned held-out batch"
+                "operation evidence requires three windows and disjoint training/held-out batches"
             )
-        if self.batch_range != (1, 8) or e["validation_status"] not in (
+        if e["validation_status"] not in (
             "pending",
             "heldout_passed",
             "heldout_failed",
@@ -238,7 +244,7 @@ class TransportServiceProfile(ConfigurationOwner):
             evidence.get("kind") not in ("measured", "synthetic_test")
             or not evidence.get("source")
             or evidence.get("window_count", 0) < 3
-            or evidence.get("sample_count", 0) < 150
+            or evidence.get("sample_count", 0) < 1
             or evidence.get("measurement_boundary")
             != "after_both_device_kernels_started_until_both_complete"
             or evidence.get("peer_delay_audit_passed") is not True

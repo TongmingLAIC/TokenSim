@@ -1,56 +1,20 @@
-# Parallelism and Worker Layouts
+# Parallelism and worker layouts
 
-TokenSim describes a cluster through worker roles and its parallel configuration.
+TokenSim configures cluster serving through `worker_groups`, `parallel_config` and hierarchical interconnect topologies.
 
-Prompt processing is called prefill, and output token generation is called decode.
-A rank identifies a worker's position in the parallel configuration.
-The attention key/value (KV) cache stores the context needed to generate later tokens.
+## Worker roles
 
-- Worker roles define where prefill and decode requests are scheduled.
-- `parallel_config` defines tensor, pipeline, data, and expert ranks used for compute, memory, placement, and communication latency.
-
-## Worker Roles
-
-A cluster's `worker_groups` use the following roles.
-
-| Role | Behavior |
+| Role | Scheduling behavior |
 | --- | --- |
-| `hybrid` | Accepts both prefill and decode |
-| `prefill` | Accepts prefill and produces KV for transfer |
-| `decode` | Accepts decode and consumes transferred KV |
+| `hybrid` | Executes both prompt processing (prefill) and token generation (decode) |
+| `prefill` | Executes prefill and hands off KV state to decode workers |
+| `decode` | Receives KV state and executes decode |
 
-`data/clusters/1_a100/h1.json` is a single hybrid worker.
-`data/clusters/8_a100/p2d5.json` separates two prefill workers from six decode workers.
-After prefill, a request's KV blocks move to a decode worker over the link at the smallest topology level containing both workers.
-For example, workers on the same node use that node's local link, while workers on different nodes use their shared network level.
-With `MooncakeConnector`, transfer times follow the rules in [Mooncake](kv-storage.md).
+Select pool placement policies with `--prefill_worker_pool_type` (default `round_robin`) and `--decode_worker_pool_type` (default `least_gpu_memory`; `balanced_load` is also supported).
 
-The prefill and decode pools select workers with `round_robin`, `least_gpu_memory` or `balanced_load`.
-Set these policies with `--prefill_worker_pool_type` and `--decode_worker_pool_type`, whose defaults are `round_robin` and `least_gpu_memory` respectively.
+## Tensor, pipeline, data and expert parallelism
 
-## TP, PP, and DP
-
-Tensor parallelism (TP) divides operations within a model layer, pipeline parallelism (PP) divides layers into stages, and data parallelism (DP) runs replicas that handle separate request batches.
-Add `parallel_config` to the cluster configuration to specify these sizes.
-
-```json
-{
-  "tensor_parallel_size": 2,
-  "pipeline_parallel_size": 2,
-  "data_parallel_size": 2,
-  "data_parallel_size_local": 2
-}
-```
-
-When `parallel_config` describes more than one rank, the sum of `worker_groups[*].num_workers` must equal the following `world_size`.
-
-```text
-world_size = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
-```
-
-In the shared layout, without a `parallel_config` each worker is an independent replica.
-
-The following command uses the eight-rank configuration in `data/clusters/8_a100/tp2_pp2_dp2.json`.
+Configure shared-layout parallelism in the cluster JSON or override individual axes on the CLI:
 
 ```bash
 tokensim \
@@ -62,100 +26,32 @@ tokensim \
   --verbose none
 ```
 
-Rank mapping uses TP as the fastest-changing dimension, then PP, then DP.
-For TP=2, PP=2, DP=2, global ranks 0-3 form DP group 0 and ranks 4-7 form DP group 1.
-Within each DP group, ranks 0/1 are PP stage 0 and ranks 2/3 are PP stage 1.
+When multiple ranks are configured in a shared layout, `sum(worker_groups[*].num_workers)` equals `tensor_parallel_size * pipeline_parallel_size * data_parallel_size`.
+Global rank order varies tensor parallelism (TP) fastest, followed by pipeline parallelism (PP), then data parallelism (DP).
 
-The following table describes the `parallel_config` fields.
-
-| Field | Default | Meaning |
+| Field in `parallel_config` | Default | Meaning |
 | --- | --- | --- |
-| `tensor_parallel_size` | 1 | TP ranks per replica |
-| `pipeline_parallel_size` | 1 | PP stages per replica |
-| `data_parallel_size` | 1 | Replicas |
-| `data_parallel_rank` | 0 | Recorded DP rank of this deployment (validated metadata) |
-| `data_parallel_size_local` | 1 | DP ranks per node (validated metadata; cannot exceed `data_parallel_size`) |
-| `tensor_parallel_collective_latency_scale` | 1.0 | Multiplier on TP collective time |
-| `pipeline_parallel_activation_latency_scale` | 1.0 | Multiplier on PP activation-transfer time |
-| `enable_expert_parallel` | `false` | Shard MoE experts across ranks |
-| `expert_parallel_scope` | `global` | `global` or `per_dp` (see [MoE](../reference/models.md#mixture-of-experts)) |
-| `expert_parallel_size` | whole scope | Ranks per expert-parallel group |
-| `expert_placement_strategy` | `linear` | `linear` or `round_robin` |
-| `all2all_backend` | `allgather_reducescatter` | `allgather_reducescatter`, `naive`, `deepep_high_throughput`, `deepep_low_latency` |
+| `tensor_parallel_size` | `1` | Intra-layer TP shard count per replica |
+| `pipeline_parallel_size` | `1` | Contiguous layer stages per replica |
+| `data_parallel_size` | `1` | Replica count |
+| `data_parallel_rank`, `data_parallel_size_local` | `0`, `1` | Recorded deployment rank and DP ranks per node |
+| `tensor_parallel_collective_latency_scale` | `1.0` | Multiplier on TP collective latency |
+| `pipeline_parallel_activation_latency_scale` | `1.0` | Multiplier on PP stage-transfer latency |
+| `enable_expert_parallel` | `false` | Distribute mixture-of-experts (MoE) routed experts across ranks |
+| `expert_parallel_scope` | `global` | `global` (`TP * DP` stage ranks) or `per_dp` (each replica's `TP` ranks) |
+| `expert_parallel_size` | scope size | Ranks per expert-parallel (EP) group |
+| `expert_placement_strategy` | `linear` | `linear` contiguous blocks or `round_robin` |
+| `all2all_backend` | `allgather_reducescatter` | `allgather_reducescatter`, `naive`, `deepep_high_throughput` or `deepep_low_latency` |
 
-### Tensor Parallelism
+- **Tensor parallelism**: shards projections, attention heads, dense FFNs and KV capacity across TP ranks, adding post-attention and post-FFN all-reduces (replaced by EP dispatch/combine on EP MoE layers).
+- **Pipeline parallelism**: partitions layers across PP stages (assigning remainder layers to early stages), charges point-to-point activation transfers between stages and places the vocabulary output head on the final stage.
+- **Data parallelism**: schedules requests on each replica's `TP=0, PP=0` leader within the smallest rank KV pool.
+  Use `--sticky_sessions`, `--router_policy consistent_hash` or `--router_policy fixed_mapping --router_mapping_path FILE` for conversation affinity.
+  `--dp_lockstep` synchronizes steps across hybrid PP1 replicas (checking completion every `--dp_sync_interval` steps, default 16).
 
-TP divides projection and attention work, model weights and KV cache memory among its ranks.
-The latency backend looks up matrix multiplication (GEMM) and attention times using each rank's local dimensions: `ceil(heads / TP)` heads and `ceil(inter / TP)` feed-forward network (FFN) columns.
-Each layer adds an all-reduce, which combines results across ranks, after the attention output projection and after the FFN.
-Mixture-of-experts (MoE) layers with expert parallelism distribute tokens to experts and collect the results in place of the FFN all-reduce.
-The KV head count must be divisible by TP, or TP must be a multiple of the KV head count so that heads can be replicated across ranks.
+## Independent prefill and decode domains
 
-### Pipeline Parallelism
-
-PP splits layers, model memory, and KV memory across stages.
-Remainder layers are assigned to the earliest stages.
-An ordinary serving replica executes each step through its stages in order and charges an activation transfer between adjacent stages.
-The last stage adds the output projection that produces vocabulary logits, called the LM head.
-The ordinary stage model uses one representative rank per stage and serializes all stages of each batch without overlapping different batches.
-It supports hybrid workers with uniform KV caches, `NoopConnector`, and independent DP steps.
-
-### Data Parallelism
-
-DP creates replica groups.
-New requests are assigned to replica groups in round-robin order and keep their `dp_rank` when moving from prefill to decode.
-The selected worker policy chooses a worker within that DP group.
-`--sticky_sessions` keeps requests of one conversation (`chat_id`) on the same replica, and `--router_policy consistent_hash` (session hashing as in vllm-router) or `fixed_mapping` (`--router_mapping_path`) replace the round-robin placement.
-The routing mapping file contains a JSON object mapping conversation IDs to nonnegative integer ranks, optionally nested under `mapping`.
-Integer strings are accepted for compatibility; fractional numbers, booleans, null values and ranks absent from the worker pool cause a configuration error.
-Unreadable files and malformed JSON also cause a configuration error.
-The simulator validates `data_parallel_size_local` and `data_parallel_rank` and records them in the result's topology metadata.
-It represents every rank in `world_size` within one simulation process.
-
-Only the TP=0, PP=0 worker in each DP group is directly schedulable.
-Other ranks represent model shards and participate through per-rank memory and communication modeling.
-The replica admits requests within the KV capacity of its smallest rank pool.
-
-By default the DP replicas step independently.
-`--dp_lockstep` advances replicas in synchronized steps and supplies dummy batches for idle replicas.
-It checks whether execution has finished every `--dp_sync_interval` steps, with a default interval of 16.
-This mode requires hybrid workers and one pipeline stage (PP1).
-The fused MoE module needs it whenever DP > 1.
-
-## Expert Parallelism
-
-Expert parallelism (EP) distributes MoE experts across ranks and is enabled with `enable_expert_parallel`.
-`expert_parallel_scope` chooses which ranks share a copy of the experts.
-The default, `global`, distributes experts across all `tensor_parallel_size * data_parallel_size` ranks of a pipeline stage.
-`per_dp` gives each data-parallel replica its own group of experts distributed across that replica's TP ranks.
-`expert_parallel_size` states the group size and is validated against that layout.
-MoE layers follow their PP stages.
-EP adds time for distributing tokens to experts (dispatch), collecting expert results (combine) and waiting for ranks with more work.
-It requires a MoE model configuration.
-See [MoE](../reference/models.md#mixture-of-experts).
-
-## Configuration Precedence
-
-In a shared layout, the effective parallel configuration follows this precedence order.
-
-1. CLI values such as `--tensor_parallel_size` override individual fields (TP, PP, DP sizes, DP rank and local size, and the expert-parallel settings).
-2. The cluster's `parallel_config` supplies the base configuration.
-3. Missing values default to one rank with expert parallelism disabled.
-
-Changing TP/PP/DP on the CLI does not add workers.
-For a shared layout with multiple ranks, the cluster must contain exactly the resulting `world_size` workers.
-
-## Independent prefill and decode layouts
-
-Dedicated prefill and decode worker groups can each declare `parallel_config` and `kv_transfer` in the cluster configuration.
-The global parallel layout stays omitted when group layouts are present.
-Every group has its own TP, DP and expert placement, and physical worker identifiers remain unique across the entire allocation.
-Collective discovery never crosses a complete-model group boundary.
-P/D handoff selects decode replicas in the destination group's DP coordinate space.
-The source coordinate remains attached during DMA, and delivery assigns the selected decode coordinate.
-Transport lifecycle rows retain both source and destination DP ranks for independent groups.
-DP lockstep maintains a separate busy wave and finished-state consensus for each group.
-Choose dedicated ordinary prefill and decode roles for every group; use the separate [AF configuration](attention-ffn.md) for split attention and FFN execution.
+Dedicated `prefill` and `decode` worker groups can each declare their own `parallel_config` and `kv_transfer` when top-level `parallel_config` is omitted:
 
 ```json
 {
@@ -205,49 +101,13 @@ Choose dedicated ordinary prefill and decode roles for every group; use the sepa
 }
 ```
 
-The example sets analytical endpoint and fabric rate limits in bytes per second.
-Ordinary workers may use independent TP layouts for complete-model execution.
-Endpoint transport currently supports TP1 ordinary workers, including independent DP-attention and global EP groups.
-The grouped transport requires identical native KV geometry at both ends and PP1.
-It copies the resident computed group pages using their actual physical slot stride, including padding.
+Collectives stay isolated within each domain, and P/D handoff routes completed prefills into the destination domain's DP space.
+With `pd_endpoint_limits`, `EndpointFabric` shares sender, receiver and fabric bandwidth across active transfers while pinning source pages and reserving receiver slots until DMA completes.
+Prefill samples the initial output token on completion; handoff transfer and decode scheduling contribute to the subsequent inter-token interval.
+Results report per-domain layouts and transport flows under `parallel_serving_domains`, `moe_serving_domains` and `pd_transport`.
 
-Source DMA references survive source request release.
-The receiver allocates private request-owned pages before DMA starts, and DMA holds separate references until physical completion.
-Receiver capacity can delay the transfer without publishing a destination prefix.
-Copy completion publishes only cache identities already proven complete at the source.
-Partial prompt tails remain private and are computed further by the normal decode scheduler.
-Cancellation drains the active transfer, releases both sets of references and publishes no cancelled destination data.
-The native scheduler resumes imported pages through its loaded-request queue without repeating prefill.
+## Topologies and communication reporting
 
-The request's first token is sampled when prefill completes.
-Transfer and receiver scheduling occur after that sample and contribute to the following inter-token interval and end-to-end latency.
-This timing convention must be checked against a reference frontend's streaming behavior before an accuracy comparison.
-
-Results include `parallel_serving_domains`, `moe_serving_domains` and `pd_transport`.
-Physical capacity reporting distinguishes identical DP coordinates in different domains.
-Per-domain reports preserve each layout, expert ownership, rank loads and placement counts.
-The transport report retains physical endpoint flows, bandwidth-sharing intervals, lifecycle events and outstanding ownership counts.
-
-## Communication Topology and Metrics
-
-Workers are placed on a hierarchical topology (`data/topologies/*.yaml`).
-A cluster selects a topology with a field such as `"topology": "hgx_h100_8x_ndr"` and can assign workers to specific devices with `device_indices`.
-When no explicit topology is supplied, the simulator builds two levels from `networks`.
-Workers sharing a network form a node connected by the device's local interconnect, and the network's link class connects nodes.
-
-Network names must reference catalog link classes.
-An unknown link name causes a configuration error.
-Clusters with mixed device or network link types require an explicit topology.
-
-Communication operations involving a group of ranks are called collectives.
-For each topology level crossed by the TP or EP group, the alpha-beta model adds fixed transfer latency and a term based on message size and bandwidth.
-The topology selects a ring, tree or direct communication algorithm at each level.
-If the device's `collective` table contains matching measurements for the operation, data type, group size and node count, the simulator uses that curve.
-Missing measurements follow `--latency_fallback`: `table_first` uses a formula and records the missing query, while `table_only` returns an error.
-Point-to-point transfers (PP activations, prefill-to-decode KV) use the link of the lowest topology level shared by the two workers.
-See [operator-latency-model.md](../reference/operator-latency-model.md#communication-model).
-
-Results record the effective `parallel_config`, expected and actual rank counts, each rank's TP/PP/DP identifiers and utilization, and request placement counts for DP groups.
-`parallel_groups` describes rank 0's TP and EP groups and the topology levels they span.
-Timing fields include TP collectives, PP transfers, EP all-to-all communication and total synchronization time.
-Results also record synchronization event counts, events at each topology level (`parallel_link_type_counts`) and estimates from measurements or formulas (`parallel_comm_match_type_counts`).
+Clusters reference hierarchical topologies in `data/topologies/*.yaml` (with optional `device_indices`) or synthesize a two-level node/network hierarchy from `networks` and `data/topologies/links.yaml`.
+Results record `parallel_config`, `parallel_groups`, `parallel_link_type_counts`, `parallel_comm_match_type_counts` and per-phase synchronization latencies.
+See [Operator latency and data packages](../reference/operator-latency.md#communication-models) for collective lookup and analytical formulas.

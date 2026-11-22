@@ -1,19 +1,34 @@
+from dataclasses import replace
 import unittest
+from unittest.mock import patch
 import simpy
 from types import SimpleNamespace
-from TokenSim.errors import ConfigurationError
+from TokenSim.config.config import (
+    ClusterConfig,
+    ParallelConfig,
+    WorkerGroupConfig,
+)
+from TokenSim.config.simulation import SimulationConfig
+from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.mooncake.config import MooncakeConfig, parse_mooncake_config
 from TokenSim.mooncake.transfer_engine import TransferEngineSimulator, Segment
 from TokenSim.mooncake.ssd import OffloadTier
 from TokenSim.mooncake.store import MooncakeStore
-from TokenSim.mooncake.service import get_mooncake_service
+from TokenSim.mooncake.service import get_mooncake_service, shared_store
 from TokenSim.mooncake.pool_key import KeyMetadata, PoolKey
 from TokenSim.config.kv_transfer_config import KVTransferConfig
 from TokenSim.kv_transfer.connectors.factory import KVConnectorFactory
+from TokenSim.kv_transfer.connectors.mooncake_store import MooncakeStoreConnector
+from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.llm.llm_request import Request
-from TokenSim.kv_transfer.connectors.store_pages import _SharedService
-from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.connectors.store_pages import _SharedService, _StoreView
+from TokenSim.kv_transfer.storage.native import (
+    NativePageStore,
+    QueuedKVLink,
+    validate_external_stores,
+)
 from tests.support.hardware import make_hardware
+from tests.test_kv_transfer_integration import _DEVICE, _MODEL, _DeterministicBackend
 
 
 class ExternalStorageTest(unittest.TestCase):
@@ -305,3 +320,84 @@ class ExternalStorageTest(unittest.TestCase):
         self.assertEqual(env.now, 4)
         self.assertEqual(link.queue_wait_seconds, 2)
         self.assertEqual(link.bytes, 200)
+
+    def test_mooncake_capacity_only_and_tp_replica_accounting(self):
+        def group(capacity=None):
+            extra = dict(global_segment_size=capacity, local_buffer_size=10)
+            return WorkerGroupConfig(
+                role="hybrid",
+                hardware="TestGPU",
+                num_workers=1,
+                kv_transfer=(
+                    KVTransferConfig(
+                        kv_connector="MooncakeStoreConnector",
+                        kv_connector_extra_config=extra,
+                    )
+                    if capacity is not None
+                    else None
+                ),
+            )
+
+        cluster = ClusterConfig(
+            num_workers=3,
+            networks={"net1": "ethernet-test"},
+            worker_groups=[group(1000), group(), group(500)],
+        )
+        with patch(
+            "TokenSim.llm.engine.worker.build_latency_backend",
+            return_value=_DeterministicBackend(),
+        ):
+            engine = LLMEngine(
+                simpy.Environment(),
+                KVTransferConfig.default(),
+                _MODEL,
+                cluster,
+                make_hardware(_DEVICE, models=[_MODEL]),
+                config=SimulationConfig(block_size=16, batching="paged-attn"),
+            )
+        left, _, right = engine.workers
+        self.assertIs(left.connector.service, right.connector.service)
+        self.assertEqual(left.connector.service.store.memory_capacity_bytes, 1500)
+        self.assertEqual(left.connector.service.capacity.staging_bytes, 20)
+
+        env = simpy.Environment()
+        options = MooncakeConfig(global_segment_size=1000, local_buffer_size=10)
+        owner = object()
+        first = shared_store(env, options, ("grouped",), lambda: owner)
+        self.assertIs(
+            shared_store(
+                env, replace(options, enable_lookup=False), ("grouped",), object
+            ),
+            first,
+        )
+
+        tp_cache = SimpleNamespace(
+            block_size=16,
+            size_per_token=64,
+            model="fixture",
+            rank_info=None,
+            parallel_config=ParallelConfig(tensor_parallel_size=4),
+        )
+        connector = MooncakeStoreConnector(
+            KVTransferConfig(
+                kv_connector="MooncakeStoreConnector",
+                kv_connector_extra_config=dict(
+                    mode="standalone-store",
+                    global_segment_size=16384,
+                    aggregate_tensor_parallel=True,
+                    master_server_address="replica-accounting-test",
+                ),
+            ),
+            tp_cache,
+        )
+        self.assertEqual(connector.block_bytes, 4096)
+        keys = [PoolKey(KeyMetadata("fixture"), str(i)) for i in range(2)]
+        connector.service.store.put(keys)
+        self.assertEqual(connector.service.store.memory_used_bytes, 8192)
+
+        shared = NativePageStore(1024)
+        views = [SimpleNamespace(store=_StoreView(shared, (r,))) for r in range(4)]
+        self.assertEqual(validate_external_stores(views), 1)
+        shared.used_bytes = 1
+        with self.assertRaises(SimulationStateError):
+            validate_external_stores(views)

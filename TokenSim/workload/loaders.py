@@ -104,6 +104,60 @@ def load_synthetic_workload(
     )
 
 
+def _build_user_request(
+    *,
+    request_id: int,
+    prefill_len: Any,
+    decode_len: Any,
+    record: dict[str, Any],
+    num_experts: int,
+    arrival_time: float | None = None,
+    include_inter_arrival: bool = False,
+) -> UserRequest:
+    return UserRequest(
+        request_id=request_id,
+        prefill_len=prefill_len,
+        decode_len=decode_len,
+        arrival_time=(
+            record.get("arrival_time") if arrival_time is None else arrival_time
+        ),
+        inter_arrival_time=(
+            record.get("inter_arrival_time") if include_inter_arrival else None
+        ),
+        chat_id=_optional_str(record.get("chat_id")),
+        parent_chat_id=_optional_str(record.get("parent_chat_id")),
+        turn=record.get("turn"),
+        hash_ids=record.get("hash_ids"),
+        output_hash_ids=record.get("output_hash_ids"),
+        expert_histogram=_histogram_or_none(
+            record.get("expert_histogram"),
+            num_experts=num_experts,
+            request_id=request_id,
+        ),
+        prefill_expert_histogram=_histogram_or_none(
+            record.get("prefill_expert_histogram"),
+            num_experts=num_experts,
+            request_id=request_id,
+        ),
+        decode_expert_histogram=_histogram_or_none(
+            record.get("decode_expert_histogram"),
+            num_experts=num_experts,
+            request_id=request_id,
+        ),
+        routing_assignments=_assignments_or_none(
+            record.get("routing_assignments"), request_id=request_id
+        ),
+        prefill_routing_assignments=_assignments_or_none(
+            record.get("prefill_routing_assignments"), request_id=request_id
+        ),
+        decode_routing_assignments=_assignments_or_none(
+            record.get("decode_routing_assignments"), request_id=request_id
+        ),
+        cache_salt=_optional_str(record.get("cache_salt")),
+        reuse_group=_optional_str(record.get("reuse_group")),
+    )
+
+
 def load_json_pairs_workload(
     dataset_path: str,
     request_count: int | None,
@@ -138,43 +192,13 @@ def load_json_pairs_workload(
                 f"json_pairs record {request_id} in {path} third field must be an object"
             )
         user_requests.append(
-            UserRequest(
+            _build_user_request(
                 request_id=request_id,
                 prefill_len=item[0],
                 decode_len=item[1],
-                arrival_time=extra.get("arrival_time"),
-                inter_arrival_time=extra.get("inter_arrival_time"),
-                chat_id=_optional_str(extra.get("chat_id")),
-                parent_chat_id=_optional_str(extra.get("parent_chat_id")),
-                turn=extra.get("turn"),
-                hash_ids=extra.get("hash_ids"),
-                output_hash_ids=extra.get("output_hash_ids"),
-                expert_histogram=_histogram_or_none(
-                    extra.get("expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=request_id,
-                ),
-                prefill_expert_histogram=_histogram_or_none(
-                    extra.get("prefill_expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=request_id,
-                ),
-                decode_expert_histogram=_histogram_or_none(
-                    extra.get("decode_expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=request_id,
-                ),
-                routing_assignments=_assignments_or_none(
-                    extra.get("routing_assignments"), request_id=request_id
-                ),
-                prefill_routing_assignments=_assignments_or_none(
-                    extra.get("prefill_routing_assignments"), request_id=request_id
-                ),
-                decode_routing_assignments=_assignments_or_none(
-                    extra.get("decode_routing_assignments"), request_id=request_id
-                ),
-                cache_salt=_optional_str(extra.get("cache_salt")),
-                reuse_group=_optional_str(extra.get("reuse_group")),
+                record=extra,
+                num_experts=num_experts,
+                include_inter_arrival=True,
             )
         )
 
@@ -245,45 +269,15 @@ def load_qwen_jsonl_workload(
             raise WorkloadValidationError(
                 f"qwen_jsonl record {request_id} in {path} is missing {exc.args[0]!r}"
             ) from exc
+        row_record = {k: v for k, v in row.items() if k != "arrival_time"}
         user_requests.append(
-            UserRequest(
+            _build_user_request(
                 request_id=unique_request_id,
                 prefill_len=prefill_len,
                 decode_len=decode_len,
+                record=row_record,
+                num_experts=num_experts,
                 arrival_time=arrival_time,
-                chat_id=_optional_str(row.get("chat_id")),
-                parent_chat_id=_optional_str(row.get("parent_chat_id")),
-                turn=row.get("turn"),
-                hash_ids=row.get("hash_ids"),
-                output_hash_ids=row.get("output_hash_ids"),
-                expert_histogram=_histogram_or_none(
-                    row.get("expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=unique_request_id,
-                ),
-                prefill_expert_histogram=_histogram_or_none(
-                    row.get("prefill_expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=unique_request_id,
-                ),
-                decode_expert_histogram=_histogram_or_none(
-                    row.get("decode_expert_histogram"),
-                    num_experts=num_experts,
-                    request_id=unique_request_id,
-                ),
-                routing_assignments=_assignments_or_none(
-                    row.get("routing_assignments"), request_id=unique_request_id
-                ),
-                prefill_routing_assignments=_assignments_or_none(
-                    row.get("prefill_routing_assignments"),
-                    request_id=unique_request_id,
-                ),
-                decode_routing_assignments=_assignments_or_none(
-                    row.get("decode_routing_assignments"),
-                    request_id=unique_request_id,
-                ),
-                cache_salt=_optional_str(row.get("cache_salt")),
-                reuse_group=_optional_str(row.get("reuse_group")),
             )
         )
 

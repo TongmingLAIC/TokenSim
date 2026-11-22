@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, TypeVar
 
 from TokenSim.errors import ConfigurationError
 from TokenSim.utils import BoundedCache
@@ -13,10 +13,6 @@ WorkerT = TypeVar("WorkerT")
 
 def replica_key(worker) -> tuple[str | None, int]:
     return getattr(worker, "execution_domain", None), getattr(worker, "dp_rank", 0)
-
-
-class PlacementPolicy(Protocol[WorkerT]):
-    def schedule(self) -> WorkerT: ...
 
 
 class WorkerPool(Generic[WorkerT]):
@@ -34,10 +30,16 @@ class WorkerPool(Generic[WorkerT]):
     def select_prefill_worker(self, request=None) -> WorkerT:
         return self._select()
 
-    def select_decode_worker(self, request=None) -> WorkerT:
+    def select_decode_worker(
+        self, request=None, *, preserve_dp_rank: bool = True
+    ) -> WorkerT:
+        _ = preserve_dp_rank
         return self._select()
 
-    def select_transfer_target(self, requests=None) -> WorkerT:
+    def select_transfer_target(
+        self, requests=None, *, preserve_dp_rank: bool = True
+    ) -> WorkerT:
+        _ = preserve_dp_rank
         return self._select()
 
     def _select(self) -> WorkerT:
@@ -96,16 +98,26 @@ class DataParallelWorkerPool(WorkerPool[WorkerT]):
         return self._next_group_pool().schedule()
 
     def select_prefill_worker(self, request=None) -> WorkerT:
-        return self._select_for_request(request, assign_new=True)
+        return self._select_for_request(request, assign_new=True, preserve_dp_rank=True)
 
-    def select_decode_worker(self, request=None) -> WorkerT:
-        return self._select_for_request(request, assign_new=False)
+    def select_decode_worker(
+        self, request=None, *, preserve_dp_rank: bool = True
+    ) -> WorkerT:
+        return self._select_for_request(
+            request, assign_new=False, preserve_dp_rank=preserve_dp_rank
+        )
 
-    def select_transfer_target(self, requests=None) -> WorkerT:
-        return self.select_decode_worker(requests[0] if requests else None)
+    def select_transfer_target(
+        self, requests=None, *, preserve_dp_rank: bool = True
+    ) -> WorkerT:
+        return self.select_decode_worker(
+            requests[0] if requests else None, preserve_dp_rank=preserve_dp_rank
+        )
 
-    def _select_for_request(self, request, *, assign_new: bool) -> WorkerT:
-        rank = getattr(request, "dp_rank", None)
+    def _select_for_request(
+        self, request, *, assign_new: bool, preserve_dp_rank: bool = True
+    ) -> WorkerT:
+        rank = getattr(request, "dp_rank", None) if preserve_dp_rank else None
         domain = getattr(request, "dp_domain", None)
         affinity_key = (
             getattr(request, "chat_id", None) if self.sticky_sessions else None

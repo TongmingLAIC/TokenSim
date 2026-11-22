@@ -67,6 +67,16 @@ class StepComposition:
             else 0.0
         )
 
+        projection_us: list[float] = []
+        qkv_us = attn_output_us = 0.0
+        q_norm_us = k_norm_us = value_norm_us = rope_us = attn_output_norm_us = 0.0
+        ffn_norm_us = ffn_residual_us = ffn_up_us = ffn_down_us = 0.0
+        ffn_activation_us = ffn_output_norm_us = 0.0
+        moe_norm_us = moe_residual_us = 0.0
+        layer_scale_us = embedding_scale_us = 0.0
+        residual_output_us = final_norm_us = logits_gemm_us = 0.0
+        logit_softcap_us = token_selection_us = 0.0
+
         # Attention block shared by dense and MoE layers.
         if self.native_attention:
             # The complete compressed attention module table already contains all
@@ -280,7 +290,51 @@ class StepComposition:
         )
         stats.record_component("comm", comm_s)
         if self.trace_composition is not None:
-            self.trace_composition(self, locals())
+            self.trace_composition(
+                self,
+                {
+                    "T": T,
+                    "requests": requests,
+                    "requests_list": requests_list,
+                    "forward_rows": forward_rows,
+                    "norm_rows": norm_rows,
+                    "router_rows": router_rows,
+                    "overhead_us": overhead_us,
+                    "embedding_lookup_us": embedding_lookup_us,
+                    "embedding_scale_us": embedding_scale_us,
+                    "attn_norm_us": attn_norm_us,
+                    "mhc_us": mhc_us,
+                    "projection_us": projection_us,
+                    "qkv_us": qkv_us,
+                    "q_norm_us": q_norm_us,
+                    "k_norm_us": k_norm_us,
+                    "value_norm_us": value_norm_us,
+                    "rope_us": rope_us,
+                    "attention_us": attention_us,
+                    "attn_output_us": attn_output_us,
+                    "attn_output_norm_us": attn_output_norm_us,
+                    "attn_residual_us": attn_residual_us,
+                    "moe_norm_us": moe_norm_us,
+                    "router_us": router_us,
+                    "moe_us": moe_us,
+                    "moe_residual_us": moe_residual_us,
+                    "ffn_norm_us": ffn_norm_us,
+                    "ffn_up_us": ffn_up_us,
+                    "ffn_activation_us": ffn_activation_us,
+                    "ffn_down_us": ffn_down_us,
+                    "ffn_output_norm_us": ffn_output_norm_us,
+                    "ffn_residual_us": ffn_residual_us,
+                    "layer_scale_us": layer_scale_us,
+                    "residual_output_us": residual_output_us,
+                    "final_norm_us": final_norm_us,
+                    "logits_gemm_us": logits_gemm_us,
+                    "logit_softcap_us": logit_softcap_us,
+                    "token_selection_us": token_selection_us,
+                    "draft": draft,
+                    "compute_s": compute_s,
+                    "comm_s": comm_s,
+                },
+            )
         return compute_s + comm_s
 
     def _communication(

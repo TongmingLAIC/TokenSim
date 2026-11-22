@@ -53,7 +53,7 @@ class LLMEngine(AFEngineMixin, Worker):
             )
         self.config = config
         self.workload_config = workload_config or WorkloadConfig()
-        from TokenSim.timing import TimingRecorder
+        from TokenSim.llm.request_time import TimingRecorder
 
         self.timing_recorder = TimingRecorder()
         super().__init__(env, -1)
@@ -147,7 +147,7 @@ class LLMEngine(AFEngineMixin, Worker):
 
             self.dp_coordinator = build_dp_coordinator(self)
         self.trace_session = None
-        from TokenSim.kv_transfer.pd_handoff import build_pd_handoff
+        from TokenSim.kv_transfer.transport.uniform import build_pd_handoff
 
         self.pd_handoff = build_pd_handoff(self, kv_transfer_config)
         if config.trace.enabled:
@@ -156,10 +156,10 @@ class LLMEngine(AFEngineMixin, Worker):
             self.trace_session = TraceSession(self)
         self.cache_controller = None
         if config.cache_policy != "apc":
-            from TokenSim.kv_transfer.cache_control import NativeCacheController
+            from TokenSim.kv_transfer.policies.native import NativeCacheController
 
             self.cache_controller = NativeCacheController(self)
-        from TokenSim.kv_transfer.uniform_control import attach_uniform_controller
+        from TokenSim.kv_transfer.policies.uniform import attach_uniform_controller
 
         attach_uniform_controller(self)
         self.action = self.env.process(self.run())

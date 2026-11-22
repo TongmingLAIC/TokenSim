@@ -295,7 +295,9 @@ class MLAIntegrationTest(unittest.TestCase):
                     OperatorDataPackage.load(directory),
                     LookupPolicy(extrapolate="none"),
                 )
-                result = lookup.lookup("mla_attention", key)
+                result = lookup.lookup(
+                    "mla_attention", dict(key, context_lengths="[[16384, 1.0]]")
+                )
                 self.assertEqual(
                     (result.latency_us, result.source_id, result.match_type),
                     (latency, source.source_id, "exact"),

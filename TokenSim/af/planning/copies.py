@@ -250,6 +250,8 @@ class TensorCopyPlannerMixin:
 
     @staticmethod
     def _routing_edge(assignment: Any) -> AFRoutingEdge:
+        if isinstance(assignment, AFRoutingEdge):
+            return assignment
         return AFRoutingEdge(
             iteration_id=assignment.iteration_id,
             phase=assignment.phase,

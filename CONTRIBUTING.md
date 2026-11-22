@@ -62,7 +62,7 @@ For changes intended to alter results, describe the expected effect and measured
 ## Operator data
 
 Operator packages live in `data/operator_data/<device>/<backend>`.
-Import AIConfigurator measurements with the operator-data CLI as described in [docs/reference/operator-data.md](docs/reference/operator-data.md), or collect your own with [scripts/collect](scripts/collect/README.md).
+Import AIConfigurator measurements with the operator-data CLI as described in [docs/reference/operator-latency.md](docs/reference/operator-latency.md), or collect your own with [scripts/collect](scripts/collect/README.md).
 Keep each package's `generation_meta.yaml` because it records the source, version and operations included in each measurement.
 Validate a package before committing it.
 

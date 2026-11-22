@@ -14,17 +14,6 @@ from .handoff import GroupedHandoffMixin
 from .prefix_cache import PrefixCacheMixin
 
 
-class NoHostSwapAllocator:
-    def get_num_allocated_blocks(self):
-        return 0
-
-    def get_num_free_blocks(self):
-        return 0
-
-    def get_status(self):
-        return 0, 0, 0
-
-
 class _GroupSpec:
     """Per-group constants read on every scheduling step."""
 
@@ -70,17 +59,7 @@ class _HybridBlockTable:
 class HybridKVBlockManager(
     PrefixCacheMixin, SlotAllocatorMixin, ExternalCacheMixin, GroupedHandoffMixin
 ):
-    """Group-aware slot allocation with atomic prefix recovery and retention.
-
-    Short-block identities use the containing known prefix hash and a subblock
-    ordinal; matching remains at complete engine-block boundaries. Unknown
-    generated/tail content is never published under a trace prefix hash.
-
-    The free queue follows vLLM's BlockPool order: uncached slots first, most
-    recently released first, then cached slots from least to most recently
-    released. Uncached slots are interchangeable, so they live in a stack and
-    only cached slots need an ordered map.
-    """
+    """Group-aware slot allocation with atomic prefix recovery and retention."""
 
     grouped_cache = True
 
@@ -102,7 +81,6 @@ class HybridKVBlockManager(
         ]
         self.null_block = self.blocks[0]
         self.null_block.ref_count = 1
-        # Stack top (list end) is the front of the free queue: slot 1 first.
         self._free_uncached = self.blocks[:0:-1]
         self._free_cached = OrderedDict()
         self.cache = {}
@@ -113,19 +91,18 @@ class HybridKVBlockManager(
         self.keys = {}
         self.fine_keys = {}
         self.transfer_references = {}
+        self.transfer_reservations = {}
+        self.pd_handoff = None
         self.publish_callbacks = []
         self.block_table = _HybridBlockTable(self)
         self.kv_cache_manager = self
         self.gpu_allocator = self
-        self.cpu_allocator = NoHostSwapAllocator()
         self.allocation_count = self.release_count = self.eviction_count = 0
         self.peak_used_slots = 1
         self.groups = tuple(_GroupSpec(group, layout) for group in layout.groups)
         self.full_spec = next(
             spec for spec in self.groups if spec.group is layout.full_group
         )
-        # (position, group id, page tokens, window history) per group: window
-        # pages before ``computed - history`` fall out of the window.
         self._full_growth = tuple(
             (spec.group_id, spec.block_tokens)
             for spec in self.groups
@@ -136,20 +113,14 @@ class HybridKVBlockManager(
             for position, spec in enumerate(self.groups)
             if spec.window_tokens
         )
-        # Retained tails can be enumerated per boundary when each tail run
-        # fits in one retention segment; otherwise test every window page.
         interval = layout.retention_interval
         self._tails_fit_segments = not interval or all(
             spec.need * spec.block_tokens <= interval for spec in self.groups
         )
-        # Reuse plans are pure functions of the request and the prefix map;
-        # any change to the map bumps the version and invalidates them.
         self._cache_version = 0
         self._plans = {}
-        # Per request: ((computed, context_len, shared boundaries) of the last
-        # publication pass, computed position at which a window page can next
-        # become publishable). Cleared whenever the tables change shape.
         self._committed = {}
-        # Per request: for each window group, the held contiguous index range
-        # ``(first, top)`` of its table, or None when not known to be one.
         self._spans = {}
+
+    def get_cpu_status(self) -> tuple[int, int, int]:
+        return 0, 0, 0

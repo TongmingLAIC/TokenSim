@@ -97,12 +97,6 @@ class BaseKVConnector:
             )
         return latency
 
-    def wait_for_layer_load(self, layer: int | str) -> float:
-        return 0.0
-
-    def save_kv_layer(self, layer: int | str, requests: list[Request]) -> float:
-        return 0.0
-
     def wait_for_save(self) -> float:
         latency = sum(plan.latency for plan in self._metadata.saves)
         for plan in self._metadata.saves:

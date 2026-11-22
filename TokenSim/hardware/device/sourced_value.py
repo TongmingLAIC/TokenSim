@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware._yaml import finite_number, require
 
-# Evidence grades — see hardware/README.md for definitions.
+# Evidence grades — see data/devices/README.md for definitions.
 #   A = official spec or first-party measurement
 #   B = public benchmark (third-party, reproducible)
 #   C = calibrated estimate (fitted from measured data)

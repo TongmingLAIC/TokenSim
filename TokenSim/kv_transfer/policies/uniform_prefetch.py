@@ -16,7 +16,7 @@ class UniformSnapshot:
     cache_salt: str
     reuse_group: str
     chat_id: str
-    play: tuple
+    session_key: object
     keys: tuple
     blocks: tuple
     content: tuple
@@ -55,9 +55,6 @@ class UniformPrefetch:
     def capture(self, scheduler, req):
         if getattr(req, "parent_chat_id", None) is not None or not req.hash_ids:
             return
-        source = getattr(req, "source", None)
-        if source is None:
-            return
         connector = scheduler.connector
         keys = tuple(connector._keys_for_request(req))
         blocks = tuple(
@@ -75,7 +72,7 @@ class UniformPrefetch:
             req.cache_salt,
             req.reuse_group,
             req.chat_id,
-            (source.trace_id, source.play_id, source.lane),
+            getattr(req, "session_key", None),
             keys,
             blocks,
             gpu_keys,
@@ -269,9 +266,11 @@ class UniformPrefetch:
             elif state["process"].is_alive:
                 state["process"].interrupt()
 
-    def finish_play(self, play):
+    def finish_play(self, session_key):
+        if session_key is None:
+            return
         for owner, snapshot in list(self.snapshots.items()):
-            if snapshot.play == play:
+            if snapshot.session_key == session_key:
                 self.release(owner)
                 self.snapshots.pop(owner, None)
                 self.waiting.pop(owner, None)

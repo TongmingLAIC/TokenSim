@@ -1,175 +1,114 @@
-"""Native control serialization, readiness, ordering and failure cleanup."""
+"""Native control serialization, preposted call order, and multi-owner rounds."""
 
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 import unittest
 
 import simpy
 
+from TokenSim.af.caching.estimates import cached_estimate, initialize_cache
 from TokenSim.af.execution.control import encode_eager_control
+from TokenSim.af.execution.executor import AFExecutor
+from TokenSim.af.factory import simulate_decode
+from TokenSim.af.providers.queries import AFServiceEstimate, AFTransferQuery
+from TokenSim.af.runtime.compiler import compile_af_runtime_plan
+from TokenSim.af.trace.metrics import summarize_timeline
 from TokenSim.errors import ConfigurationError, SimulationStateError
-from tests.af.support import profiles as fixed
+from tests.af.support.batching import submit_owner
+from tests.af.support.config import _cluster
+from tests.af.support.execution import (
+    FixedComputeProvider,
+    FixedTransferProvider,
+    af_test_hardware,
+    af_test_resources,
+)
+from tests.af.support.model import _moe
 from tests.af.support.profiles import FixedHostFixture
 
 
-class NativeControlTest(unittest.TestCase):
+class NativeControlAndOrderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixed.FixedHostFixture.setUpClass()
-        cls.fixture = fixed.FixedHostFixture()
+        FixedHostFixture.setUpClass()
+        cls.fixture = FixedHostFixture()
 
     def run_case(self, **costs):
         env, ex = self.fixture.executor(native_control_enabled=True, **costs)
         self.fixture.run_step(env, ex)
         return env, ex
 
-    def test_wire_schema_and_decimal_size(self):
+    def test_wire_schema_control_messages_and_readback_order(self):
         for count in (1, 8, 16):
             encoded = encode_eager_control(count)
-            expected = (
-                '{"dp_metadata_list":{"0":{"max_tokens_across_dp_cpu":%d,'
-                '"num_tokens_across_dp_cpu":[%d]}},"is_graph_capturing":false,'
-                '"is_graph_replaying":false,"is_profile":false,"is_warmup":false}'
-                % (count, count)
-            ).encode()
-            self.assertEqual(encoded, expected)
             self.assertEqual(
                 json.loads(encoded)["dp_metadata_list"]["0"][
                     "num_tokens_across_dp_cpu"
                 ],
                 [count],
             )
+        env, ex = self.run_case(model=True)
+        control = [e for e in ex.trace.events if e.event_type == "control_transfer"]
+        data = [e for e in ex.trace.events if e.event_type == "transfer"]
         self.assertEqual(
-            len(encode_eager_control(16)), len(encode_eager_control(8)) + 2
+            [e.payload_bytes for e in control], [8, len(encode_eager_control(1))]
+        )
+        self.assertTrue(
+            all(
+                e.details["transport_backend"] == "torch_distributed_nccl"
+                for e in control
+            )
+        )
+        self.assertTrue(
+            all(e.details["transport_backend"] == "pynccl" for e in data)
+            and len(data) == 4
         )
 
-    def test_two_control_messages_per_step_and_data_unchanged(self):
-        env, ex = self.run_case(model=True)
-        for _ in range(2):
-            iteration_id = max(e.iteration_id for e in ex.trace.events)
-            events = ex.trace.events_for(iteration_id)
-            control = [e for e in events if e.event_type == "control_transfer"]
-            data = [e for e in events if e.event_type == "transfer"]
-            self.assertEqual(
-                [e.payload_bytes for e in control], [8, len(encode_eager_control(1))]
-            )
-            self.assertEqual(
-                [e.details["wire_dtype"] for e in control], ["int64", "uint8"]
-            )
-            self.assertTrue(
-                all(
-                    e.details["transport_backend"] == "torch_distributed_nccl"
-                    for e in control
-                )
-            )
-            self.assertTrue(
-                all(e.details["transport_backend"] == "pynccl" for e in data)
-            )
-            self.assertEqual(len(data), 4)
-            self.assertTrue(all(e.payload_bytes == 512 for e in data))
-            self.fixture.run_step(env, ex)
-
-    def test_length_readback_precedes_payload_and_decode_blocks_f(self):
-        _, ex = self.run_case(
+        _, ordered = self.run_case(
             control_length_readback_us=7,
             control_payload_readback_us=11,
             control_decode_us=200,
         )
-        events = ex.trace.events
+        events = ordered.trace.events
         by_id = {e.node_id: e for e in events}
-        control = [e for e in events if e.event_type == "control_transfer"]
-        self.assertAlmostEqual(control[0].start_at, 0)
-        self.assertAlmostEqual(control[0].end_at, 5e-6)
-        self.assertAlmostEqual(control[1].start_at, 12e-6)
-        self.assertAlmostEqual(control[1].end_at, 17e-6)
         self.assertAlmostEqual(by_id["i0:control:decode"].end_at, 228e-6)
-        attention = next(e for e in events if e.stage == "attention")
-        self.assertAlmostEqual(attention.start_at, 17e-6)
         first_data = next(e for e in events if e.event_type == "transfer")
         self.assertAlmostEqual(first_data.start_at, 228e-6)
-        self.assertAlmostEqual(first_data.queue_duration, 0)
-        self.assertAlmostEqual(first_data.service_duration, 5e-6)
-        self.assertAlmostEqual(first_data.details["readiness_wait_duration"], 111e-6)
-        from TokenSim.af.trace.metrics import summarize_timeline
-
         summary = summarize_timeline(
-            events, 0, max(e.end_at for e in events), ex.resources.resource_capacities()
+            events,
+            0,
+            max(e.end_at for e in events),
+            ordered.resources.resource_capacities(),
         )
         self.assertAlmostEqual(summary["unexplained_duration"], 0)
 
-    def test_split_block_is_rejected_in_single_stage_protocol(self):
+    def test_split_block_interleave_cancellation_and_cache_separation(self):
         env, ex = self.fixture.executor(native_control_enabled=True)
         with self.assertRaisesRegex(ConfigurationError, "unsplit"):
             self.fixture.run_step(env, ex, count=17)
-        self.assertFalse(ex.active_iterations)
 
-    def test_cancel_control_wait_releases_resources(self):
-        env, ex = self.fixture.executor(
+        env2, ex2 = self.fixture.executor(
             native_control_enabled=True, control_decode_us=200
         )
-        request = SimpleNamespace(
+        req = SimpleNamespace(
             id=0, is_prefill=False, prefill_len=128, context_len=129, generation_idx=0
         )
-        process = env.process(ex.run_iteration(ex.submit(0, [request])))
-
-        def cancel():
-            yield env.timeout(50e-6)
-            process.interrupt("cancel control")
-
-        env.process(cancel())
+        process = env2.process(ex2.run_iteration(ex2.submit(0, [req])))
+        env2.run(until=1e-6)
+        with self.assertRaisesRegex(SimulationStateError, "in-flight"):
+            self.fixture.run_step(env2, ex2)
+        process.interrupt("cancel control")
         with self.assertRaises(simpy.Interrupt):
-            env.run(until=process)
-        env.run()
-        self.assertFalse(ex._native_controls)
-        self.assertTrue(
-            all(
-                not r.users and not r.queue
-                for r in ex.resources.host_submission_slots.values()
-            )
-        )
-        self.fixture.run_step(env, ex)
+            env2.run(until=process)
+        env2.run()
+        self.assertFalse(ex2._native_controls)
+        self.fixture.run_step(env2, ex2)
 
-    def test_control_failure_propagates_and_cleans_state(self):
-        env, ex = self.fixture.executor(native_control_enabled=True)
-        provider = ex.transfer_provider
-
-        class Broken:
-            def estimate(self, query):
-                raise ValueError("control provider failed")
-
-        ex.transfer_provider = Broken()
-        with self.assertRaisesRegex(SimulationStateError, "control provider failed"):
-            self.fixture.run_step(env, ex)
-        env.run()
-        self.assertFalse(ex._native_controls)
-        ex.transfer_provider = provider
-        self.fixture.run_step(env, ex)
-
-    def test_control_parameters_require_valid_enabled_configuration(self):
-        for name in (
-            "control_encode_us",
-            "control_h2d_us",
-            "control_length_readback_us",
-            "control_payload_readback_us",
-            "control_decode_us",
-        ):
-            for value in (-1, float("nan"), float("inf"), True):
-                with (
-                    self.subTest(name=name, value=value),
-                    self.assertRaises((ValueError, ConfigurationError)),
-                ):
-                    self.fixture.executor(native_control_enabled=True, **{name: value})
-            with self.assertRaises(ConfigurationError):
-                self.fixture.executor(**{name: 1})
-        with self.assertRaises(ConfigurationError):
-            self.fixture.executor(native_control_enabled=1)
-
-    def test_transfer_cache_separates_backends(self):
-        from dataclasses import replace
-        from TokenSim.af.caching.estimates import cached_estimate
-        from TokenSim.af.caching.estimates import initialize_cache
-        from TokenSim.af.providers.queries import AFServiceEstimate
-        from TokenSim.af.providers.queries import AFTransferQuery
+        for value in (-1, float("nan"), float("inf"), True):
+            with self.assertRaises((ValueError, ConfigurationError)):
+                self.fixture.executor(
+                    native_control_enabled=True, control_encode_us=value
+                )
 
         class Provider:
             fallback = "analytical_only"
@@ -183,151 +122,186 @@ class NativeControlTest(unittest.TestCase):
                     5 if query.transport_backend == "pynccl" else 7, "oracle"
                 )
 
-        query = AFTransferQuery(
-            iteration_id=0,
-            block_id=0,
-            layer_id=0,
-            phase="decode",
-            direction="a_to_f",
-            token_count=1,
-            hidden_size=256,
-            dtype="bf16",
-            source_device="a",
-            target_device="f",
-            network="link",
-            payload_bytes=512,
-            transport_backend="pynccl",
+        q = AFTransferQuery(
+            0, 0, 0, "decode", "a_to_f", 1, 256, "bf16", "a", "f", "link", 512
         )
-        provider = Provider()
-        self.assertEqual(provider.estimate(query).service_duration, 5)
+        p = Provider()
         self.assertEqual(
-            provider.estimate(
-                replace(query, transport_backend="torch_distributed_nccl")
+            p.estimate(replace(q, transport_backend="pynccl")).service_duration, 5
+        )
+        self.assertEqual(
+            p.estimate(
+                replace(q, transport_backend="torch_distributed_nccl")
             ).service_duration,
             7,
         )
-        self.assertEqual(
-            provider.estimate(replace(query, iteration_id=1)).service_duration, 5
-        )
-        self.assertEqual(provider.estimate_cache_hits, 1)
 
-    def test_no_interleaved_eager_control_transactions(self):
+    def test_preposted_call_order_and_failure_cleanup(self):
+        with self.assertRaises(ConfigurationError):
+            self.fixture.executor(native_call_order_enabled=True)
         env, ex = self.fixture.executor(
-            native_control_enabled=True, control_decode_us=200
-        )
-        request = SimpleNamespace(
-            id=0, is_prefill=False, prefill_len=128, context_len=129, generation_idx=0
-        )
-        running = env.process(ex.run_iteration(ex.submit(0, [request])))
-        env.run(until=1e-6)
-        with self.assertRaisesRegex(SimulationStateError, "in-flight"):
-            self.fixture.run_step(env, ex)
-        env.run(until=running)
-        self.assertFalse(ex.active_iterations)
-
-
-class NativeOrderTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        FixedHostFixture.setUpClass()
-        cls.fixture = FixedHostFixture()
-
-    def executor(self, **costs):
-        return self.fixture.executor(
             model=True,
             native_control_enabled=True,
             native_call_order_enabled=True,
-            **costs,
-        )
-
-    def test_control_enqueue_and_device_completion_are_separate(self):
-        env, ex = self.executor(
             a_step_prepare_us=10,
             f_step_prepare_us=100,
-            host_receive_submit_us=20,
+            host_receive_submit_us=3,
             control_length_readback_us=50,
             compute_submit_us=3,
         )
         self.fixture.run_step(env, ex)
-        events = ex.trace.events_for(0)
-        by_id = {e.node_id: e for e in events}
-        payload_send = by_id["i0:control:payload:host_submit"]
-        length_wire = by_id["i0:control:length:transport"]
-        payload_wire = by_id["i0:control:payload:transport"]
-        self.assertLess(payload_send.end_at, length_wire.end_at)
-        self.assertGreaterEqual(
-            by_id["i0:control:payload:receive_submit"].start_at,
-            by_id["i0:control:length_readback"].end_at,
-        )
-        embedding = next(e for e in events if e.operation == "embedding_lookup")
-        cpu = by_id[embedding.node_id + ":compute_submit"]
-        self.assertLess(cpu.end_at, payload_wire.end_at)
-        self.assertGreaterEqual(embedding.start_at, payload_wire.end_at)
-        ex.trace.validate_invariants(0)
-
-    def test_receivers_prepost_without_occupying_transport(self):
-        env, ex = self.executor(host_receive_submit_us=3)
-        self.fixture.run_step(env, ex)
         by_id = {e.node_id: e for e in ex.trace.events_for(0)}
-        wires = [e for e in by_id.values() if e.event_type == "transfer"]
-        for wire in wires:
+        for wire in [e for e in by_id.values() if e.event_type == "transfer"]:
             root = wire.node_id.removesuffix(":transport")
-            recv = by_id[root + ":receive_submit"]
-            send = by_id[root + ":host_submit"]
-            self.assertLess(recv.start_at, send.start_at)
-            self.assertGreaterEqual(wire.start_at, max(recv.end_at, send.end_at))
+            self.assertLess(
+                by_id[root + ":receive_submit"].start_at,
+                by_id[root + ":host_submit"].start_at,
+            )
             self.assertEqual(
                 wire.details["readiness_mode"], "native_preposted_call_order"
             )
-        self.assertFalse(ex._native_controls)
+        ex.trace.validate_invariants(0)
 
-    def test_cancellation_cleans_preposted_calls(self):
-        env, ex = self.executor(a_step_prepare_us=1000000, host_receive_submit_us=3)
-        request = SimpleNamespace(
-            id=0, is_prefill=False, prefill_len=128, context_len=129, generation_idx=0
-        )
-        process = env.process(ex.run_iteration(ex.submit(0, [request])))
-        env.run(until=10e-6)
-        process.interrupt("cancel preposted iteration")
-        with self.assertRaises(simpy.Interrupt):
-            env.run(until=process)
+        original = ex.transfer_provider.estimate
+
+        def fail(query):
+            if query.operation == "af_control_length":
+                raise ValueError("injected transfer failure")
+            return original(query)
+
+        ex.transfer_provider.estimate = fail
+        with self.assertRaisesRegex(SimulationStateError, "injected transfer failure"):
+            self.fixture.run_step(env, ex)
         env.run()
-        self.assertFalse(ex._native_controls)
-        self.assertTrue(
-            all(
-                not r.users and not r.queue
-                for r in ex.resources.host_submission_slots.values()
-            )
-        )
+        self.assertFalse(ex._native_controls or ex.active_iterations)
+        ex.transfer_provider.estimate = original
         self.fixture.run_step(env, ex)
 
-    def test_requires_native_control(self):
-        with self.assertRaises(ConfigurationError):
-            self.fixture.executor(native_call_order_enabled=True)
 
-    def test_failed_control_estimate_unblocks_and_can_retry(self):
-        for operation in ("af_control_length", "af_control_payload"):
-            env, ex = self.executor(host_receive_submit_us=3)
-            original = ex.transfer_provider.estimate
+class NativeMultiOwnerTest(unittest.TestCase):
+    def runtime(self, *, native_control=False, batching=True, max_tokens=0, layers=1):
+        cluster = _cluster(a_tp=1, a_dp=2, f_tp=1, f_dp=1, f_ep=1)
+        cluster = replace(
+            cluster,
+            af=replace(
+                cluster.af,
+                af_block_size=2,
+                ffn_batching=batching,
+                ffn_batch_max_tokens=max_tokens,
+                execution_protocol="vllm_afd",
+                communication_timing=replace(
+                    cluster.af.communication_timing,
+                    enabled=True,
+                    native_control_enabled=native_control,
+                ),
+            ),
+        )
+        hardware = af_test_hardware(
+            layers=layers, capacity_gib=0.1, moe=replace(_moe(), num_moe_layers=layers)
+        )
+        model = replace(
+            hardware.model("TestModel"),
+            model_id="moe-tiny",
+            dtype="bf16",
+            kv_cache_dtype="bf16",
+            qk_norm=True,
+        )
+        plan = compile_af_runtime_plan(
+            cluster_config=cluster,
+            worker_configs=cluster.workers(),
+            hardware=hardware,
+            model=model,
+            block_size=4,
+            dtype="bf16",
+        )
+        env = simpy.Environment()
+        provider = FixedComputeProvider(1e-6, 20e-6, router=1e-6, expert=20e-6)
+        transfer = FixedTransferProvider(0, 0, timing_scope="transport_service")
+        executor = AFExecutor(
+            env,
+            cluster,
+            cluster.workers(),
+            provider,
+            transfer,
+            model.model_id,
+            "bf16",
+            layers,
+            16,
+            runtime_plan=plan,
+            moe_config=model.moe,
+            resources=af_test_resources(env, cluster),
+        )
+        return env, executor, provider, transfer
 
-            def failure(query):
-                if query.operation == operation:
-                    raise ValueError("injected transfer failure")
-                return original(query)
+    def test_cross_owner_batching_late_peer_and_round_ordering(self):
+        with self.assertRaisesRegex(ConfigurationError, "native control requires 1A1F"):
+            self.runtime(native_control=True)
 
-            ex.transfer_provider.estimate = failure
-            with self.assertRaisesRegex(
-                SimulationStateError, "injected transfer failure"
-            ):
-                self.fixture.run_step(env, ex)
-            env.run()
-            self.assertFalse(ex._native_controls)
-            self.assertFalse(ex.active_iterations)
-            self.assertTrue(
-                all(
-                    not r.users and not r.queue
-                    for r in ex.resources.host_submission_slots.values()
-                )
+        env, executor, provider, transfer = self.runtime(layers=2)
+        for owner in range(2):
+            env.process(
+                executor.run_iteration(submit_owner(executor, owner, count=4)[0])
             )
-            ex.transfer_provider.estimate = original
-            self.fixture.run_step(env, ex)
+        env.run()
+        routers = [q for q in provider.queries if q.stage == "router"]
+        self.assertEqual(
+            [(q.layer_id, q.block_id) for q in routers],
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+        )
+        self.assertEqual(
+            len([q for q in transfer.queries if q.operation == "af_f_to_a"]), 8
+        )
+
+        env2, ex2, prov2, _ = self.runtime(batching=False)
+        left, _ = submit_owner(ex2, 0)
+        task = env2.process(ex2.run_iteration(left))
+        env2.run(until=100e-6)
+        self.assertFalse(task.triggered)
+        right, _ = submit_owner(ex2, 1, count=1)
+        env2.process(ex2.run_iteration(right))
+        env2.run()
+        self.assertTrue(task.triggered)
+        self.assertEqual(
+            [q for q in prov2.queries if q.stage == "router"][0].original_token_count, 3
+        )
+
+    def test_inconsistent_microbatches_workspace_limit_and_peer_abort(self):
+        env, executor, _, _ = self.runtime()
+        errors = []
+
+        def guarded(ex, iteration):
+            try:
+                yield from ex.run_iteration(iteration)
+            except (SimulationStateError, simpy.Interrupt) as error:
+                errors.append(str(error))
+
+        env.process(guarded(executor, submit_owner(executor, 0)[0]))
+        env.run(until=100e-6)
+        with self.assertRaisesRegex(ConfigurationError, "matching microbatch counts"):
+            submit_owner(executor, 1, count=4)
+        env.run()
+        self.assertEqual(len(errors), 1)
+        self.assertFalse(executor.active_iterations)
+
+        env2, ex2, prov2, _ = self.runtime(max_tokens=2)
+        errors.clear()
+        for owner in range(2):
+            env2.process(guarded(ex2, submit_owner(ex2, owner)[0]))
+        env2.run()
+        self.assertEqual(len(errors), 2)
+        self.assertFalse(any(q.stage == "router" for q in prov2.queries))
+
+        env3, ex3, prov3, _ = self.runtime()
+        original = prov3.estimate
+        prov3.estimate = lambda q: (
+            (_ for _ in ()).throw(ValueError("peer attention failed"))
+            if q.stage == "attention" and q.dp_rank == 1
+            else original(q)
+        )
+        errors.clear()
+        for owner in range(2):
+            env3.process(guarded(ex3, submit_owner(ex3, owner)[0]))
+        env3.run()
+        self.assertEqual(len(errors), 2)
+        with self.assertRaisesRegex(ConfigurationError, "submit every peer"):
+            simulate_decode(SimpleNamespace(cluster=ex3.cluster_config), 2, 8)

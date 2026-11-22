@@ -1,6 +1,7 @@
 """Content identities for experiment inputs and runtime dependencies."""
 
 from dataclasses import asdict, is_dataclass
+from functools import lru_cache
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -47,11 +48,14 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+_FILE_DIGESTS: dict[Path, tuple[tuple[int, int, int, int, int], str]] = {}
+
+
 class InputFingerprints:
     """Reuse file digests while size, inode, modification and change times agree."""
 
     def __init__(self):
-        self._files = {}
+        self._files = _FILE_DIGESTS
 
     def paths(self, paths, *, code=False):
         records = []
@@ -82,6 +86,7 @@ class InputFingerprints:
         return identity(records)
 
 
+@lru_cache(maxsize=1)
 def environment_identity():
     packages = {}
     for name in (

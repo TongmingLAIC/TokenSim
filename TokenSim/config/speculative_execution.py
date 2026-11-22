@@ -16,7 +16,7 @@ class MTPAcceptanceConfig:
     distribution: tuple[float, ...] = ()
 
     def __post_init__(self):
-        if self.kind not in ("mean", "conditional", "empirical", "legacy"):
+        if self.kind not in ("mean", "conditional", "empirical"):
             raise ConfigurationError("unknown MTP acceptance kind")
         for name in ("rates", "distribution"):
             values = getattr(self, name)
@@ -77,9 +77,7 @@ class MTPAcceptanceConfig:
             rates=list(self.rates),
             distribution=list(self.distribution),
             expected_accepted_tokens=expected,
-            sampling_version=(
-                "linear_legacy" if self.kind == "legacy" else "blake2b_round_v1"
-            ),
+            sampling_version="blake2b_round_v1",
             draft_tokens=drafts,
         )
 

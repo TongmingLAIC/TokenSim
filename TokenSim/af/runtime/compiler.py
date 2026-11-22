@@ -7,7 +7,6 @@ from typing import Any
 from TokenSim.af.runtime.memory import (
     _compile_physical_states,
     _components_for_binding,
-    _experts_by_ep,
 )
 from TokenSim.af.runtime.plan import AFRuntimePlan
 from TokenSim.af.runtime.records import (
@@ -106,13 +105,12 @@ def compile_af_runtime_plan(
     moe_config = model.moe
     if cluster_config.af.execution_protocol == "vllm_afd":
         if (
-            "qwen3" not in model_id.lower()
-            or not moe_config.enabled
+            not moe_config.enabled
             or moe_config.num_shared_experts
             or moe_config.num_moe_layers != model.num_layers
         ):
             raise ConfigurationError(
-                "vllm_afd supports all-MoE Qwen3 without shared experts"
+                "vllm_afd requires an all-MoE model without shared experts"
             )
         domains = tuple(cluster_config.execution_domains.values())
         if len(domains) != 2 or any(

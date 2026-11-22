@@ -26,6 +26,23 @@ from tests.af.support.model import (
 
 
 class PrecisionLayoutTest(unittest.TestCase):
+    def test_canonical_dtype_registry_aliases_and_invalid_roles(self):
+        for value, (canonical, size_bytes) in {
+            "float32": ("fp32", 4),
+            "FLOAT16": ("fp16", 2),
+            "bfloat16": ("bf16", 2),
+            "float8_e4m3fn": ("fp8", 1),
+            "float8_e5m2": ("fp8", 1),
+            "int8": ("int8", 1),
+        }.items():
+            self.assertEqual(canonicalize_dtype(value), canonical)
+            self.assertEqual(dtype_size_bytes(value), size_bytes)
+        for value in ("", "mystery"):
+            with self.assertRaisesRegex(ValueError, "activation_dtype"):
+                dtype_size_bytes(value, role="activation_dtype")
+        with self.assertRaisesRegex(ValueError, "unknown dtype role"):
+            canonicalize_dtype("bf16", role="optimizer_dtype")
+
     def test_packed_formats_are_weight_only_and_store_row_scale_metadata(self):
         self.assertEqual(dtype_size_bytes("mxfp4", role="weight_dtype"), 0.5)
         for role in (

@@ -62,6 +62,7 @@ class RequestLifecycle:
             ),
             cache_salt=play.scope,
             reuse_group=play.graph.trace_id,
+            session_key=(play.graph.trace_id, play.pass_index, play.lane),
             measurement_phase="warmup" if warmup else "profile",
             record_timing=not warmup,
         )

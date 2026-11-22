@@ -16,7 +16,3 @@ class SimulationStateError(TokenSimError):
 
 class OutOfBlocksError(SimulationStateError):
     """A KV cache tier has no available physical blocks."""
-
-
-class TransferError(TokenSimError):
-    """Swap or remote KV transfer cannot be completed."""

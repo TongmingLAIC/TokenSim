@@ -40,14 +40,8 @@ class PDHandoff(EndpointHandoff):
             raise ConfigurationError("Endpoint P/D transport requires uniform GPU KV")
         super().__init__(engine, specification)
         for worker in workers:
-            worker.scheduler.block_manager.transfer_reservations = {}
+            worker.scheduler.block_manager.transfer_reservations.clear()
             worker.scheduler.block_manager.pd_handoff = self
-            for manager in getattr(
-                worker.scheduler.block_manager, "rank_managers", {}
-            ).values():
-                manager.transfer_reservations = (
-                    worker.scheduler.block_manager.transfer_reservations
-                )
 
     def notify(self):
         from TokenSim.llm.engine.messages import Task, WorkerStatus

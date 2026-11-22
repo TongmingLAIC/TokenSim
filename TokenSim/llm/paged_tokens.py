@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from TokenSim.llm.llm_request import Request
-from TokenSim.llm.speculative_acceptance import sample_acceptance, legacy_acceptance
+from TokenSim.llm.speculative_acceptance import sample_acceptance
 
 
 class PagedTokenBudgetMixin:
@@ -35,18 +35,13 @@ class PagedTokenBudgetMixin:
     def _decode_output_tokens(self, req: Request, remaining: int) -> int:
         if not self.mtp_enabled:
             return min(1, remaining)
-        if self.mtp_acceptance.kind == "legacy":
-            accepted = legacy_acceptance(
-                self.mtp_acceptance_length, self.mtp_seed, req.id, req.generation_idx
-            )
-        else:
-            accepted = sample_acceptance(
-                self.mtp_acceptance,
-                self.mtp_acceptance_length,
-                self.mtp_seed,
-                req.id,
-                req.decode_round,
-            )
+        accepted = sample_acceptance(
+            self.mtp_acceptance,
+            self.mtp_acceptance_length,
+            self.mtp_seed,
+            req.id,
+            req.decode_round,
+        )
         req.scheduled_accepted_tokens = accepted
         return min(accepted, remaining)
 

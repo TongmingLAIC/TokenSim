@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -9,13 +10,17 @@ import yaml
 
 from TokenSim.block.hybrid.dspark_memory import persistent_allocations
 from TokenSim.block.hybrid.kv_layout import hybrid_kv_layout
+from TokenSim.block.hybrid.manager import HybridKVBlockManager
+from TokenSim.config.cache_config import CacheConfig
 from TokenSim.config.dspark import DSparkConfig
 from TokenSim.config.model_config import ModelSpec
+from TokenSim.config.parallel_config import ParallelConfig
 from TokenSim.config.weight_memory import packed_weight_memory
 from TokenSim.errors import ConfigurationError
 from TokenSim.hardware import HardwareContext
 from TokenSim.latency.operator_table import OperatorTableLatencyBackend
 from TokenSim.llm.llm_request import Request
+from tests.support.kv import layout as _test_layout
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -146,6 +151,64 @@ class DSparkTest(unittest.TestCase):
         self.assertEqual(argmax_calls, [("argmax", 2, value.vocab_size)] * 5)
         self.assertNotIn("dspark_markov_sampling", backend.stats.table_match_counts)
         self.assertIn("greedy selection", backend.native_mtp.describe()["sampling"])
+
+    def test_storage_budgets_yield_integral_capacity_conserving_slots(self):
+        value = model()
+        hardware = HardwareContext.load(ROOT / "data")
+        candidate = SimpleNamespace(
+            dspark=SimpleNamespace(
+                target_layer_ids=(0,),
+                draft_sample_method="probabilistic",
+                confidence_head=True,
+            ),
+            hidden_size=2,
+            vocab_size=3,
+            operator_dtype=lambda _: "int4",
+        )
+        self.assertEqual(
+            persistent_allocations(candidate, 1, 1, 1)["dspark_draft_logits"], 2
+        )
+        for ratio, reason in (
+            (1, "at least one full compressed layer"),
+            (3, "must be divisible"),
+        ):
+            bad = replace(
+                value,
+                components=replace(
+                    value.components,
+                    compress_ratios=(ratio,) * value.num_layers
+                    + (1,) * value.dspark.num_layers,
+                ),
+            )
+            with self.assertRaisesRegex(ConfigurationError, reason):
+                hybrid_kv_layout(bad, block_size=256)
+        parallel = ParallelConfig(
+            data_parallel_size=8,
+            data_parallel_size_local=4,
+            enable_expert_parallel=True,
+            expert_parallel_scope="global",
+            expert_parallel_size=8,
+        )
+        cache = CacheConfig(
+            256,
+            hardware.device("gb200"),
+            value,
+            parallel_config=parallel,
+            usable_memory_fraction=0.9,
+            max_num_batched_tokens=8240,
+            max_num_seqs=8,
+            speculative_tokens=5,
+            attention_backend="module",
+            moe_execution={"backend": "deep_gemm_amxf4_mega_moe"},
+        )
+        available = cache.memory_budget["available_kv_bytes"]
+        slots, stride = cache.num_gpu_blocks, cache.physical_slot_bytes
+        self.assertIs(type(slots), int)
+        self.assertLessEqual(slots * stride, available)
+        self.assertGreater((slots + 1) * stride, available)
+        for bad_slots in (3.0, 3.5, True):
+            with self.assertRaises(ConfigurationError):
+                HybridKVBlockManager(_test_layout(), bad_slots, "fixture")
 
 
 if __name__ == "__main__":

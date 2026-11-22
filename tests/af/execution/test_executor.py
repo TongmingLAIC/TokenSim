@@ -1,19 +1,29 @@
 """Af executor."""
 
+from dataclasses import replace
 import math
+from types import SimpleNamespace
 import unittest
 
 import simpy
 
+from TokenSim.af.execution.executor import AFExecutor
+from TokenSim.af.providers.queries import AFServiceEstimate
+from TokenSim.config.af.domains import DomainCollectiveConfig
 from TokenSim.config.cluster_config import ClusterConfig
 from TokenSim.errors import ConfigurationError, SimulationStateError
-from tests.af.support.config import _cluster_dict, _load_cluster
+from TokenSim.llm.llm_engine import LLMEngine
+from TokenSim.moe.config import MoEModelConfig
+from TokenSim.placement import BalancedLoadWorkerPool, DataParallelWorkerPool
+from tests.af.support.config import _cluster, _cluster_dict, _load_cluster
 from tests.af.support.execution import (
     FixedComputeProvider,
     FixedTransferProvider,
     InvalidComputeProvider,
     _executor,
     _requests,
+    af_test_resources,
+    execution_plan,
 )
 
 
@@ -313,4 +323,121 @@ class AFExecutorEndToEndTest(unittest.TestCase):
                 cluster,
                 None,
                 FixedTransferProvider(0.0, 0.0),
+            )
+
+
+class AFParallelExecutionOracleTest(unittest.TestCase):
+    @staticmethod
+    def _moe_request(request_id, *, prefill_tokens=1):
+        return SimpleNamespace(
+            id=request_id,
+            is_prefill=False,
+            generation_idx=1,
+            scheduled_query_tokens=prefill_tokens,
+            prefill_len=prefill_tokens,
+            prefill_compute_len=prefill_tokens,
+            context_len=prefill_tokens,
+            expert_histogram=None,
+            af_a_owners={},
+        )
+
+    @staticmethod
+    def _moe_executor(env, compute=None):
+        cluster = _cluster()
+        cluster = replace(cluster, af=replace(cluster.af, ffn_batch_wait_us=0))
+        moe = MoEModelConfig(
+            is_moe_model=True, num_experts=4, num_experts_per_tok=1, num_moe_layers=1
+        )
+        return AFExecutor(
+            env,
+            cluster,
+            cluster.workers(),
+            compute or FixedComputeProvider(1.0, 0.1),
+            FixedTransferProvider(0.0, 0.0),
+            "TestModel",
+            "bf16",
+            total_layers=1,
+            hidden_size=16,
+            runtime_plan=execution_plan(cluster),
+            moe_config=moe,
+            resources=af_test_resources(env, cluster, cluster.workers()),
+        )
+
+    def test_worker_pool_dp_placement_and_pinned_owner(self):
+        workers = [
+            SimpleNamespace(
+                id=rank * 2,
+                dp_rank=rank,
+                scheduler=SimpleNamespace(running=[], waiting=[]),
+                workload=lambda: 0.0,
+                cpu_workload=lambda: 0.0,
+            )
+            for rank in range(2)
+        ]
+        pool = LLMEngine._build_worker_pool(
+            SimpleNamespace(), workers, BalancedLoadWorkerPool
+        )
+        self.assertIsInstance(pool, DataParallelWorkerPool)
+        self.assertEqual([pool.schedule().dp_rank for _ in range(4)], [0, 1, 0, 1])
+
+        executor = self._moe_executor(simpy.Environment())
+        requests = [self._moe_request(index) for index in range(4)]
+        first = executor.submit(0, requests)
+        self.assertEqual(
+            [b.placement.f_instance for b in first.blocks], ["f0", "f1", "f0", "f1"]
+        )
+        with self.assertRaisesRegex(
+            ConfigurationError, "cannot move.*without KV transfer"
+        ):
+            executor.submit(2, [requests[0]])
+        replay = self._moe_executor(simpy.Environment()).submit(
+            0, [self._moe_request(index + 10) for index in range(4)]
+        )
+        self.assertEqual(
+            [b.placement for b in first.blocks], [b.placement for b in replay.blocks]
+        )
+
+    def test_dp_replicas_execute_independently_and_missing_fabric_fails(self):
+        class SkewCompute:
+            def estimate(self, query):
+                duration = (
+                    (2.0 if query.dp_rank == 0 else 0.1)
+                    if query.stage == "attention"
+                    else 0.0
+                )
+                return AFServiceEstimate(duration, "skew")
+
+        env = simpy.Environment()
+        executor = self._moe_executor(env, compute=SkewCompute())
+        slow = executor.submit(0, [self._moe_request(20)])
+        fast = executor.submit(2, [self._moe_request(21)])
+        env.process(executor.run_iteration(slow))
+        env.process(executor.run_iteration(fast))
+        env.run()
+        self.assertAlmostEqual(slow.makespan, 2.0)
+        self.assertAlmostEqual(fast.makespan, 0.1)
+
+        cluster = _cluster()
+        cluster.execution_domains["a-domain"].communication_plan.append(
+            DomainCollectiveConfig(
+                operation="all_reduce",
+                after_stage="a_compute",
+                participants=(0, 1),
+                resource_group="missing-fabric",
+            )
+        )
+        with self.assertRaisesRegex(ConfigurationError, "missing fabric alias"):
+            AFExecutor(
+                simpy.Environment(),
+                cluster,
+                cluster.workers(),
+                FixedComputeProvider(0.0, 0.0),
+                FixedTransferProvider(0.0, 0.0),
+                "TestModel",
+                "bf16",
+                total_layers=1,
+                hidden_size=16,
+                resources=af_test_resources(
+                    simpy.Environment(), cluster, cluster.workers()
+                ),
             )

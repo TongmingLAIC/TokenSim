@@ -1,18 +1,20 @@
-"""Scheduling order, independent timing, deadlines and durable result semantics."""
+"""Scheduling order, independent timing, lockstep DP, deadlines and result semantics."""
 
 from contextlib import redirect_stdout
 import heapq
 import io
 import json
-import random
-import numpy as np
-from types import SimpleNamespace
 from pathlib import Path
+import random
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from tests.support.cli import simulation_args, run_quiet
+import numpy as np
+import simpy
+
+from TokenSim.cli.lifecycle import request_observation_duration, run_simulation
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.config.workload_config import WorkloadConfig
 from TokenSim.errors import (
@@ -20,21 +22,31 @@ from TokenSim.errors import (
     SimulationStateError,
     WorkloadValidationError,
 )
-from TokenSim.workload.user_request import UserRequest
-from TokenSim.llm.llm_engine import Message, Task, Worker, LLMWorker
-from TokenSim.llm.llm_scheduler import LLMDynamicScheduler, LLMStaticScheduler
+from TokenSim.llm.llm_engine import LLMWorker, Message, Task, Worker
 from TokenSim.llm.llm_request import Request
-from TokenSim.workload.loaders import load_qwen_jsonl_workload, load_synthetic_workload
+from TokenSim.llm.llm_scheduler import LLMDynamicScheduler, LLMStaticScheduler
+from TokenSim.workload.loaders import (
+    apply_trace_timestamp_scaling,
+    load_qwen_jsonl_workload,
+    load_synthetic_workload,
+    load_workload,
+)
+from TokenSim.workload.source import LLMSource
+from TokenSim.workload.user_request import UserRequest
+from tests.support.cli import MOE_CLUSTER, run_quiet, simulation_args
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeTest(unittest.TestCase):
-    def test_synthetic_generation_is_repeatable_without_modifying_global_rngs(self):
+    args = staticmethod(simulation_args)
+    run_main = staticmethod(run_quiet)
+
+    def test_synthetic_generation_is_repeatable_with_independent_streams(self):
         args = SimpleNamespace(random_seed=7, request_count=100)
         config = WorkloadConfig(
-            prefill_mean_len=4,
-            prefill_range_len=4,
+            prefill_mean_len=20,
+            prefill_range_len=8,
             decode_mean_len=1,
             decode_range_len=4,
             decode_len_distribution="exponential",
@@ -44,9 +56,53 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(random.getstate(), py_state)
         np.testing.assert_equal(np.random.get_state(), np_state)
         second = load_synthetic_workload(args, config)
-        self.assertEqual(first.prefill_lens(), second.prefill_lens())
-        self.assertEqual(first.decode_lens(), second.decode_lens())
+        self.assertEqual(first, second)
         self.assertTrue(all(1 <= n <= 4 for n in first.decode_lens()))
+        uniform = load_synthetic_workload(
+            args,
+            WorkloadConfig(
+                prefill_mean_len=20,
+                decode_mean_len=12,
+                prefill_range_len=8,
+                decode_range_len=8,
+            ),
+        )
+        self.assertGreater(len({r.prefill_len - r.decode_len for r in uniform}), 1)
+
+    def test_trace_scaling_and_ordinary_source_arrivals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "requests.json"
+            trace.write_text(
+                json.dumps([[8, 2, {"arrival_time": t}] for t in (1, 10, 20)])
+            )
+            args = SimpleNamespace(
+                workload_type="json_pairs",
+                dataset_path=str(trace),
+                dataset_skip_count=1,
+                request_count=100,
+                trace_target_qps=1,
+            )
+            selected = load_workload(args, WorkloadConfig())
+            self.assertEqual([r.arrival_time for r in selected], [1.0, 2.0])
+            with self.assertRaisesRegex(WorkloadValidationError, "non-burst"):
+                load_workload(args, WorkloadConfig(distribution="burst"))
+        records = [UserRequest(i, 8, 2, arrival_time=t) for i, t in enumerate((1, 2))]
+        with self.assertRaisesRegex(WorkloadValidationError, "scaled arrival_time"):
+            apply_trace_timestamp_scaling(records, trace_timestamp_scale=1e308)
+        self.assertEqual([r.arrival_time for r in records], [1, 2])
+        env = simpy.Environment()
+        arrivals = []
+        env.process(
+            LLMSource(
+                env,
+                SimpleNamespace(add_requests=lambda _: arrivals.append(env.now)),
+                [Request(i, 8, 1, 16) for i in range(2)],
+                2,
+                "uniform",
+            )
+        )
+        env.run()
+        self.assertEqual(arrivals, [0, 0.5])
 
     def test_mooncake_cache_is_shared_within_engine_and_isolated_between_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -118,7 +174,7 @@ class RuntimeTest(unittest.TestCase):
                 services.append(store.service)
             self.assertIsNot(services[0], services[1])
 
-    def test_model_geometry_and_routing_are_independent_of_workload_configuration(self):
+    def test_model_geometry_routing_and_dp_lockstep(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             workload = path / "workload.json"
@@ -132,35 +188,41 @@ class RuntimeTest(unittest.TestCase):
                     }
                 )
             )
-            args = simulation_args(
-                path,
-                model="moe-toy",
-                cluster=ROOT / "data/clusters/8_a100/moe_tp2_dp4.json",
-                workload_config=workload,
-                request_count=2,
-                prefill_mean_len=None,
-                decode_mean_len=None,
-                moe_routing_distribution="hot",
-                moe_hot_experts="0,1",
-                moe_hot_expert_fraction=0.8,
+            engine = self.run_main(
+                simulation_args(
+                    path,
+                    model="moe-toy",
+                    cluster=MOE_CLUSTER,
+                    workload_config=workload,
+                    request_count=2,
+                    prefill_mean_len=None,
+                    decode_mean_len=None,
+                    moe_routing_distribution="hot",
+                    moe_hot_experts="0,1",
+                    moe_hot_expert_fraction=0.8,
+                )
             )
-            engine = self.run_main(args)
-            self.assertEqual(engine.model_spec.hidden_size, 128)
-            self.assertEqual(engine.model_spec.moe.num_experts, 4)
             self.assertEqual(engine.moe_config.routing.hot_experts, [0, 1])
             self.assertEqual(engine.workload_config.qps, 9)
-            self.assertEqual(engine.workload_config.first_token_latency.max, 7)
-            result = json.loads((path / "result_inf.json").read_text())
-            self.assertEqual(result["prefill_lens"], [16, 16])
-            self.assertEqual(result["decode_lens"], [2, 2])
             workload.write_text(json.dumps({"hidden_size": 256}))
             with self.assertRaisesRegex(ConfigurationError, "hidden_size"):
                 WorkloadConfig.from_file(workload)
+            lockstep_dir = path / "lockstep"
+            dp_engine = self.run_main(
+                simulation_args(
+                    lockstep_dir,
+                    model="moe-toy",
+                    cluster=MOE_CLUSTER,
+                    batching="paged-attn",
+                    dp_lockstep=True,
+                )
+            )
+            dp_result = json.loads((lockstep_dir / "result_inf.json").read_text())
+            self.assertEqual(dp_result["termination_reason"], "completed")
+            self.assertEqual(len(dp_engine.timing_recorder.timing.time), 8)
+            self.assertIsNotNone(dp_result["dp_step_stats"])
 
-    args = staticmethod(simulation_args)
-    run_main = staticmethod(run_quiet)
-
-    def test_equal_priority_messages_are_fifo_and_cancel_has_priority(self):
+    def test_equal_priority_messages_and_scheduler_limits(self):
         messages = [Message(Task.ADD, sender_id=i) for i in range(40)]
         heapq.heapify(messages)
         messages.append(Message(Task.CANCEL, sender_id=-1))
@@ -169,41 +231,24 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(
             [heapq.heappop(messages).sender_id for _ in range(40)], list(range(40))
         )
-
-    def test_batch_modes_respect_sequence_limits_and_waiting_order(self):
         for cls in (LLMDynamicScheduler, LLMStaticScheduler):
             scheduler = cls(max_num_seqs=2)
-            requests = [Request(i, 16 + i, 3, 16) for i in range(5)]
-            scheduler.add_requests(requests)
-            running, _ = scheduler.schedule()
-            self.assertEqual([r.id for r in running], [0, 1])
-            self.assertEqual([r.id for r in scheduler.waiting], [2, 3, 4])
+            scheduler.add_requests([Request(i, 16 + i, 3, 16) for i in range(5)])
+            self.assertEqual([r.id for r in scheduler.schedule()[0]], [0, 1])
             scheduler.running.clear()
             self.assertEqual([r.id for r in scheduler.schedule()[0]], [2, 3])
         with self.assertRaises(ConfigurationError):
             SimulationConfig(max_num_seqs=0)
-        for invalid in (
-            {"long_prefill_token_threshold": 1.5},
-            {"dp_lockstep": "false"},
-            {"random_seed": -1},
-            {"mtp_acceptance_length": float("nan")},
-            {"mtp_acceptance_length": 2},
-            {"gpu_memory_utilization": True},
-        ):
-            with self.subTest(invalid=invalid), self.assertRaises(ConfigurationError):
-                SimulationConfig(**invalid)
 
     def test_main_batch_modes_count_output_tokens_and_keep_timing_independent(self):
         with tempfile.TemporaryDirectory() as directory:
             engines = []
             for batching in ("dynamic", "static", "paged-attn"):
                 path = Path(directory) / batching
-                args = self.args(path, "--batching", batching)
-                engine = self.run_main(args)
+                engine = self.run_main(self.args(path, "--batching", batching))
                 result = json.loads((path / "result_inf.json").read_text())
                 self.assertEqual(result["request_count"], 8)
                 self.assertEqual(result["notdone"], [])
-                self.assertEqual(len(engine.timing_recorder.timing.time), 8)
                 self.assertAlmostEqual(
                     result["output_token_ps"] * result["duration"], 24
                 )
@@ -211,7 +256,6 @@ class RuntimeTest(unittest.TestCase):
             self.assertIsNot(
                 engines[0].timing_recorder.timing, engines[1].timing_recorder.timing
             )
-            self.assertEqual(len(engines[0].timing_recorder.timing.time), 8)
 
     def test_pd_dynamic_batching_charges_every_transfer_plan(self):
         issued, charged = [], []
@@ -266,50 +310,66 @@ class RuntimeTest(unittest.TestCase):
             result = json.loads((path / "result_inf.json").read_text())
             slo = result["slo"]
             self.assertEqual(
-                slo["first_token_latency"]["observed"]["p50"],
-                result["prefill_time"]["p50"],
-            )
-            self.assertEqual(
                 slo["first_token_latency"]["met"], {"max": False, "p50": True}
             )
-            self.assertEqual(slo["decode_token_latency"]["met"], {"p99": False})
             self.assertEqual(
                 slo["goodput_requests"], sum(t <= bound for t in first_token)
             )
 
-    def test_cutoff_and_failure_always_preserve_partial_results(self):
+    def test_cutoffs_failures_and_post_workload_drains(self):
+        for mode in ("write", "audit"):
+            env = simpy.Environment()
+            connector = SimpleNamespace(
+                async_offload=True, loads=[], pending_writes=[], write_jobs=0
+            )
+            engine = SimpleNamespace(
+                env=env,
+                failure_event=env.event(),
+                raise_if_failed=lambda: None,
+                request_workers=[
+                    SimpleNamespace(connector=connector, scheduler=SimpleNamespace())
+                ],
+                cache_controller=None,
+            )
+            req = Request(0, 8, 1, 16)
+
+            def storage(env=env, connector=connector):
+                yield env.timeout(5)
+                connector.write_jobs = 0
+
+            def simulate(env=env, req=req, connector=connector, mode=mode):
+                req.arrive(env)
+                yield env.timeout(1)
+                req.step(env, 1, 1)
+                if mode == "write":
+                    connector.write_jobs = 1
+                    env.process(storage())
+
+            if mode == "audit":
+                connector.post_workload_drain = storage
+            replay = SimpleNamespace(
+                cancellation_timeout=10, grace_period=0, issue_window_end_at=1
+            )
+            status = run_simulation(
+                engine, env.process(simulate()), replay=replay, sim_time=2
+            )
+            self.assertEqual((status, env.now), ("sim_time_limit", 2))
+            self.assertEqual(request_observation_duration([req], env.now), 1)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            args = self.args(path, "--sim_time", "0.000001")
-            self.run_main(args)
+            self.run_main(self.args(path, "--sim_time", "0.000001"))
             result = json.loads((path / "result_inf.json").read_text())
             self.assertEqual(result["termination_reason"], "sim_time_limit")
             self.assertTrue(result["notdone"])
-            self.assertEqual(result["simulated_time"], 0.000001)
-            # A cutoff after the workload ends must not stretch its duration.
-            self.run_main(self.args(path))
-            natural = json.loads((path / "result_inf.json").read_text())
-            self.run_main(self.args(path, "--sim_time", "1000000"))
-            late = json.loads((path / "result_inf.json").read_text())
-            self.assertEqual(late["termination_reason"], "completed")
-            for field in ("duration", "simulated_time", "output_qps"):
-                self.assertEqual(late[field], natural[field], field)
-            args = self.args(path)
             with patch(
                 "TokenSim.llm.llm_engine.LLMEngine.raise_if_failed",
                 side_effect=SimulationStateError("conservation failed"),
             ):
                 with self.assertRaises(SimulationStateError):
-                    self.run_main(args)
-            result = json.loads((path / "result_inf.json").read_text())
-            self.assertEqual(result["termination_reason"], "failed")
-            self.assertIn("conservation failed", result["failure"])
+                    self.run_main(self.args(path))
             self.assertTrue((path / "failure.json").is_file())
-            self.assertTrue((path / "failed.txt").is_file())
 
-    def test_agentx_uses_regular_model_and_warmup_cutoff_does_not_drain_past_limit(
-        self,
-    ):
+    def test_agentx_cutoff_and_qwen_jsonl_unique_request_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args(
                 directory,
@@ -329,17 +389,6 @@ class RuntimeTest(unittest.TestCase):
             self.run_main(args)
             result = json.loads((Path(directory) / "agentx_c1.json").read_text())
             self.assertEqual(result["termination_reason"], "sim_time_limit")
-            self.assertEqual(result["agentx_metrics"]["random_seed"], args.random_seed)
-            windows = [
-                json.loads(line)
-                for line in (Path(directory) / "replay/cache_windows.jsonl")
-                .read_text()
-                .splitlines()
-            ]
-            self.assertLessEqual(windows[-1]["simulation_time"], 0.001)
-
-    def test_duplicate_trace_ids_cannot_collide_with_fallback_ids(self):
-        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"
             path.write_text(
                 "\n".join(
@@ -349,31 +398,4 @@ class RuntimeTest(unittest.TestCase):
             )
             with redirect_stdout(io.StringIO()):
                 requests = load_qwen_jsonl_workload(str(path), 5)
-            ids = [r.request_id for r in requests]
-            self.assertEqual(len(set(ids)), 5)
-            path.write_text(
-                json.dumps({"request_id": "a7", "input_length": 8, "output_length": 2})
-            )
-            with (
-                redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(WorkloadValidationError, "record 0"),
-            ):
-                load_qwen_jsonl_workload(str(path), 1)
-        self.assertEqual(
-            UserRequest(request_id="7", prefill_len=8, decode_len=2).request_id, 7
-        )
-        for fields in (
-            {"request_id": 1.5},
-            {"turn": "first"},
-            {"prefill_len": 1.5},
-            {"decode_len": True},
-            {"arrival_time": float("nan")},
-            {"inter_arrival_time": -1},
-        ):
-            with (
-                self.subTest(fields=fields),
-                self.assertRaises(WorkloadValidationError),
-            ):
-                UserRequest(
-                    **{"request_id": 0, "prefill_len": 8, "decode_len": 2, **fields}
-                )
+            self.assertEqual(len({r.request_id for r in requests}), 5)

@@ -160,7 +160,21 @@ def _draw_panel(ax, tracks, selection, renderer, properties, scale):
     return records
 
 
-def _render(selection, output, formats, title, quality, width, dpi):
+DEFAULT_SIMULATED_LABEL = "(a) Generated trace with TokenSim"
+DEFAULT_PROFILED_LABEL = "(b) Profiled trace with PyTorch Profiler"
+
+
+def _render(
+    selection,
+    output,
+    formats,
+    title,
+    quality,
+    width,
+    dpi,
+    simulated_label=DEFAULT_SIMULATED_LABEL,
+    profiled_label=DEFAULT_PROFILED_LABEL,
+):
     try:
         import matplotlib
         from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -205,10 +219,7 @@ def _render(selection, output, formats, title, quality, width, dpi):
         for ax, (side, rows), caption in zip(
             axes,
             tracks.items(),
-            (
-                "(a) Generated trace with TokenSim",
-                "(b) Profiled trace with PyTorch Profiler",
-            ),
+            (simulated_label, profiled_label),
         ):
             ax.set_xlim(selection["start_us"] / scale, selection["end_us"] / scale)
             ax.set_ylim(max(1, len(rows)) - 0.4, -0.6)
@@ -281,6 +292,8 @@ def export_timeline(
     title=None,
     width=20,
     dpi=180,
+    simulated_label=DEFAULT_SIMULATED_LABEL,
+    profiled_label=DEFAULT_PROFILED_LABEL,
     **selection_options,
 ):
     """Read a comparison report; publish paired images and their exact geometry."""
@@ -334,7 +347,15 @@ def export_timeline(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     files, records = _render(
-        selection, output, tuple(dict.fromkeys(formats)), title, quality, width, dpi
+        selection,
+        output,
+        tuple(dict.fromkeys(formats)),
+        title,
+        quality,
+        width,
+        dpi,
+        simulated_label=simulated_label,
+        profiled_label=profiled_label,
     )
     manifest = dict(
         schema_version=1,
@@ -371,6 +392,8 @@ def main(argv=None):
         "--formats", choices=("png", "svg"), nargs="+", default=("png", "svg")
     )
     parser.add_argument("--title")
+    parser.add_argument("--simulated-label", default=DEFAULT_SIMULATED_LABEL)
+    parser.add_argument("--profiled-label", default=DEFAULT_PROFILED_LABEL)
     parser.add_argument("--width", type=float, default=20)
     parser.add_argument("--dpi", type=int, default=180)
     args = vars(parser.parse_args(argv))

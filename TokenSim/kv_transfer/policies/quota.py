@@ -4,11 +4,8 @@ from math import ceil
 
 
 def session_id(req):
-    source = getattr(req, "source", None)
-    if source is not None and all(
-        hasattr(source, key) for key in ("trace_id", "play_id", "lane")
-    ):
-        return f"play:{source.trace_id}:{source.play_id}:{source.lane}"
+    if getattr(req, "session_key", None) is not None:
+        return f"session:{req.session_key}"
     return req.cache_salt or req.chat_id or f"request:{req.id}"
 
 

@@ -14,21 +14,26 @@ import re
 from pathlib import Path
 from typing import Any
 
+from TokenSim.dtypes import normalize_dtype
 from TokenSim.errors import ConfigurationError
 
-_TYPE_MAP = {
-    "float": "fp32",
-    "float32": "fp32",
-    "half": "fp16",
-    "float16": "fp16",
-    "bfloat16": "bf16",
-    "bf16": "bf16",
-    "int8": "int8",
+_NCCL_WIRE_OVERRIDES = {
     "uint8": "int8",
     "int32": "fp32",
-    "fp8e4m3": "fp8",
-    "fp8e5m2": "fp8",
 }
+_SUPPORTED_WIRE_DTYPES = {"fp32", "fp16", "bf16", "int8", "fp8"}
+
+
+def _nccl_dtype(raw: str) -> str | None:
+    key = raw.strip().lower()
+    if key in _NCCL_WIRE_OVERRIDES:
+        return _NCCL_WIRE_OVERRIDES[key]
+    try:
+        normalized = normalize_dtype(key)
+    except ConfigurationError:
+        return None
+    return normalized if normalized in _SUPPORTED_WIRE_DTYPES else None
+
 
 _OPERATION_FROM_BINARY = {
     "all_reduce_perf": "all_reduce",
@@ -101,7 +106,7 @@ def parse_nccl_tests_output(
         if len(parts) < 3 or not all(value.isdigit() for value in parts[:2]):
             continue
         size_bytes = int(parts[0])
-        dtype = _TYPE_MAP.get(parts[2].lower())
+        dtype = _nccl_dtype(parts[2])
         if dtype is None:
             continue
         where = f"nccl-tests line {line_number} ({mode})"

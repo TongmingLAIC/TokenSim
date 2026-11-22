@@ -11,7 +11,6 @@ from TokenSim.af.execution.model import ModelAFExecutor
 from TokenSim.af.providers.operator_table import build_operator_table_af_providers
 from TokenSim.af.runtime.plan import AFRuntimePlan
 from TokenSim.af.runtime.compiler import compile_af_runtime_plan
-from TokenSim.trace.host import host_collection, run_environment
 from TokenSim.trace.archive import ArchivedTraceRecorder
 from TokenSim.trace.config import TraceConfig
 from TokenSim.trace.formats import make_trace_recorder, validate_trace_format
@@ -52,7 +51,6 @@ def build_model_runtime(doc, *, hardware, model, block_size=None):
     return AFModelRuntime(doc, hardware, model, cluster, workers, placement, plan)
 
 
-@host_collection()
 def simulate_decode(
     config,
     batch,
@@ -176,7 +174,7 @@ def simulate_decode(
         iteration = executor.submit(source_worker, requests)
         env.process(executor.run_iteration(iteration))
         try:
-            run_environment(env)
+            env.run()
         except BaseException:
             executor.trace.close()
             raise

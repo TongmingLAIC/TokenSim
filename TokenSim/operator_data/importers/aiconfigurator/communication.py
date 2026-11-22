@@ -156,63 +156,44 @@ def import_collectives(context: ImportContext):
     source_for = context.source_for
 
     collective_rows: dict[tuple, dict[str, Any]] = {}
-    for resolved in _candidates(
-        system_path / "comm", "nccl", nccl_version, ("nccl_perf.parquet",)
+    for comm_backend, table_file in (
+        ("nccl", "nccl_perf.parquet"),
+        ("oneccl", "oneccl_perf.parquet"),
     ):
-        if not _has_table(resolved, "nccl_perf.parquet"):
-            continue
-        raw_rows = _read_parquet(resolved / "nccl_perf.parquet")
-        label = _version_label(resolved, raw_rows, nccl_version or "unknown")
-        source_id = source_for("comm", resolved, label, backend_label="nccl")
-        resolved_versions.setdefault("collective_nccl", []).append(label)
-        for row in raw_rows:
-            dtype = _map_dtype(row.get("nccl_dtype"))
-            operation = _OPERATION_MAP.get(str(row.get("op_name", "")).lower())
-            if dtype is None or operation is None:
-                dropped["collective"] = dropped.get("collective", 0) + 1
+        for resolved in _candidates(
+            system_path / "comm", comm_backend, nccl_version, (table_file,)
+        ):
+            if not _has_table(resolved, table_file):
                 continue
-            key = (dtype, operation, int(row["num_gpus"]), 1, int(row["message_size"]))
-            if key in collective_rows:
-                continue  # newer NCCL version already provided this point
-            collective_rows[key] = {
-                "dtype": key[0],
-                "operation": key[1],
-                "group_size": key[2],
-                "nodes": key[3],
-                "message_bytes": key[4],
-                "latency_us": float(row["latency"]) * 1000.0,
-                "source_id": source_id,
-                "kernel": "nccl",
-            }
-    for resolved in _candidates(
-        system_path / "comm", "oneccl", nccl_version, ("oneccl_perf.parquet",)
-    ):
-        # Intel XPU systems ship oneCCL curves with the NCCL column layout.
-        if not _has_table(resolved, "oneccl_perf.parquet"):
-            continue
-        raw_rows = _read_parquet(resolved / "oneccl_perf.parquet")
-        label = _version_label(resolved, raw_rows, nccl_version or "unknown")
-        source_id = source_for("comm", resolved, label, backend_label="oneccl")
-        resolved_versions.setdefault("collective_oneccl", []).append(label)
-        for row in raw_rows:
-            dtype = _map_dtype(row.get("nccl_dtype"))
-            operation = _OPERATION_MAP.get(str(row.get("op_name", "")).lower())
-            if dtype is None or operation is None:
-                dropped["collective"] = dropped.get("collective", 0) + 1
-                continue
-            key = (dtype, operation, int(row["num_gpus"]), 1, int(row["message_size"]))
-            if key in collective_rows:
-                continue
-            collective_rows[key] = {
-                "dtype": key[0],
-                "operation": key[1],
-                "group_size": key[2],
-                "nodes": key[3],
-                "message_bytes": key[4],
-                "latency_us": float(row["latency"]) * 1000.0,
-                "source_id": source_id,
-                "kernel": "oneccl",
-            }
+            raw_rows = _read_parquet(resolved / table_file)
+            label = _version_label(resolved, raw_rows, nccl_version or "unknown")
+            source_id = source_for("comm", resolved, label, backend_label=comm_backend)
+            resolved_versions.setdefault(f"collective_{comm_backend}", []).append(label)
+            for row in raw_rows:
+                dtype = _map_dtype(row.get("nccl_dtype"))
+                operation = _OPERATION_MAP.get(str(row.get("op_name", "")).lower())
+                if dtype is None or operation is None:
+                    dropped["collective"] = dropped.get("collective", 0) + 1
+                    continue
+                key = (
+                    dtype,
+                    operation,
+                    int(row["num_gpus"]),
+                    1,
+                    int(row["message_size"]),
+                )
+                if key in collective_rows:
+                    continue
+                collective_rows[key] = {
+                    "dtype": key[0],
+                    "operation": key[1],
+                    "group_size": key[2],
+                    "nodes": key[3],
+                    "message_bytes": key[4],
+                    "latency_us": float(row["latency"]) * 1000.0,
+                    "source_id": source_id,
+                    "kernel": comm_backend,
+                }
     if include_custom_allreduce:
         resolved = _select(
             system_path / "comm", backend, version, ("custom_allreduce_perf.parquet",)

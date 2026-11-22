@@ -73,10 +73,14 @@ class OperatorResolver:
     def operator_backend(self) -> str:
         return self.package.backend if self.package else "analytical"
 
-    def query(self, table: str, key: Mapping[str, Any]) -> OperatorEstimate:
+    def query(
+        self, table: str, key: Mapping[str, Any], *, record_stats: bool = True
+    ) -> OperatorEstimate:
         normalized_key = {**key, **normalize_query_key(table, key)}
         identity = (table, tuple(sorted(normalized_key.items())))
-        return self._resolve(table, (normalized_key,), identity)
+        return self._resolve(
+            table, (normalized_key,), identity, record_stats=record_stats
+        )
 
     def query_moe(
         self, base_key: Mapping[str, Any], distributions: Iterable[str]
@@ -93,7 +97,7 @@ class OperatorResolver:
         )
         return self._resolve("moe", keys, identity)
 
-    def _resolve(self, table, keys, identity):
+    def _resolve(self, table, keys, identity, *, record_stats: bool = True):
         estimate = self._cache.get(identity)
         if estimate is None:
             if self.fallback != "analytical_only":
@@ -101,7 +105,8 @@ class OperatorResolver:
             if estimate is None:
                 estimate = self.analytical_estimate(table, keys[0], gated=self.gated)
             self._cache[identity] = estimate
-        self.stats.record(table, estimate.match_type)
+        if record_stats:
+            self.stats.record(table, estimate.match_type)
         return estimate
 
     def _measured(self, table, keys):

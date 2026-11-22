@@ -6,7 +6,11 @@ import logging
 import math
 
 
-from TokenSim.llm.llm_comm import KVConnectorMetadata, KVConnectorWorkerMetadata
+from TokenSim.kv_transfer import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+    NoopConnector,
+)
 from TokenSim.llm.llm_request import Request, RequestStatus
 from TokenSim.block.block_manager import BlockManager
 from TokenSim.config.config import CacheConfig, KVTransferConfig
@@ -15,10 +19,8 @@ from TokenSim.config.speculative_execution import (
     validate_mtp_token_budget,
 )
 from TokenSim.errors import ConfigurationError
-from TokenSim.kv_transfer import NoopConnector
 from TokenSim.llm.paged_scheduling import PagedSchedulingMixin
 from TokenSim.llm.paged_tokens import PagedTokenBudgetMixin
-from TokenSim.llm.admission_observation import observe_uniform_sources
 from TokenSim.llm.async_admission import admit_async
 
 logger = logging.getLogger(__name__)
@@ -186,15 +188,12 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         mtp_enabled: bool | None = None,
         mtp_seed: int = 0,
         mtp_acceptance=None,
-        max_parallem_sum: int | None = None,
     ):
         super().__init__(connector=connector)
 
         self.id = id
         self.cache_config = cache_config
-        self.max_num_seqs = (
-            max_parallem_sum if max_parallem_sum is not None else max_num_seqs
-        )
+        self.max_num_seqs = max_num_seqs
         if max_num_batched_tokens is not None and max_num_batched_tokens < 1:
             raise ConfigurationError("max_num_batched_tokens must be at least 1")
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -326,7 +325,7 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         if self.block_manager.grouped_cache:
             req.record_context_admission(local_plan.hit_tokens, num_external_tokens)
         else:
-            observe_uniform_sources(req, local_plan.hit_tokens, num_external_tokens)
+            req.observe_uniform_sources(local_plan.hit_tokens, num_external_tokens)
 
     def _spec_decode_step_blocks(self):
         if not self.speculative_tokens:
@@ -477,12 +476,7 @@ class LLMPagedAttnScheduler(PagedSchedulingMixin, PagedTokenBudgetMixin, LLMSche
         _GB = 1 << 30
         if self.connector.async_offload:
             return self.connector.store.used_bytes / _GB
-        return (
-            self.block_manager.cpu_allocator.get_num_allocated_blocks()
-            * self.cache_config.block_size
-            * self.cache_config.size_per_token
-            / _GB
-        )
+        return 0.0
 
     def _release_delayed_blocks(self, req: Request, block_ids: list[int]) -> None:
         self.block_manager.release_request_blocks(req)

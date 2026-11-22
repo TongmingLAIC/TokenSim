@@ -7,10 +7,13 @@ from unittest.mock import patch
 
 import simpy
 
+from TokenSim.af.communication.endpoints import EndpointResources
 from TokenSim.af.factory import build_model_runtime
 from TokenSim.af.runtime.compiler import compile_af_runtime_plan
+from TokenSim.af.serving.handoff import execute_handoff, plan_handoff
 from TokenSim.af.serving.metrics import steady_metrics
 from TokenSim.af.serving.service import AFService
+from TokenSim.errors import ConfigurationError
 from TokenSim.hardware.placement import build_topology_placement
 from TokenSim.latency.operator_table import OperatorTableLatencyBackend
 
@@ -243,3 +246,146 @@ class CompletePrefillTest(unittest.TestCase):
                 with self.assertRaises(simpy.Interrupt):
                     env.run(until=blocker)
                 self.assertFalse(registry.scheduler.owners)
+
+
+class HandoffTest(unittest.TestCase):
+    def services(self, kv_heads=None):
+        hardware = _runtime_hardware()
+        model = replace(hardware.model("TestModel"), attention_windows=(4, 0))
+        if kv_heads is not None:
+            model = replace(model, num_key_value_heads=kv_heads)
+        env = simpy.Environment()
+        runtimes = []
+        for namespace, pp in (("source", 1), ("target", 2)):
+            cluster = pipeline_cluster(
+                pp, pp, resource_scope="endpoint", namespace=namespace
+            )
+            workers = cluster.workers()
+            plan = compile_af_runtime_plan(
+                cluster_config=cluster,
+                worker_configs=workers,
+                hardware=hardware,
+                model=model,
+                block_size=4,
+            )
+            runtimes.append(
+                SimpleNamespace(
+                    hardware=hardware,
+                    model=model,
+                    cluster=cluster,
+                    workers=workers,
+                    plan=plan,
+                    placement=build_topology_placement(cluster, workers, hardware),
+                )
+            )
+        identities = [
+            worker.physical_worker_ref.identity
+            for runtime in runtimes
+            for worker in runtime.workers
+        ]
+        resources = EndpointResources(
+            env, {"af-net": "test", "cross": "test", "replication": "test"}, identities
+        )
+        source, target = [
+            AFService(env, runtime, communication=resources) for runtime in runtimes
+        ]
+        return env, hardware, resources, source, target
+
+    def test_warm_suffix_replication_ordering_and_cancellation(self):
+        env, hardware, resources, source, target = self.services()
+        before = source.admit(1, 0, maximum_context=24, current_context=20)
+        after = target.admit(1, 0, maximum_context=24, current_context=16)
+        incremental = plan_handoff(
+            source,
+            before,
+            target,
+            after,
+            context=20,
+            mode="incremental",
+            cross_network="cross",
+            replication_network="replication",
+        )
+        full = plan_handoff(
+            source,
+            before,
+            target,
+            after,
+            context=20,
+            mode="full",
+            cross_network="cross",
+            replication_network="replication",
+        )
+        bytes_per_token = (
+            source.runtime.model.kv_elements_per_token()
+            * source.runtime.plan.kv_dtype_size_bytes
+        )
+        self.assertEqual(sum(c.bytes for c in incremental), 2 * 4 * bytes_per_token)
+        self.assertEqual(sum(c.bytes for c in full), (4 + 20) * bytes_per_token)
+        events = []
+        env.process(
+            execute_handoff(
+                env,
+                incremental,
+                hardware=hardware,
+                resources=resources,
+                identity=(1,),
+                target=target,
+                target_session=after,
+                context=20,
+                events=events,
+            )
+        )
+        self.assertEqual(after.cached_context, 16)
+        env.run()
+        self.assertEqual(after.cached_context, 20)
+        self.assertFalse(resources.scheduler.owners)
+
+        env2, hw2, res2, src2, dst2 = self.services(kv_heads=1)
+        s_session = src2.admit(1, 0, maximum_context=24, current_context=20)
+        t_session = dst2.admit(1, 0, maximum_context=24, current_context=16)
+        copies = plan_handoff(
+            src2,
+            s_session,
+            dst2,
+            t_session,
+            context=20,
+            mode="incremental",
+            cross_network="cross",
+            replication_network="replication",
+        )
+        rep_events = []
+        env2.process(
+            execute_handoff(
+                env2,
+                copies,
+                hardware=hw2,
+                resources=res2,
+                identity=(1,),
+                target=dst2,
+                target_session=t_session,
+                context=20,
+                events=rep_events,
+            )
+        )
+        env2.run()
+        for layer in (0, 1):
+            cross = next(
+                e for e in rep_events if e["layer"] == layer and e["network"] == "cross"
+            )
+            local = next(
+                e
+                for e in rep_events
+                if e["layer"] == layer and e["network"] == "replication"
+            )
+            self.assertGreaterEqual(local["start_s"], cross["end_s"])
+        with self.assertRaises(ConfigurationError):
+            plan_handoff(
+                src2,
+                s_session,
+                dst2,
+                t_session,
+                context=25,
+                mode="full",
+                cross_network="cross",
+                replication_network="replication",
+            )

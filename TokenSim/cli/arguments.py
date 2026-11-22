@@ -4,15 +4,31 @@ from __future__ import annotations
 
 import argparse
 import json
-from TokenSim.cli.cache_policy_arguments import add_cache_policy_arguments
-from TokenSim.cli.open_root_arguments import add_open_root_arguments
+from pathlib import Path
+
+from TokenSim.cli.workload_arguments import add_workload_and_cache_arguments
 from TokenSim.config.parallel_config import EXPERT_PARALLEL_SCOPES
-from .data_paths import DATA_ROOT, SimulationArgumentParser
+from TokenSim.config.paths import default_data_root
 from TokenSim.latency import FALLBACK_POLICIES
 from TokenSim.llm.llm_scheduler import DEFAULT_MAX_NUM_BATCHED_TOKENS
 
-
+DATA_ROOT = default_data_root()
+_DEFAULT_CLUSTER = Path("clusters/1_a100/h1.json")
 LATENCY_BACKEND_KEYWORDS = ("operator_table", "analytical")
+
+
+class SimulationArgumentParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, remaining = super().parse_known_args(args, namespace)
+        root = (
+            Path(parsed.data_root).expanduser().resolve()
+            if parsed.data_root is not None
+            else default_data_root()
+        )
+        parsed.data_root = str(root)
+        if parsed.cluster is None:
+            parsed.cluster = str(root / _DEFAULT_CLUSTER)
+        return parsed, remaining
 
 
 def build_parser():
@@ -310,72 +326,6 @@ def build_parser():
         help="Result directory; defaults to results/<model>/<cluster directory>/<cluster>.",
     )
     parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default=None,
-        help="Request dataset or AgentX trace file.",
-    )
-    parser.add_argument(
-        "--dataset_skip_count",
-        type=int,
-        default=0,
-        help="Skip this many leading dataset records or traces.",
-    )
-    parser.add_argument(
-        "--trace_timestamp_scale",
-        type=float,
-        default=None,
-        help="Scale loaded timestamped trace arrivals as new_ts = old_ts * scale.",
-    )
-    parser.add_argument(
-        "--trace_target_qps",
-        type=float,
-        default=None,
-        help="Scale trace times so (arrivals - 1) / (last - earliest) matches this QPS.",
-    )
-    parser.add_argument(
-        "--workload_type",
-        choices=["synthetic", "json_pairs", "qwen_jsonl", "agentx_weka"],
-        default="synthetic",
-        help="Request source: synthetic lengths, a dataset format, or AgentX trace replay.",
-    )
-    parser.add_argument(
-        "--agentx_concurrency",
-        type=int,
-        default=1,
-        help="Concurrent AgentX trace trees (replay lanes).",
-    )
-    parser.add_argument(
-        "--agentx_trace_count",
-        type=int,
-        default=None,
-        help="Use at most this many traces from the dataset; default all.",
-    )
-    parser.add_argument(
-        "--agentx_profile_duration",
-        type=float,
-        default=3600.0,
-        help="Simulated seconds of the measured AgentX issue window.",
-    )
-    parser.add_argument(
-        "--agentx_issue_mode",
-        choices=("closed_loop", "recorded"),
-        default="closed_loop",
-        help="Issue requests when their dependencies finish (closed loop) or at recorded trace times.",
-    )
-    parser.add_argument(
-        "--agentx_idle_gap_cap",
-        type=float,
-        default=10.0,
-        help="Compress system-wide idle gaps longer than this many seconds; 0 disables.",
-    )
-    parser.add_argument(
-        "--agentx_warmup",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Warm caches with sampled trace frontiers before the measured window.",
-    )
-    parser.add_argument(
         "--random_seed",
         type=int,
         default=0,
@@ -427,7 +377,7 @@ def build_parser():
         "--mtp_acceptance",
         type=json.loads,
         default={},
-        help="Acceptance JSON: kind mean, conditional (rates), empirical (distribution), or legacy.",
+        help="Acceptance JSON: kind mean, conditional (rates), or empirical (distribution).",
     )
     parser.add_argument(
         "--mtp_num_speculative_tokens",
@@ -453,42 +403,5 @@ def build_parser():
         default=None,
         help="Catalog directory; overrides TOKENSIM_DATA_ROOT and the bundled data root.",
     )
-    parser.add_argument(
-        "--agentx_workload_seed",
-        type=int,
-        default=None,
-        help="Trace warmup sampling seed; defaults to random_seed.",
-    )
-    parser.add_argument(
-        "--agentx_grace_period",
-        type=float,
-        default=30.0,
-        help="Seconds to allow issued requests to finish.",
-    )
-    parser.add_argument(
-        "--agentx_warmup_requests_per_lane",
-        type=int,
-        default=10,
-        help="Warmup requests issued per replay lane before the measured window.",
-    )
-    parser.add_argument(
-        "--agentx_warmup_grace_period",
-        type=float,
-        default=1800.0,
-        help="Seconds allowed for warmup requests to finish before measurement.",
-    )
-    parser.add_argument(
-        "--agentx_tree_idle_cap",
-        type=float,
-        default=300.0,
-        help="Skip idle gaps longer than this within one trace tree; 0 disables.",
-    )
-    parser.add_argument(
-        "--agentx_cancellation_timeout",
-        type=float,
-        default=10.0,
-        help="Seconds to drain cancellation and transfer ownership.",
-    )
-    add_cache_policy_arguments(parser)
-    add_open_root_arguments(parser)
+    add_workload_and_cache_arguments(parser)
     return parser

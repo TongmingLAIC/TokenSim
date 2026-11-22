@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import simpy
 
 from TokenSim.config.config import ParallelConfig
-from TokenSim.kv_transfer.grouped_pd_handoff import GroupedPDHandoff
+from TokenSim.kv_transfer.transport.grouped import GroupedPDHandoff
 from TokenSim.llm.engine.messages import WorkerStatus
 from TokenSim.llm.llm_request import Request
 from TokenSim.llm.llm_scheduler import LLMPagedAttnScheduler
@@ -51,7 +51,7 @@ def setup(prefill=33, slots=40, target_inflight=None):
         workers=workers,
         dp_coordinator=None,
         decode_workers=SimpleNamespace(
-            select_transfer_target=lambda requests: workers[1]
+            select_transfer_target=lambda requests, **kwargs: workers[1]
         ),
         send_task=lambda *args: None,
     )

@@ -47,7 +47,7 @@ def request_metrics(records):
     rows = [
         row
         for row in records
-        if row["phase"] == "profile" and row["outcome"] == "successful"
+        if row["phase"] != "warmup" and row["outcome"] == "successful"
     ]
 
     def distribution(name):
@@ -103,9 +103,7 @@ class IOObservation:
         eligible = [
             row
             for row in self.loads
-            if not row["prefetch"]
-            and not row["cancelled"]
-            and row["phase"] == "profile"
+            if not row["prefetch"] and not row["cancelled"] and row["phase"] != "warmup"
         ]
         busy = BusyIndex(self.compute)
         exposed = [busy.uncovered(row["start"], row["end"]) for row in eligible]

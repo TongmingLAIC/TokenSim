@@ -5,26 +5,23 @@ from TokenSim.errors import ConfigurationError
 
 from .base import BaseKVConnector
 from .multi import MultiConnector
-from .mooncake_store import MooncakeStoreConnector
 
 
 class KVConnectorFactory:
-    _registry: dict[str, type[BaseKVConnector | MooncakeStoreConnector]] = {}
+    _registry: dict[str, type[BaseKVConnector]] = {}
 
     @classmethod
     def register_connector(
         cls,
         name: str,
-        connector_cls: type[BaseKVConnector | MooncakeStoreConnector],
+        connector_cls: type[BaseKVConnector],
     ) -> None:
         if name in cls._registry:
             raise ConfigurationError(f"connector {name!r} is already registered")
         cls._registry[name] = connector_cls
 
     @classmethod
-    def get_connector_class(
-        cls, name: str
-    ) -> type[BaseKVConnector | MooncakeStoreConnector]:
+    def get_connector_class(cls, name: str) -> type[BaseKVConnector]:
         if name not in cls._registry:
             raise ConfigurationError(
                 f"unsupported kv_connector {name!r}; expected one of "
@@ -37,7 +34,7 @@ class KVConnectorFactory:
         cls,
         config: KVTransferConfig,
         cache_config: CacheConfig | None = None,
-    ) -> BaseKVConnector | MooncakeStoreConnector:
+    ) -> BaseKVConnector:
         connector_cls = cls.get_connector_class(config.kv_connector or "NoopConnector")
         if connector_cls is MultiConnector:
             children = []

@@ -165,14 +165,6 @@ class MTPAcceptanceTest(unittest.TestCase):
         req.advance(env, 0, 1)
         self.assertEqual(req.decode_round, 1)
 
-    def test_legacy_is_available_for_reproduction(self):
-        budget = self.budget(MTPAcceptanceConfig("legacy"))
-        budget.mtp_acceptance_length, budget.mtp_seed = 2.49, 0
-        for request_id, expected in ((0, 3), (2, 2), (17, 3)):
-            req = self.request()
-            req.id = request_id
-            self.assertEqual(budget._decode_output_tokens(req, 100), expected)
-
     def test_committed_execution_counts_unclipped_and_emitted_tokens(self):
         budget = self.budget(MTPAcceptanceConfig("conditional", rates=(1, 1, 1)))
         req = self.request()

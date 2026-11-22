@@ -1,7 +1,8 @@
 """Global recording across execution modes without changing serving results."""
 
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -11,13 +12,17 @@ from unittest.mock import patch
 import simpy
 
 from tests.support.cli import run_quiet, simulation_args
+from TokenSim.cli import build_parser, main
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.errors import SimulationStateError
 from TokenSim.config.config import KVTransferConfig, ClusterConfig
 from TokenSim.llm.llm_engine import LLMEngine
+from TokenSim.operator_data.workload import work_for_table
 from TokenSim.trace.config import TraceConfig
-from tests.af.support.config import _with_prefill_pool, _cluster_dict
+from TokenSim.workload.source import LLMSource
+from tests.af.support.config import _cluster, _with_prefill_pool, _cluster_dict
 from tests.af.support.execution import af_test_hardware, _run_request
+from tests.af.support.model import _engine, _moe
 from tests.support.hardware import make_hardware, make_model
 from TokenSim.llm.llm_request import Request
 
@@ -312,3 +317,60 @@ class ServingTraceTest(unittest.TestCase):
                     if row["ph"] == "X"
                 )
             )
+
+    def test_moe_prefill_work_shape_and_burst_strict_json_reporting(self):
+        env, engine = _engine(
+            _cluster(a_tp=1, a_dp=1, f_tp=1, f_dp=1, f_ep=1),
+            moe_config=_moe(),
+            trace=dict(mode="full"),
+        )
+        req = Request(0, 8, 2, block_size=4)
+        env.process(LLMSource(env, engine, [req], 1, "burst"))
+        env.run()
+        engine.raise_if_failed()
+        rows = [
+            e
+            for e in engine.trace_session.recorder.events
+            if e.operation == "moe_module" and e.phase == "prefill"
+        ]
+        self.assertEqual(
+            work_for_table("moe", rows[0].details["shape"]).flops, 8 * 2 * 16 * 32 * 6
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            data = path / "requests.json"
+            data.write_text(json.dumps([[16, 1], [16, 1], [16, 2]]))
+            workload = path / "workload.json"
+            workload.write_text(
+                json.dumps({"decode_token_latency": {"p50": 0.0, "max": 0.0}})
+            )
+            args = build_parser().parse_args(
+                [
+                    "--distribution",
+                    "burst",
+                    "--latency_backend",
+                    "analytical",
+                    "--request_count",
+                    "3",
+                    "--workload_type",
+                    "json_pairs",
+                    "--dataset_path",
+                    str(data),
+                    "--workload_config",
+                    str(workload),
+                    "--verbose",
+                    "none",
+                    "--results_path",
+                    directory,
+                ]
+            )
+            with redirect_stdout(io.StringIO()):
+                main(args)
+            result = json.loads(
+                (path / "result_inf.json").read_text(),
+                parse_constant=lambda v: (_ for _ in ()).throw(AssertionError(v)),
+            )
+            self.assertIsNone(result["qps"])
+            self.assertEqual(result["slo"]["decode_token_latency"]["sample_count"], 1)
+            self.assertEqual(result["slo"]["goodput_requests"], 2)

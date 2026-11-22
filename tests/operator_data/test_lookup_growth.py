@@ -8,7 +8,7 @@ from TokenSim.latency.operator_table import (
     OperatorResolver,
     OperatorTableLatencyBackend,
 )
-from TokenSim.operator_data.analytical import analytical_model_for
+from TokenSim.operator_data.analytical import Calibration, analytical_model_for
 from TokenSim.operator_data.lookup import (
     LookupPolicy,
     MissingOperatorDataError,
@@ -175,3 +175,93 @@ class LookupGrowthTest(unittest.TestCase):
                 self.package("generation_attention", [self.key]),
                 bind_analytical_axes="false",
             )
+
+    def test_routed_experts_work_and_table_scoped_calibration(self):
+        key = dict(dtype="bf16", hidden_size=8, inter_size=16, expert_tokens="[1,2]")
+        estimate = self.model.estimate(
+            "routed_experts", key, self.device, Calibration(1, 10)
+        )
+        self.assertEqual(estimate.work.weight_bytes, 3 * 2 * 8 * 16 * 2)
+        self.assertEqual(estimate.work.flops, 6 * 3 * 8 * 16 + 4 * 3 * 16)
+        self.assertAlmostEqual(estimate.latency_us, estimate.roofline_us + 10)
+        source = SourceRecord("fixture", "A", "measured")
+        meta = PackageMeta(
+            "fixture-v1",
+            self.device.device_id,
+            "test",
+            sources={source.source_id: source},
+            calibration={
+                "routed_experts": Calibration(100, 1000, "group").to_dict(),
+                "default": Calibration(2, 3, "default").to_dict(),
+            },
+        )
+        package = OperatorDataPackage.from_rows(
+            meta,
+            {"routed_experts": [{**key, "latency_us": 7.0, "source_id": "fixture"}]},
+        )
+        resolver = OperatorResolver(device=self.device, package=package)
+        self.assertEqual(resolver.query("routed_experts", key).latency_us, 7.0)
+        grouped = dict(key, expert_tokens="[3]")
+        self.assertAlmostEqual(
+            resolver.query("routed_experts", grouped).latency_us,
+            self.model.estimate("routed_experts", grouped, self.device).latency_us * 100
+            + 1000,
+        )
+        gemm = dict(dtype="bf16", m=1, n=24, k=8)
+        self.assertAlmostEqual(
+            resolver.query("gemm", gemm).latency_us,
+            self.model.estimate("gemm", gemm, self.device).latency_us * 2 + 3,
+        )
+
+
+class AnalyticalInterpolationTests(unittest.TestCase):
+    def setUp(self):
+        self.key = dict(dtype="fp32", operation="all_reduce", group_size=16, nodes=2)
+        rows = [
+            {
+                **self.key,
+                "message_bytes": size,
+                "latency_us": 1 + size,
+                "source_id": "anchors",
+            }
+            for size in (1, 1024)
+        ]
+        meta = PackageMeta(
+            "test",
+            "device",
+            "nccl",
+            sources={"anchors": SourceRecord("anchors", "A", "measured")},
+        )
+        self.package = OperatorDataPackage.from_rows(meta, {"collective": rows})
+
+    def test_sparse_alpha_beta_anchors_recover_linear_byte_growth(self):
+        lookup = OperatorLookup(
+            self.package, LookupPolicy(interpolation_space="analytical")
+        )
+        result = lookup.lookup(
+            "collective",
+            {**self.key, "message_bytes": 32},
+            scaler=lambda _, key: 7 + 2 * key["message_bytes"],
+        )
+        self.assertAlmostEqual(result.latency_us, 33)
+        self.assertEqual(result.match_type, "interpolated")
+        self.assertIn("analytical_interpolated", result.detail["flags"])
+        default = OperatorLookup(self.package).lookup(
+            "collective", {**self.key, "message_bytes": 32}
+        )
+        self.assertAlmostEqual(default.latency_us, (2 + 1025) / 2)
+
+    def test_missing_or_nonmonotonic_physics_and_invalid_policy(self):
+        lookup = OperatorLookup(
+            self.package, LookupPolicy(interpolation_space="analytical")
+        )
+        for scaler in (None, lambda *_: None, lambda _, key: -key["message_bytes"]):
+            result = lookup.lookup(
+                "collective", {**self.key, "message_bytes": 32}, scaler=scaler
+            )
+            self.assertAlmostEqual(result.latency_us, (2 + 1025) / 2)
+            self.assertIn("axis_interpolation_fallback", result.detail["flags"])
+        exact = lookup.lookup("collective", {**self.key, "message_bytes": 1024})
+        self.assertEqual((exact.latency_us, exact.match_type), (1025, "exact"))
+        with self.assertRaises(ConfigurationError):
+            LookupPolicy(interpolation_space="unrecognized")

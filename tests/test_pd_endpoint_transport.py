@@ -1,7 +1,11 @@
 """Endpoint contention, DMA ownership and receiver capacity use native events."""
 
+from collections import Counter
+from fractions import Fraction
+import math
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import simpy
 
@@ -9,10 +13,14 @@ from TokenSim.config.config import KVTransferConfig
 from TokenSim.config.simulation import SimulationConfig
 from TokenSim.errors import SimulationStateError
 from TokenSim.reporting.stats import get_connector_stats
-from TokenSim.kv_transfer.endpoint_fabric import EndpointFabric, fair_rates
+from TokenSim.kv_transfer.transport.fabric import EndpointFabric, fair_rates
+from TokenSim.kv_transfer.transport.uniform import PDHandoff
 from TokenSim.llm.llm_engine import LLMEngine
 from TokenSim.llm.llm_request import Request
 from TokenSim.workload.source import LLMSource
+from tests.af.runtime import test_kv as kv_tests
+from tests.af.support.config import _cluster as _af_cluster
+from tests.af.support.model import _engine as _af_engine, _request as _af_request
 from tests.support.hardware import make_hardware
 from tests.support.pd import (
     _pd_cluster,
@@ -62,6 +70,28 @@ class EndpointFabricTest(unittest.TestCase):
             ),
             150,
         )
+
+    def test_late_high_bandwidth_and_zero_byte_flows_avoid_clock_livelock(self):
+        rate = 50_000_000_000
+        env = simpy.Environment(initial_time=1_000_000.0)
+        fabric = EndpointFabric(
+            env,
+            send_bytes_per_second=rate,
+            receive_bytes_per_second=rate,
+            fabric_bytes_per_second=rate,
+        )
+        process = env.process(fabric.transfer(0, 1, 1_000_003))
+        for _ in range(100):
+            if process.triggered:
+                break
+            env.step()
+        self.assertTrue(process.triggered)
+        ideal = Fraction.from_float(1_000_000.0) + Fraction(1_000_003, rate)
+        error = abs(float(Fraction.from_float(fabric.completed[0]["end"]) - ideal))
+        self.assertLessEqual(error, 2 * math.ulp(float(ideal)))
+        env.process(fabric.transfer(0, 1, 0))
+        env.run()
+        self.assertFalse(fabric.active)
 
 
 def setup_transport(capacity=None, requests=None, *, transfer=None):
@@ -134,6 +164,61 @@ class PDTransportIntegrationTest(unittest.TestCase):
                 worker.scheduler.block_manager.get_num_allocated_blocks(), 0
             )
 
+    def test_af_decode_replica_delivery_and_tp_shard_reservations(self):
+        manager = kv_tests.ReplicaKVBlockManagerTest()._manager(gpu=(2, 2))
+        request = _af_request(0, prefill_len=8)
+        manager.transfer_reservations[request.id] = 2
+        manager.pd_handoff = SimpleNamespace(admitted=Mock())
+        manager.reserve_gpu_blocks(2)
+        self.assertTrue(manager.can_allocate(request))
+        manager.allocate(request)
+        manager.pd_handoff.admitted.assert_called_once_with(request)
+        manager.release_request_blocks(request)
+        self.assertTrue(
+            all(m.get_num_free_blocks() == 2 for m in manager.rank_managers.values())
+        )
+
+        env, engine = _af_engine(_af_cluster(a_tp=1, a_dp=4, f_tp=1, f_dp=1, f_ep=1))
+        engine.pd_handoff = PDHandoff(
+            engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=4e6,
+            ),
+        )
+        requests = [Request(i, 8, 3, block_size=4) for i in range(4)]
+        for r in requests:
+            r.dp_rank = 0
+        env.process(LLMSource(env, engine, requests, 1, "burst"))
+        env.run()
+        engine.raise_if_failed()
+        starts = [
+            row for row in engine.pd_handoff.events if row["kind"] == "transfer_start"
+        ]
+        self.assertEqual(
+            Counter(row["target_dp_rank"] for row in starts), Counter(range(4))
+        )
+        self.assertEqual(engine.pd_handoff.report()["receiver_reserved_pages"], 0)
+
+        env2, tp_engine = _af_engine(
+            _af_cluster(a_tp=2, a_dp=1, f_tp=1, f_dp=1, f_ep=1)
+        )
+        tp_engine.pd_handoff = PDHandoff(
+            tp_engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=2e6,
+            ),
+        )
+        tp_req = Request(0, 8, 3, block_size=4)
+        env2.process(LLMSource(env2, tp_engine, [tp_req], 1, "burst"))
+        env2.run()
+        tp_engine.raise_if_failed()
+        self.assertTrue(tp_req.is_done)
+        self.assertEqual(len(tp_engine.pd_handoff.fabric.completed), 2)
+
     def test_sources_pinned_and_target_reserved_until_wire_completion(self):
         env, engine, req = setup_transport()
         env.run(until=0.02)
@@ -187,6 +272,61 @@ class PDTransportIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 worker.scheduler.block_manager.get_num_allocated_blocks(), 0
             )
+
+    def test_af_decode_replica_delivery_and_tp_shard_reservations(self):
+        manager = kv_tests.ReplicaKVBlockManagerTest()._manager(gpu=(2, 2))
+        request = _af_request(0, prefill_len=8)
+        manager.transfer_reservations[request.id] = 2
+        manager.pd_handoff = SimpleNamespace(admitted=Mock())
+        manager.reserve_gpu_blocks(2)
+        self.assertTrue(manager.can_allocate(request))
+        manager.allocate(request)
+        manager.pd_handoff.admitted.assert_called_once_with(request)
+        manager.release_request_blocks(request)
+        self.assertTrue(
+            all(m.get_num_free_blocks() == 2 for m in manager.rank_managers.values())
+        )
+
+        env, engine = _af_engine(_af_cluster(a_tp=1, a_dp=4, f_tp=1, f_dp=1, f_ep=1))
+        engine.pd_handoff = PDHandoff(
+            engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=4e6,
+            ),
+        )
+        requests = [Request(i, 8, 3, block_size=4) for i in range(4)]
+        for r in requests:
+            r.dp_rank = 0
+        env.process(LLMSource(env, engine, requests, 1, "burst"))
+        env.run()
+        engine.raise_if_failed()
+        starts = [
+            row for row in engine.pd_handoff.events if row["kind"] == "transfer_start"
+        ]
+        self.assertEqual(
+            Counter(row["target_dp_rank"] for row in starts), Counter(range(4))
+        )
+        self.assertEqual(engine.pd_handoff.report()["receiver_reserved_pages"], 0)
+
+        env2, tp_engine = _af_engine(
+            _af_cluster(a_tp=2, a_dp=1, f_tp=1, f_dp=1, f_ep=1)
+        )
+        tp_engine.pd_handoff = PDHandoff(
+            tp_engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=2e6,
+            ),
+        )
+        tp_req = Request(0, 8, 3, block_size=4)
+        env2.process(LLMSource(env2, tp_engine, [tp_req], 1, "burst"))
+        env2.run()
+        tp_engine.raise_if_failed()
+        self.assertTrue(tp_req.is_done)
+        self.assertEqual(len(tp_engine.pd_handoff.fabric.completed), 2)
 
     def test_storage_connectors_do_not_absorb_legacy_pd_transfer(self):
         baseline, _, prior = setup_transport(
@@ -246,6 +386,61 @@ class PDTransportIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 worker.scheduler.block_manager.get_num_allocated_blocks(), 0
             )
+
+    def test_af_decode_replica_delivery_and_tp_shard_reservations(self):
+        manager = kv_tests.ReplicaKVBlockManagerTest()._manager(gpu=(2, 2))
+        request = _af_request(0, prefill_len=8)
+        manager.transfer_reservations[request.id] = 2
+        manager.pd_handoff = SimpleNamespace(admitted=Mock())
+        manager.reserve_gpu_blocks(2)
+        self.assertTrue(manager.can_allocate(request))
+        manager.allocate(request)
+        manager.pd_handoff.admitted.assert_called_once_with(request)
+        manager.release_request_blocks(request)
+        self.assertTrue(
+            all(m.get_num_free_blocks() == 2 for m in manager.rank_managers.values())
+        )
+
+        env, engine = _af_engine(_af_cluster(a_tp=1, a_dp=4, f_tp=1, f_dp=1, f_ep=1))
+        engine.pd_handoff = PDHandoff(
+            engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=4e6,
+            ),
+        )
+        requests = [Request(i, 8, 3, block_size=4) for i in range(4)]
+        for r in requests:
+            r.dp_rank = 0
+        env.process(LLMSource(env, engine, requests, 1, "burst"))
+        env.run()
+        engine.raise_if_failed()
+        starts = [
+            row for row in engine.pd_handoff.events if row["kind"] == "transfer_start"
+        ]
+        self.assertEqual(
+            Counter(row["target_dp_rank"] for row in starts), Counter(range(4))
+        )
+        self.assertEqual(engine.pd_handoff.report()["receiver_reserved_pages"], 0)
+
+        env2, tp_engine = _af_engine(
+            _af_cluster(a_tp=2, a_dp=1, f_tp=1, f_dp=1, f_ep=1)
+        )
+        tp_engine.pd_handoff = PDHandoff(
+            tp_engine,
+            dict(
+                send_bytes_per_second=1e6,
+                receive_bytes_per_second=1e6,
+                fabric_bytes_per_second=2e6,
+            ),
+        )
+        tp_req = Request(0, 8, 3, block_size=4)
+        env2.process(LLMSource(env2, tp_engine, [tp_req], 1, "burst"))
+        env2.run()
+        tp_engine.raise_if_failed()
+        self.assertTrue(tp_req.is_done)
+        self.assertEqual(len(tp_engine.pd_handoff.fabric.completed), 2)
 
 
 if __name__ == "__main__":

@@ -55,32 +55,35 @@ def prefill_components(provider, resolver, query, tokens, common):
         if k > q:
             key["context_len"] = k
         component = provider._component(
-            resolver, "attention_core", "context_attention", key
+            resolver,
+            "attention_core",
+            "context_attention",
+            key,
+            record_stats=(k <= q),
         )
-        if k > q and component.match_type != "analytical":
-            base = resolver.analytical_reference_us(
-                "context_attention",
-                {name: value for name, value in key.items() if name != "context_len"},
-            )
-            full = resolver.analytical_reference_us("context_attention", key)
-            if base is None or full is None or base <= 0:
-                raise ConfigurationError(
-                    "cached prefill requires an analytical growth reference"
+        if k > q:
+            if component.match_type == "analytical":
+                resolver.stats.record("context_attention", "analytical")
+            else:
+                base = resolver.analytical_reference_us(
+                    "context_attention",
+                    {
+                        name: value
+                        for name, value in key.items()
+                        if name != "context_len"
+                    },
                 )
-            previous = component.match_type
-            for counter in (
-                resolver.stats.match_type_counts,
-                resolver.stats.table_match_counts["context_attention"],
-            ):
-                counter[previous] -= 1
-                if counter[previous] == 0:
-                    del counter[previous]
-            resolver.stats.record("context_attention", "extrapolated")
-            component = replace(
-                component,
-                latency_us=component.latency_us * max(1.0, full / base),
-                match_type="extrapolated",
-                source_id=f"prefix_scaled:{component.source_id}",
-            )
+                full = resolver.analytical_reference_us("context_attention", key)
+                if base is None or full is None or base <= 0:
+                    raise ConfigurationError(
+                        "cached prefill requires an analytical growth reference"
+                    )
+                resolver.stats.record("context_attention", "extrapolated")
+                component = replace(
+                    component,
+                    latency_us=component.latency_us * max(1.0, full / base),
+                    match_type="extrapolated",
+                    source_id=f"prefix_scaled:{component.source_id}",
+                )
         components.append(component)
     return components

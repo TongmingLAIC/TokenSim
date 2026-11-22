@@ -1,6 +1,6 @@
 """Order-preserving matching with explicit ambiguity and semantic group rules."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 
 from TokenSim.errors import ConfigurationError
@@ -33,12 +33,12 @@ def compatible(left, right):
     return True
 
 
-def _scores(left, right, forbidden=None):
+def _scores(left, right):
     scores = [[0] * (len(right) + 1) for _ in range(len(left) + 1)]
     for i in range(len(left) - 1, -1, -1):
         for j in range(len(right) - 1, -1, -1):
             score = max(scores[i + 1][j], scores[i][j + 1])
-            if (i, j) != forbidden and compatible(left[i], right[j]):
+            if compatible(left[i], right[j]):
                 score = max(score, 1 + scores[i + 1][j + 1])
             scores[i][j] = score
     return scores
@@ -47,21 +47,27 @@ def _scores(left, right, forbidden=None):
 def _align(left, right):
     scores = _scores(left, right)
     optimum = scores[0][0]
+    if optimum == 0:
+        return [], set(), set()
     prefix = _scores(list(reversed(left)), list(reversed(right)))
-    matches = []
-    ambiguous_left, ambiguous_right = set(), set()
+    candidates = []
+    rank_counts: Counter[int] = Counter()
     for i, item in enumerate(left):
         for j, other in enumerate(right):
             if not compatible(item, other):
                 continue
             before = prefix[len(left) - i][len(right) - j]
-            if before + 1 + scores[i + 1][j + 1] != optimum:
-                continue
-            if _scores(left, right, forbidden=(i, j))[0][0] < optimum:
-                matches.append((item, other))
-            else:
-                ambiguous_left.add(item.id)
-                ambiguous_right.add(other.id)
+            if before + 1 + scores[i + 1][j + 1] == optimum:
+                candidates.append((before, item, other))
+                rank_counts[before] += 1
+    matches = []
+    ambiguous_left, ambiguous_right = set(), set()
+    for rank, item, other in candidates:
+        if rank_counts[rank] == 1:
+            matches.append((item, other))
+        else:
+            ambiguous_left.add(item.id)
+            ambiguous_right.add(other.id)
     return matches, ambiguous_left, ambiguous_right
 
 

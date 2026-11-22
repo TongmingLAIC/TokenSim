@@ -6,8 +6,7 @@ from functools import cached_property
 
 from TokenSim.config.validation import number
 from TokenSim.errors import ConfigurationError
-from TokenSim.dtypes import CAST_OPERATIONS
-from TokenSim.hardware.device.dtypes import normalize_dtype
+from TokenSim.dtypes import CAST_OPERATIONS, normalize_dtype
 from TokenSim.operator_data.key_normalization import (
     integral_shape,
     normalize_table_key_value,
@@ -44,6 +43,9 @@ ELEMENTWISE_OPS = CAST_OPERATIONS + (
     "residual_add",
     "swiglu",
     "gelu",
+    "geglu",
+    "scale",
+    "logit_softcap",
     "data_reorder",
     "other_residual",
     "embedding_lookup",

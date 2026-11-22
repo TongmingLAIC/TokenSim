@@ -56,7 +56,7 @@ def setup(policy=None, annotated=False, **options):
     first = Request(0, 32, 2, 16, hash_ids=[1, 2])
     if annotated:
         first.chat_id = "parent"
-        first.source = SimpleNamespace(trace_id="parent", play_id=0, lane=0)
+        first.session_key = ("parent", 0, 0)
     env.process(LLMSource(env, engine, [first], 1, "burst"))
     return env, engine, first
 

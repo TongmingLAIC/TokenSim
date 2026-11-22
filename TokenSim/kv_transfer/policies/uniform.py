@@ -35,7 +35,7 @@ class UniformCacheController:
         self.stats["completions"] += 1
         self.request_rows.append(request_record(req, self.env.now, "successful"))
         self.owners.pop(req.id, None)
-        if req.measurement_phase == "profile" and not req.cancel_requested:
+        if req.is_measured and not req.cancel_requested:
             self.prefetch.capture(scheduler, req)
 
     def defer_admission(self, scheduler, req):

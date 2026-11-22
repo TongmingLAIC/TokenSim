@@ -2,7 +2,7 @@
 
 Every function returns an :class:`OperatorWork`. These formulas are the single
 source of truth for the analytical estimators, the ``*_analysis`` tables, and
-the documentation; see ``docs/operator-latency-model.md`` for the derivations.
+the documentation; see ``docs/reference/operator-latency.md``.
 """
 
 from __future__ import annotations
@@ -200,6 +200,7 @@ def moe_work(
 
 _ELEMENTWISE_FLOPS_PER_ELEMENT = {
     "rmsnorm": 4.0,
+    "post_attention_norm": 4.0,
     "layernorm": 5.0,
     "rope": 3.0,
     "residual_add": 1.0,
@@ -219,6 +220,7 @@ _ELEMENTWISE_FLOPS_PER_ELEMENT = {
 _ELEMENTWISE_BYTES_PER_ELEMENT = {
     # (reads + writes) expressed in element units of the token x hidden tensor
     "rmsnorm": 2.0,
+    "post_attention_norm": 2.0,
     "layernorm": 2.0,
     "rope": 2.0,
     "residual_add": 3.0,
@@ -256,7 +258,9 @@ def elementwise_work(
     elements = float(num_tokens) * hidden_size
     b = activation_bytes_for(dtype)
     extra_bytes = (
-        hidden_size * b if op in {"rmsnorm", "layernorm"} else 0.0
+        hidden_size * b
+        if op in {"rmsnorm", "post_attention_norm", "layernorm"}
+        else 0.0
     )  # weight vector
     return OperatorWork(
         flops=_ELEMENTWISE_FLOPS_PER_ELEMENT[op] * elements,

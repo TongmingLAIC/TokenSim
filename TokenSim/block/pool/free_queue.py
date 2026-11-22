@@ -74,7 +74,7 @@ class FreeBlockQueue:
             self._priority_queue[block.block_number] = entry
 
     def enable_priority(self, priority, clock):
-        from TokenSim.block.priority_queue import PriorityFreeMap
+        from .priority_queue import PriorityFreeMap
 
         self._priority_queue = PriorityFreeMap(
             priority, clock, order=lambda key, entry: entry.block.last_accessed

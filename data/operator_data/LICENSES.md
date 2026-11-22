@@ -15,5 +15,4 @@ V100 NCCL curves derive from the project's original nccl-tests measurements.
 Groq analytical tables are generated project data.
 Local profiling runs use `aiconfigurator-collector:` source IDs and retain records of how the measurements were collected.
 
-See [AIConfigurator usage](../../docs/reference/operator-data.md) for importing the recorded revision, validating data and selecting which operations a timing estimate includes.
-The importer does not convert unsupported measurement types into other operator types.
+See [Operator latency and data packages](../../docs/reference/operator-latency.md) for importing the recorded revision, validating data and selecting which operations a timing estimate includes.

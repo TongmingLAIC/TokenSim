@@ -160,11 +160,8 @@ class NativeCacheController:
             return
         if self.movement is not None:
             self.movement.capture(scheduler, req)
-        source = getattr(req, "source", None)
-        if source is not None and hasattr(source, "play_id"):
-            self.play_owners.setdefault(
-                (source.trace_id, source.play_id, source.lane), set()
-            ).add(self.owner(req))
+        if getattr(req, "session_key", None) is not None:
+            self.play_owners.setdefault(req.session_key, set()).add(self.owner(req))
         if not self.preset.retain:
             return
         self.prefetch_completed(scheduler, req)
@@ -198,11 +195,11 @@ class NativeCacheController:
         )
 
     def client_resuming(self, req):
-        if self.movement is not None and req.measurement_phase == "profile":
+        if self.movement is not None and req.is_measured:
             self.movement.resuming(req)
 
     def tool_wait(self, req):
-        if self.movement is not None and req.measurement_phase == "profile":
+        if self.movement is not None and req.is_measured:
             self.movement.tool_wait(req)
 
     def play_finished(self, identity):

@@ -2,15 +2,45 @@
 
 from __future__ import annotations
 
-
 from .context import ImportContext
 from .discovery import (
+    _candidates,
+    _has_table,
     _map_dtype,
     _read_parquet,
-    _has_table,
-    _candidates,
     _version_label,
 )
+
+
+def _moe_entry(key: tuple, latency_us: float, source_id: str, kernel: str) -> dict:
+    return {
+        "dtype": key[0],
+        "distribution": key[1],
+        "num_tokens": key[2],
+        "hidden_size": key[3],
+        "inter_size": key[4],
+        "top_k": key[5],
+        "num_experts": key[6],
+        "tp_size": key[7],
+        "ep_size": key[8],
+        "latency_us": latency_us,
+        "source_id": source_id,
+        "kernel": kernel,
+    }
+
+
+def _moe_key(dtype: str, row: dict) -> tuple:
+    return (
+        dtype,
+        str(row.get("distribution", "uniform")).lower(),
+        int(row["num_tokens"]),
+        int(row["hidden_size"]),
+        int(row["inter_size"]),
+        int(row["topk"]),
+        int(row["num_experts"]),
+        int(row.get("moe_tp_size", 1)),
+        int(row.get("moe_ep_size", 1)),
+    )
 
 
 def import_moe(context: ImportContext):
@@ -42,40 +72,16 @@ def import_moe(context: ImportContext):
                 dtype_label = str(row.get("moe_dtype"))
                 dropped_dtypes[dtype_label] = dropped_dtypes.get(dtype_label, 0) + 1
                 continue
-            key = (
-                dtype,
-                str(row.get("distribution", "uniform")).lower(),
-                int(row["num_tokens"]),
-                int(row["hidden_size"]),
-                int(row["inter_size"]),
-                int(row["topk"]),
-                int(row["num_experts"]),
-                int(row.get("moe_tp_size", 1)),
-                int(row.get("moe_ep_size", 1)),
-            )
+            key = _moe_key(dtype, row)
             if key in rows and key not in seen_here:
                 continue
             seen_here.add(key)
             latency_us = float(row["latency"]) * 1000.0
             current = rows.get(key)
             if current is None or latency_us < current["latency_us"]:
-                rows[key] = {
-                    "dtype": key[0],
-                    "distribution": key[1],
-                    "num_tokens": key[2],
-                    "hidden_size": key[3],
-                    "inter_size": key[4],
-                    "top_k": key[5],
-                    "num_experts": key[6],
-                    "tp_size": key[7],
-                    "ep_size": key[8],
-                    "latency_us": latency_us,
-                    "source_id": source_id,
-                    "kernel": str(row.get("kernel_source", "")),
-                }
-    # Wide-EP expert kernels share the moe schema (plus extra columns); they only
-    # backfill keys the standard table does not have. Generation rows are
-    # preferred over context rows because the runtime queries MoE per step.
+                rows[key] = _moe_entry(
+                    key, latency_us, source_id, str(row.get("kernel_source", ""))
+                )
     for wide_file in (
         "wideep_moe_perf.parquet",
         "wideep_generation_moe_perf.parquet",
@@ -97,32 +103,14 @@ def import_moe(context: ImportContext):
                 if dtype is None or not keep_kernel(row):
                     dropped["moe"] = dropped.get("moe", 0) + 1
                     continue
-                key = (
-                    dtype,
-                    str(row.get("distribution", "uniform")).lower(),
-                    int(row["num_tokens"]),
-                    int(row["hidden_size"]),
-                    int(row["inter_size"]),
-                    int(row["topk"]),
-                    int(row["num_experts"]),
-                    int(row.get("moe_tp_size", 1)),
-                    int(row.get("moe_ep_size", 1)),
-                )
+                key = _moe_key(dtype, row)
                 if key in rows:
                     continue
-                rows[key] = {
-                    "dtype": key[0],
-                    "distribution": key[1],
-                    "num_tokens": key[2],
-                    "hidden_size": key[3],
-                    "inter_size": key[4],
-                    "top_k": key[5],
-                    "num_experts": key[6],
-                    "tp_size": key[7],
-                    "ep_size": key[8],
-                    "latency_us": float(row["latency"]) * 1000.0,
-                    "source_id": source_id,
-                    "kernel": f"{wide_file.replace('_perf.parquet', '')}:{row.get('kernel_source', '')}",
-                }
+                rows[key] = _moe_entry(
+                    key,
+                    float(row["latency"]) * 1000.0,
+                    source_id,
+                    f"{wide_file.replace('_perf.parquet', '')}:{row.get('kernel_source', '')}",
+                )
     if rows:
         tables["moe"] = list(rows.values())

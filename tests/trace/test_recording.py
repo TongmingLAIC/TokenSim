@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import simpy
 
 from TokenSim.errors import SimulationStateError
-from TokenSim.kv_transfer.native_storage import QueuedKVLink
+from TokenSim.kv_transfer.storage.native import QueuedKVLink
 from TokenSim.trace.transfers import TransferObserver
 from TokenSim.trace.config import TraceConfig
 from TokenSim.trace.events import TraceEvent

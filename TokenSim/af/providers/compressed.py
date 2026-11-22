@@ -148,6 +148,7 @@ def _attention(provider, resolver, query, tokens, tp):
                 count if prefill else tokens,
                 q,
                 k - q if prefill else k,
+                record_stats=False,
             )
             matches.append(sample.match)
             sources.append(sample.source_id)
@@ -215,11 +216,16 @@ def _mhc(provider, resolver, tokens, operation, *, hidden=None):
             "sinkhorn_iters": spec.hc_sinkhorn_iters,
             "num_tokens": tokens,
         }
-        lookup = OperatorLookup(
-            resolver.package,
-            LookupPolicy(extrapolate="analytical"),
-            analytical_scaler=lambda _t, k: float(k["num_tokens"]),
-        )
+        cache = getattr(provider, "_mhc_lookups", None)
+        if cache is None:
+            cache = provider._mhc_lookups = {}
+        lookup = cache.get(id(resolver.package))
+        if lookup is None:
+            lookup = cache[id(resolver.package)] = OperatorLookup(
+                resolver.package,
+                LookupPolicy(extrapolate="analytical"),
+                analytical_scaler=lambda _t, k: float(k["num_tokens"]),
+            )
         row = lookup.lookup(binding["table"], native_key)
         latency = row.latency_us / binding["key"]["num_sites"] * h / model.hidden_size
         match, source = row.match_type, row.source_id

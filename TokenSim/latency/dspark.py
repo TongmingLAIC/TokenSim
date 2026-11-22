@@ -226,7 +226,5 @@ class DSparkEstimator(SpeculativeEstimator):
             query_width=self.query_width,
             capture_token_rows=self.capture_rows,
             attention="Noncausal query block plus the retained SWA context; analytical single-latent core",
-            source_image="vllm/vllm-openai@sha256:b09cb3bedfd4d2712f70b5abd309cb7050e53040cfad1a466dd04ed8e2f1e4df",
-            source_package_version="0.17.2rc1.dev6312+g20ebb2850",
             analytical_components="Context insertion, noncausal SWA, Markov sampling and state movement; primitive GEMM and optional native mHC/MoE use the selected operator backend",
         )

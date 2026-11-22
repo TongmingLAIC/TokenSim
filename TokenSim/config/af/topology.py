@@ -162,11 +162,13 @@ class ClusterTopologyMixin:
                 group = groups.get(domain.worker_group)
                 if (
                     group is None
-                    or domain.required_rank_count != 1
-                    or group.num_workers != 1
+                    or domain.capability not in group.capabilities
+                    or group.num_workers != domain.required_rank_count
                 ):
                     continue
-                domain.logical_instances = self._single_rank_instances(group)
+                domain.logical_instances = self._default_logical_instances(
+                    domain, group
+                )
             return
 
         endpoints = set()
@@ -178,15 +180,14 @@ class ClusterTopologyMixin:
             group = groups.get(group_name)
             if group is None:
                 continue
-            domains.append(
-                ExecutionDomainConfig(
-                    name=f"implicit:{group_name}:{capability}",
-                    capability=capability,
-                    worker_group=group_name,
-                    parallel=DomainParallelConfig(data_parallel_size=group.num_workers),
-                    logical_instances=self._single_rank_instances(group),
-                )
+            domain = ExecutionDomainConfig(
+                name=f"implicit:{group_name}:{capability}",
+                capability=capability,
+                worker_group=group_name,
+                parallel=DomainParallelConfig(data_parallel_size=group.num_workers),
             )
+            domain.logical_instances = self._default_logical_instances(domain, group)
+            domains.append(domain)
         self.af.execution_domains = domains
 
     def _normalize_communication_fabrics(self) -> None:
@@ -243,25 +244,37 @@ class ClusterTopologyMixin:
         self._communication_fabric_sources = dict(sources)
 
     @staticmethod
-    def _single_rank_instances(
+    def _default_logical_instances(
+        domain: ExecutionDomainConfig,
         group: WorkerGroupConfig,
     ) -> list[LogicalInstanceConfig]:
-        return [
-            LogicalInstanceConfig(
-                name=f"{group.name}:{worker_index}",
-                rank_mapping=[
+        tp_size = domain.parallel.tensor_parallel_size
+        ranks_per_replica = domain.ranks_per_replica
+        ep_view = domain.expert_parallel
+        instances: list[LogicalInstanceConfig] = []
+        for dp_rank in range(domain.parallel.data_parallel_size):
+            mappings: list[DomainRankMapping] = []
+            for rank_in_replica in range(ranks_per_replica):
+                domain_rank = dp_rank * ranks_per_replica + rank_in_replica
+                tp_rank = rank_in_replica % tp_size
+                pp_rank = rank_in_replica // tp_size
+                mappings.append(
                     DomainRankMapping(
-                        domain_rank=worker_index,
-                        tp_rank=0,
-                        pp_rank=0,
-                        dp_rank=worker_index,
-                        ep_rank=0,
+                        domain_rank=domain_rank,
+                        tp_rank=tp_rank,
+                        pp_rank=pp_rank,
+                        dp_rank=dp_rank,
+                        ep_rank=ep_view.ep_rank(dp_rank=dp_rank, tp_rank=tp_rank),
                         physical_worker=PhysicalWorkerRef(
                             group_name=group.name,
-                            worker_index=worker_index,
+                            worker_index=domain_rank,
                         ),
                     )
-                ],
+                )
+            instances.append(
+                LogicalInstanceConfig(
+                    name=f"{group.name}:{dp_rank}",
+                    rank_mapping=mappings,
+                )
             )
-            for worker_index in range(group.num_workers)
-        ]
+        return instances

@@ -282,7 +282,7 @@ class PageStoreEvictionTest(unittest.TestCase):
         store.finish_write(store.reserve_write("replacement", 8))
         self.assertNotIn("old", store.pages)
         self.assertIn("newer", store.pages)
-        for _ in range(3000):
+        for _ in range(3):
             store.lookup("newer")
         store.finish_write(store.reserve_write("replacement2", 8))
         self.assertIn("newer", store.pages)

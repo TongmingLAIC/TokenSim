@@ -11,7 +11,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-from TokenSim.trace.host import host_collection
 from TokenSim.trace.events import TraceEvent
 from TokenSim.trace.config import TraceConfig, TIMING_FIELDS
 from TokenSim.errors import ConfigurationError
@@ -141,7 +140,6 @@ def write_chrome_trace(
     temporary = None
     try:
         with (
-            host_collection(),
             FlowIndex() if modern else nullcontext(None) as flows,
             NamedTemporaryFile(
                 mode="w",

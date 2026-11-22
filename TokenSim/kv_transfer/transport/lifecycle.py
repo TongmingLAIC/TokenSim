@@ -13,15 +13,9 @@ def uses_decode_coordinates(engine):
 
 
 def select_decode_target(engine, requests):
-    if not uses_decode_coordinates(engine):
-        return engine.decode_workers.select_transfer_target(requests)
-    req = requests[0]
-    source_rank = req.dp_rank
-    req.dp_rank = None
-    try:
-        return engine.decode_workers.select_transfer_target(requests)
-    finally:
-        req.dp_rank = source_rank
+    return engine.decode_workers.select_transfer_target(
+        requests, preserve_dp_rank=not uses_decode_coordinates(engine)
+    )
 
 
 def assign_decode_coordinate(engine, req, target):

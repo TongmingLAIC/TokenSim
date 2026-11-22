@@ -1,29 +1,26 @@
 # TokenSim documentation
 
-Start with the [installation and quick run](../README.md#install-and-run).
-Commands that refer to repository files assume a checkout.
+Start with [installation and quick run](../README.md#install-and-run).
+Commands referencing repository files run from a checkout.
 
 ## Guides
 
 | Goal | Guide |
 | --- | --- |
-| Generate requests or replay a trace or agent workload | [Workloads and AgentX](guides/workloads.md) |
+| Generate synthetic requests or replay trace and agent workloads | [Workloads and AgentX](guides/workloads.md) |
 | Place workers and configure parallelism or prefill/decode disaggregation | [Parallelism and worker layouts](guides/serving.md) |
-| Reuse prefixes and choose programmable KV policies | [Prefix caching](guides/prefix-cache.md) |
-| Transfer KV pages or configure memory, SSD and pluggable storage | [KV transfer and storage](guides/kv-storage.md) |
-| Split attention and feed-forward (FFN) work across hardware | [Attention/FFN disaggregation](guides/attention-ffn.md) |
+| Reuse prefixes, apply cache policies, transfer KV pages and extend storage backends | [KV caching, transfer and storage](guides/kv-storage.md) |
+| Split attention and feed-forward network (FFN) execution across pools | [Attention/FFN disaggregation](guides/attention-ffn.md) |
 
 ## Reference
 
-- [Operator latency model](reference/operator-latency-model.md): measured lookup, analytical estimates, communication and result provenance.
-- [Tracing and profiler comparison](reference/operator-tracing.md): timeline recording, collection boundaries and reports.
-- [Models](reference/models.md): model layouts, expert routing, latent attention and speculative decoding.
-- [LP30 and Rubin](reference/lpx.md): device assumptions, execution and SRAM admission.
-- [Operator data packages](reference/operator-data.md): sources, imports, coverage and calibration.
-- [Device catalog](../data/devices/README.md): supported devices and hardware inputs.
+- [Operator latency and data packages](reference/operator-latency.md): table lookup, analytical roofline models, communication models, AIConfigurator imports and result provenance.
+- [Models and architectures](reference/models.md): mixture of experts, multi-head latent attention, speculative decoding, Gemma-4 block layouts and Groq LP30 / Rubin modeling.
+- [Tracing and profiler comparison](reference/operator-tracing.md): operator timelines, PyTorch Profiler alignment and timeline figures.
+- [Device catalog](../data/devices/README.md): supported accelerators, evidence grades and hardware parameters.
 
-## Extension and collection
+## Measurement and examples
 
-- [Storage backend plugins](development/storage-backends.md) and the [HBF example](../examples/storage/hbf/README.md).
+- [HBF storage plugin example](../examples/storage/hbf/README.md).
 - [Hardware measurement tools](../scripts/collect/README.md).
 - [Contributor guide](../CONTRIBUTING.md).

@@ -1,9 +1,18 @@
 """Physical KV budgets, admission quotas, and waiting-queue progress."""
 
+from contextlib import redirect_stdout
+import io
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace as NS
 import unittest
 
+from TokenSim.block.block import Device, PhysicalTokenBlock
+from TokenSim.block.pool.free_queue import FreeBlockQueue
+from TokenSim.block.pool.priority_queue import PriorityFreeMap
+from TokenSim.cli import build_parser
+from TokenSim.cli.run import main
 from TokenSim.config.cache_config import CacheConfig
 from TokenSim.config.parallel_config import ParallelConfig
 from TokenSim.errors import ConfigurationError
@@ -11,6 +20,9 @@ from TokenSim.hardware import HardwareContext
 from TokenSim.config.cache_policy import PRESETS
 from TokenSim.kv_transfer.policies.native import NativeCacheController
 from TokenSim.kv_transfer.policies.quota import should_defer
+from TokenSim.kv_transfer.policies.retention import RetentionRegistry
+from TokenSim.llm.llm_request import Request
+from TokenSim.llm.paged_scheduling import PagedSchedulingMixin
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -130,9 +142,9 @@ class CacheQuotaTest(unittest.TestCase):
         for req in (parent, child):
             req.cache_salt = None
             req.chat_id = str(req.id)
-            req.source = NS(trace_id="tree", play_id=3, lane=2)
+            req.session_key = ("tree", 3, 2)
         self.assertEqual(session_id(parent), session_id(child))
-        child.source.lane = 4
+        child.session_key = ("tree", 3, 4)
         self.assertNotEqual(session_id(parent), session_id(child))
 
     def test_global_growth_reservation_counts_running_and_loading_after_timeout(self):
@@ -211,3 +223,134 @@ class CacheQuotaTest(unittest.TestCase):
         )
         NativeCacheController.reorder_waiting(controller, scheduler)
         self.assertEqual(scheduler.waiting, [small, large])
+
+
+class ProgrammableRetentionTest(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.blocks = [
+            NS(block_number=i, block_hash=f"hash-{i}", ref_count=0) for i in range(3)
+        ]
+        self.registry = RetentionRegistry(lambda: self.now)
+        self.queue = PriorityFreeMap(
+            lambda key: self.registry.priority("pool", self.blocks[key]),
+            lambda: self.now,
+        )
+        self.registry.bind("pool", self.queue.refresh)
+        for i in range(3):
+            self.queue[i] = None
+
+    def retain(self, block, owner="a", revision=1, priority=50, ttl=10):
+        return self.registry.declare(
+            "pool",
+            [self.blocks[block]],
+            owner=owner,
+            revision=revision,
+            priority=priority,
+            ttl=ttl,
+        )
+
+    def test_retention_priority_expiration_owners_and_recycling(self):
+        self.retain(0, priority=100)
+        self.retain(2, priority=100)
+        self.assertEqual([self.blocks[i].ref_count for i in (0, 2)], [0, 0])
+        self.assertEqual(self.queue.popitem(last=False)[0], 1)
+        self.assertCountEqual(
+            [self.queue.popitem(last=False)[0] for _ in range(2)], [0, 2]
+        )
+        for i in range(3):
+            self.queue[i] = None
+        self.retain(0, owner="a", revision=3, priority=25)
+        self.assertFalse(self.retain(0, owner="a", revision=2, priority=0))
+        self.retain(0, owner="b", priority=80)
+        self.registry.release("b")
+        self.assertEqual(self.registry.priority("pool", self.blocks[0])[0], 25)
+        self.now = 11
+        self.assertEqual(self.queue.popitem(last=False)[0], 0)
+        self.setUp()
+        self.retain(0)
+        self.blocks[0].block_hash = "different-content"
+        self.queue.refresh(0)
+        self.assertEqual(self.queue.popitem(last=False)[0], 0)
+
+    def test_uniform_queue_and_retain_cli_keep_blocks_evictable(self):
+        queue = FreeBlockQueue()
+        queue.enable_priority(lambda slot: (50, float("inf")), lambda: self.now)
+        cached = [PhysicalTokenBlock(Device.GPU, i, 16) for i in range(2)]
+        for block, stamp in zip(cached, (20, 10)):
+            block.last_accessed = stamp
+            queue.append_lru(block)
+        queue.append(PhysicalTokenBlock(Device.GPU, 2, 16))
+        self.assertEqual([queue.popleft().block_number for _ in range(3)], [2, 1, 0])
+
+        released = []
+        scheduler = NS(
+            block_manager=NS(grouped_cache=False, can_allocate=lambda req: False),
+            connector=NS(async_offload=False),
+            defer_prefills=False,
+            stats={"full_input_gate": 0},
+            cache_controller=NS(
+                resumed=lambda req: released.append(req),
+                defer_admission=lambda scheduler, req: False,
+            ),
+        )
+        self.assertFalse(
+            PagedSchedulingMixin._admit_waiting(scheduler, Request(1, 16, 1, 16), None)
+        )
+        self.assertFalse(released)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            trace = directory / "requests.jsonl"
+            trace.write_text(
+                "".join(
+                    json.dumps(
+                        dict(
+                            request_id=i,
+                            timestamp=i * 0.1,
+                            input_length=64,
+                            output_length=2,
+                            chat_id="parent",
+                            turn=i,
+                            hash_ids=[1, 2, 3, 4],
+                        )
+                    )
+                    + "\n"
+                    for i in range(4)
+                )
+            )
+            args = build_parser().parse_args(
+                [
+                    "--model",
+                    str(ROOT / "data/models/llama-7b.yaml"),
+                    "--cluster",
+                    str(ROOT / "data/clusters/1_a100/h1.json"),
+                    "--workload_type",
+                    "qwen_jsonl",
+                    "--request_count",
+                    "4",
+                    "--dataset_path",
+                    str(trace),
+                    "--batching",
+                    "paged-attn",
+                    "--latency_backend",
+                    "analytical",
+                    "--max_num_batched_tokens",
+                    "128",
+                    "--max_num_seqs",
+                    "4",
+                    "--verbose",
+                    "none",
+                    "--cache_policy",
+                    "retain",
+                    "--results_path",
+                    str(directory / "result"),
+                ]
+            )
+            with redirect_stdout(io.StringIO()):
+                engine = main(args)
+            result = json.loads(
+                next((directory / "result").glob("result_*.json")).read_text()
+            )
+        self.assertEqual(result["termination_reason"], "completed")
+        self.assertGreater(engine.cache_controller.stats["retained_blocks"], 0)

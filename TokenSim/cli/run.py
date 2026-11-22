@@ -14,7 +14,7 @@ from TokenSim.config.router_config import load_router_mapping
 from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.hardware import HardwareContext
 from TokenSim.llm.llm_engine import LLMEngine
-from TokenSim.workload.agentx import AgentXReplay
+from TokenSim.workload.agentx_replay import AgentXReplay
 from TokenSim.workload.agentx_support.parser import iter_trace_graphs
 from TokenSim.workload.agentx_support.logs import ReplayLogs
 from TokenSim.workload.source import get_requests, LLMSource
@@ -31,7 +31,14 @@ from .lifecycle import request_observation_duration, run_simulation
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def main(args, preloaded_agentx_traces=None):
+def main(
+    args,
+    preloaded_agentx_traces=None,
+    *,
+    af_compute_provider=None,
+    af_transfer_provider=None,
+    af_dtype=None,
+):
     if args.sim_time is not None:
         number(args.sim_time, "sim_time", positive=True)
     config = simulation_config(args)
@@ -42,11 +49,24 @@ def main(args, preloaded_agentx_traces=None):
         )
     from TokenSim.af.providers.queries import resolve_af_latency_providers
 
+    compute_override = (
+        af_compute_provider
+        if af_compute_provider is not None
+        else getattr(args, "af_compute_provider", None)
+    )
+    transfer_override = (
+        af_transfer_provider
+        if af_transfer_provider is not None
+        else getattr(args, "af_transfer_provider", None)
+    )
+    dtype_override = (
+        af_dtype if af_dtype is not None else getattr(args, "af_dtype", None)
+    )
     af_compute_provider, af_transfer_provider = (
         resolve_af_latency_providers(
             cluster.af,
-            getattr(args, "af_compute_provider", None),
-            getattr(args, "af_transfer_provider", None),
+            compute_override,
+            transfer_override,
         )
         if cluster.af.enabled
         else (None, None)
@@ -124,7 +144,7 @@ def main(args, preloaded_agentx_traces=None):
         config=config,
         af_compute_provider=af_compute_provider,
         af_transfer_provider=af_transfer_provider,
-        af_dtype=getattr(args, "af_dtype", None),
+        af_dtype=dtype_override,
     )
     progress = TqdmManager(verbose=args.verbose, program_id=args.program_id)
     if engine.cache_controller is not None:

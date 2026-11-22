@@ -1,7 +1,7 @@
 """Observe synchronous plans and queued storage DMA without changing timing."""
 
 from TokenSim.kv_transfer.connectors.base import flatten_connectors
-from TokenSim.kv_transfer.native_storage import QueuedKVLink
+from TokenSim.kv_transfer.storage.native import QueuedKVLink
 from TokenSim.trace.events import TraceEvent
 from TokenSim.trace.execution import observe_service
 

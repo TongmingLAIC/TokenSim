@@ -3,7 +3,7 @@
 from math import inf
 
 from TokenSim.errors import SimulationStateError
-from TokenSim.kv_transfer.native_storage import validate_external_stores
+from TokenSim.kv_transfer.storage.native import validate_external_stores
 
 
 def _advance(engine, waiting, deadline):

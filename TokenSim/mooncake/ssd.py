@@ -19,9 +19,6 @@ class OffloadOperation:
     evicted_keys: list[str] = field(default_factory=list)
 
 
-SSDOperation = OffloadOperation
-
-
 class OffloadTier:
     """Offload tier simulated at block-count granularity.
 
@@ -56,7 +53,7 @@ class OffloadTier:
     def contains(self, key: str) -> bool:
         return key in self._blocks
 
-    def read(self, key: str) -> SSDOperation:
+    def read(self, key: str) -> OffloadOperation:
         blocks = self._blocks.get(key, 0)
         bytes_ = blocks * self.block_bytes
         if key in self._lru:
@@ -160,6 +157,3 @@ class OffloadTier:
             "write_blocking": True,
             "write_persistence": "blocking",
         }
-
-
-SSDTier = OffloadTier

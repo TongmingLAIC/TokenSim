@@ -215,27 +215,6 @@ def _components_for_binding(
     return tuple(components)
 
 
-def _experts_by_ep(
-    num_experts: int, ep_size: int, strategy: str
-) -> dict[int, tuple[int, ...]]:
-    result: dict[int, list[int]] = {rank: [] for rank in range(ep_size)}
-    if num_experts <= 0:
-        return {rank: () for rank in range(ep_size)}
-    if strategy == "round_robin":
-        for expert_id in range(num_experts):
-            result[expert_id % ep_size].append(expert_id)
-    elif strategy == "linear":
-        base, remainder = divmod(num_experts, ep_size)
-        cursor = 0
-        for rank in range(ep_size):
-            count = base + (1 if rank < remainder else 0)
-            result[rank].extend(range(cursor, cursor + count))
-            cursor += count
-    else:
-        raise ConfigurationError(f"unsupported expert placement strategy {strategy!r}")
-    return {rank: tuple(experts) for rank, experts in result.items()}
-
-
 def _compile_physical_states(
     *,
     preliminary,

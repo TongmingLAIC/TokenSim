@@ -176,6 +176,7 @@ class OperatorTableAFComputeProvider(
             resolver._cache.clear()
         self._estimate_cache.clear()
         getattr(self, "_compressed_states", {}).clear()
+        getattr(self, "_mhc_lookups", {}).clear()
         self.estimate_requests = 0
         self.estimate_cache_hits = 0
 

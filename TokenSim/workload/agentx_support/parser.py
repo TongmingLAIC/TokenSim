@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 from TokenSim.errors import WorkloadValidationError
-from TokenSim.workload.agentx_support.chains import (
+from TokenSim.workload.agentx_support.chain_detection import (
     detect_agent_chains,
     is_aux_chain,
     is_reduction_chain,

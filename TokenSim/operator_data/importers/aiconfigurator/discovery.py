@@ -6,31 +6,19 @@ from pathlib import Path
 from typing import Any
 
 from packaging.version import InvalidVersion, Version
+from TokenSim.dtypes import normalize_dtype
 from TokenSim.errors import ConfigurationError
-from TokenSim.hardware.device import normalize_dtype
 
 
-_DTYPE_MAP = {
-    "float16": "fp16",
-    "bfloat16": "bf16",
-    "half": "fp16",
-    "fp8": "fp8",
-    "fp8_block": "fp8_block",
+_DTYPE_OVERRIDES = {
     "fp8_static": "fp8",
-    "nvfp4": "nvfp4",
-    "int8": "int8",
-    "int8_wo": "int8_wo",
-    "int4_wo": "int4_wo",
     "sq": "int8_sq",
-    # 4-bit weights, fp8 activations
     "w4a8_awq": "int4_a8",
     "w4afp8": "int4_a8",
     "w4a8_mxfp4_mxfp8": "mxfp4",
     "w4a8_mxfp4_fp8": "mxfp4",
-    # 4-bit weights, 16-bit activations (weight-only)
     "w4a16_awq": "int4_wo",
     "w4a16_mxfp4": "mxfp4_wo",
-    "float32": "fp32",
 }
 
 _A2A_MODE_MAP = {
@@ -59,15 +47,13 @@ _OPERATION_MAP = {
 def _map_dtype(value: Any) -> str | None:
     key = str(value).strip().lower()
     if key in {"default", "", "none"}:
-        # vLLM's moe_a2a rows do not record the wire dtype; DeepEP moves bf16 activations.
         key = "bfloat16"
-    mapped = _DTYPE_MAP.get(key)
-    if mapped is None:
-        try:
-            return normalize_dtype(key)
-        except ConfigurationError:
-            return None
-    return mapped
+    if key in _DTYPE_OVERRIDES:
+        return _DTYPE_OVERRIDES[key]
+    try:
+        return normalize_dtype(key)
+    except ConfigurationError:
+        return None
 
 
 def _read_parquet(path: Path) -> list[dict[str, Any]]:

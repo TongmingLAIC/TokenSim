@@ -12,6 +12,7 @@ from TokenSim.errors import ConfigurationError, SimulationStateError
 from TokenSim.llm.engine.core import LLMEngine
 from TokenSim.llm.llm_request import Request, RequestStatus
 from TokenSim.llm.llm_scheduler import LLMPagedAttnScheduler
+from TokenSim.placement.consistent_hash import FixedWorkerRouter
 from TokenSim.placement.policies import DataParallelWorkerPool, RoundRobinWorkerPool
 from TokenSim.reporting.serving_domains import parallel_domain_stats
 from tests.support.hardware import make_device, make_hardware, make_model
@@ -223,3 +224,12 @@ class ServingCoreTest(unittest.TestCase):
         self.assertIs(select("two"), workers[1])
         select("three")
         self.assertLessEqual(len(pool.affinity_to_rank), 2)
+
+    def test_fixed_worker_router_validates_and_selects_expected_worker(self):
+        workers = [SimpleNamespace(dp_rank=rank, id=rank) for rank in (0, 1)]
+        router = FixedWorkerRouter(workers, {"chat": "1"})
+        request = SimpleNamespace(source=None, chat_id="chat")
+        self.assertIs(router.select(request), workers[1])
+        self.assertEqual(request.dp_rank, 1)
+        with self.assertRaisesRegex(ConfigurationError, "unknown DP rank"):
+            FixedWorkerRouter(workers[:1], {"chat": 1})

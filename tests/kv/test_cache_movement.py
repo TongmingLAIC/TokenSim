@@ -10,6 +10,8 @@ from TokenSim.block.hybrid.manager import HybridKVBlockManager
 from TokenSim.config.kv_transfer_config import KVTransferConfig
 from TokenSim.kv_transfer.connectors.simple_cpu import AsyncOffloadConnector
 from TokenSim.kv_transfer.storage.native import NativePageStore, QueuedKVLink
+from TokenSim.kv_transfer.storage.online_config import OnlineStoragePolicy
+from TokenSim.kv_transfer.storage.queue import StorageQueue
 from TokenSim.kv_transfer.policies.movement import MovementRuntime, PrefixSnapshot
 from TokenSim.kv_transfer.policies.child import reclaim_child, skip_write
 from TokenSim.llm.llm_request import Request
@@ -310,3 +312,51 @@ class CooperationTest(unittest.TestCase):
         runtime.resuming(NS(chat_id="p"))
         self.assertNotIn("p", runtime.waiting)
         self.assertEqual(runtime.estimates["p"], 2)
+
+
+class StorageQueueTest(unittest.TestCase):
+    def test_foreground_read_priority_and_write_credit_rate_limiting(self):
+        env = simpy.Environment()
+        queue = StorageQueue(env, OnlineStoragePolicy(read_priority=True))
+
+        def write(delay, nbytes, duration):
+            yield env.timeout(delay)
+            self.assertTrue(queue.reserve_write(nbytes))
+            yield env.process(queue.execute("write", nbytes, lambda: duration))
+
+        def read():
+            yield env.timeout(2)
+            yield env.process(queue.execute("read", 1, lambda: 1))
+
+        env.process(write(0, 10, 10))
+        env.process(write(1, 10, 2))
+        env.process(read())
+        env.run()
+        self.assertEqual(
+            [(e["kind"], e["started_at"], e["completed_at"]) for e in queue.events],
+            [("write", 0, 10), ("read", 10, 11), ("write", 11, 13)],
+        )
+
+        env2 = simpy.Environment()
+        throttled = StorageQueue(
+            env2,
+            OnlineStoragePolicy(
+                read_priority=True,
+                write_bytes_per_second=10,
+                write_burst_bytes=10,
+                max_backlog_bytes=20,
+                save_batch_bytes=10,
+            ),
+        )
+        for _ in range(2):
+            self.assertTrue(throttled.reserve_write(10))
+            env2.process(throttled.execute("write", 10, lambda: 0.1))
+        self.assertFalse(throttled.reserve_write(1))
+        env2.process(
+            (
+                lambda: (yield env2.timeout(0.2))
+                and (yield env2.process(throttled.execute("read", 1, lambda: 0.1)))
+            )()
+        )
+        env2.run()
+        self.assertEqual(throttled.dropped_write_bytes, 1)
